@@ -6,7 +6,12 @@ Current baseline section pasted into its prompt as the code it is editing.
 
 ---
 
-## Iteration 0 -- FM baseline (seeded by hand, not by the agent loop)
+## Iteration 0 -- FM baseline
+
+Seeded by hand, but it is a *real* iteration 0: `Orchestrator.bootstrap_baseline()`
+runs it through the executor before the research loop starts, so it appears in
+`logs/runs.jsonl` as iteration 0 and becomes the registry incumbent.
+Research-driven iterations are numbered from 1.
 
 `solution/train.py` is a direct port of `harness/baseline.py`'s `run_fm`,
 wrapped in the executor's `--config/--seed/--out` contract. Same model, same

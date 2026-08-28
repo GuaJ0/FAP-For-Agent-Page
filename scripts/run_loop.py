@@ -24,7 +24,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from agent.agents import FakeEvaluatorAgent, FakeResearchAgent  # noqa: E402
+from agent.agents import Diff, FakeEvaluatorAgent, FakeResearchAgent, Idea  # noqa: E402
 from agent.coding import LLMCodingAgent, OpenAIClient, TemplateLibraryClient  # noqa: E402
 from agent.config import (  # noqa: E402
     Config,
@@ -35,10 +35,16 @@ from agent.config import (  # noqa: E402
     SeedingConfig,
 )
 from agent.executor import Executor  # noqa: E402
-from agent.orchestrator import Orchestrator  # noqa: E402
+from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
 from agent.registry import CheckpointRegistry  # noqa: E402
 from agent.state import StateStore  # noqa: E402
+
+BASELINE_HYPOTHESIS = (
+    "Baseline: factorization machine over [user_id, video_id, author_id, tab, "
+    "dur_bucket] trained with pointwise logloss -- the seeded solution/train.py, "
+    "run as iteration 0 to establish the incumbent."
+)
 
 DEFAULT_HYPOTHESIS = (
     "Replace the pointwise logloss objective with a pairwise BPR ranking loss "
@@ -68,8 +74,14 @@ def load_dotenv(path: Path) -> None:
 
 def build_config(root: Path, args) -> Config:
     logs = root / "logs"
+    # --max-iterations counts *research* iterations. The baseline is a real
+    # concluded iteration and convergence.should_stop counts every non-FAILED
+    # record, so bootstrapping needs one extra slot -- otherwise
+    # --max-iterations 1 would be entirely consumed by the baseline and no
+    # hypothesis would ever run.
+    max_iterations = args.max_iterations + (0 if args.skip_baseline else 1)
     return Config(
-        convergence=ConvergenceConfig(max_iterations=args.max_iterations, max_wall_s=args.max_wall_s),
+        convergence=ConvergenceConfig(max_iterations=max_iterations, max_wall_s=args.max_wall_s),
         retry=RetryConfig(),
         executor=ExecutorConfig(per_run_timeout_s=args.timeout_s),
         seeding=SeedingConfig(max_seeds=args.seeds, min_seeds=1),
@@ -96,7 +108,11 @@ def main() -> int:
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--loss", default="bpr")
-    ap.add_argument("--max-iterations", type=int, default=1)
+    ap.add_argument("--max-iterations", type=int, default=1,
+                    help="number of research iterations (the baseline gets its own slot)")
+    ap.add_argument("--skip-baseline", action="store_true",
+                    help="do not run solution/ as iteration 0. The registry then starts "
+                         "empty, so the first result becomes the incumbent whatever it scores.")
     ap.add_argument("--max-wall-s", type=float, default=6 * 3600.0)
     ap.add_argument("--timeout-s", type=float, default=900.0)
     args = ap.parse_args()
@@ -108,6 +124,10 @@ def main() -> int:
         print("error: set KUAIRAND_PATH (in .env) or pass --data-dir; it must point at "
               "the directory holding the KuaiRand-Pure CSVs.", file=sys.stderr)
         return 2
+
+    # solution/config.yaml leaves data_dir empty and falls back to this, and
+    # the executor's subprocess inherits the environment.
+    os.environ["KUAIRAND_PATH"] = str(data_dir)
 
     root = Path(args.root)
     cfg = build_config(root, args)
@@ -138,6 +158,28 @@ def main() -> int:
     )
 
     t0 = time.time()
+
+    if not args.skip_baseline:
+        # Establish solution/ as a real iteration 0 before any hypothesis runs,
+        # so deltas, ACCEPT/REVERT and convergence all have an incumbent to
+        # measure against. Idempotent: a no-op if a previous run already did it.
+        #
+        # diff_path is solution/config.yaml, a sibling of solution/train.py --
+        # that adjacency is what lets a registry entry be resolved back to the
+        # source that produced it.
+        baseline = Diff(
+            diff_path=str(REPO_ROOT / "solution" / "config.yaml"),
+            solution_dir=str(REPO_ROOT / "solution"),
+        )
+        try:
+            record = orc.bootstrap_baseline(Idea(BASELINE_HYPOTHESIS, None), baseline)
+        except BootstrapError as e:
+            print(f"\nerror: could not establish the baseline as iteration 0:\n  {e}", file=sys.stderr)
+            return 3
+        agg = record.aggregate
+        print(f"[baseline] iteration 0: valid primary={agg.primary_mean:.4f} "
+              f"(std {agg.primary_std:.4f}) over {agg.n_seeds} seed(s) -- this is the bar")
+
     history = orc.run()
     print(f"\n=== finished in {time.time() - t0:.0f}s, {len(history)} record(s) ===")
     for r in history:

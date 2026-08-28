@@ -108,19 +108,51 @@ The clean fix is to give `Diff` a separate `config_path` field, or rename
 (`test_diff_path_is_the_config_file_the_orchestrator_will_pass_to_the_executor`)
 pinning the current behaviour so the swap is a deliberate act.
 
-## 3. First-iteration `delta_vs_current_best` is meaningless
+## 3. ~~First-iteration `delta_vs_current_best` is meaningless~~ — FIXED
 
-Observed in the end-to-end run, and it predates this work. The registry starts
-empty, so `orchestrator.py` computes
+**Was:** the registry started empty, so `orchestrator.py` computed
 `delta = agg.primary_mean - best.val_primary if best else agg.primary_mean`.
-On iteration 1 that makes the delta the *absolute score* (0.5989), not a delta
-— and `FakeEvaluatorAgent` accepts anything with `delta > margin`, so the first
-iteration is always accepted regardless of whether it beat the seeded baseline.
+On iteration 1 that made the "delta" the *absolute score* (0.5989), and
+`FakeEvaluatorAgent` accepts anything with `delta > margin` — so the first
+iteration was always accepted, even when it lost to the baseline.
 
-Now that `solution/` has a real iteration 0, the fix is probably to register the
-baseline in the checkpoint registry before the loop starts, so iteration 1 is
-measured against 0.6015 rather than against nothing. That is an orchestrator /
-bootstrap decision, not a Coding-agent one.
+**Now:** `Orchestrator.bootstrap_baseline()` runs `solution/` as a genuine
+iteration 0 before the research loop starts — a real `RunRecord` in the shared
+history, registered through the same `_register_checkpoint()` an accepted
+iteration uses. `scripts/run_loop.py` calls it automatically (pass
+`--skip-baseline` to opt out).
+
+The root problem was never really "the registry starts empty" — it was that
+`solution/`'s known result was not represented anywhere in the loop's data
+model. Making it a real iteration 0 fixed three symptoms at once, with no
+change to delta computation, `registry.py` or `convergence.py`:
+
+| symptom | now |
+|---|---|
+| delta computed against nothing → everything accepted | iteration 1 measures against 0.6016 and correctly REVERTs |
+| `convergence.should_stop` needs `n_window+1` *scored* records; the baseline wasn't one | the baseline is the first scored iteration, so stalling is noticed a full iteration sooner |
+| `Idea.parent_iteration` for the first hypothesis resolved to `None` | resolves to `0` |
+
+**Iteration numbering now starts at 0.** Iteration 0 is reserved for the seeded
+baseline; research-driven iterations are numbered from 1, as before. A run that
+never bootstraps simply has no iteration 0 and behaves exactly as it always
+did. Worth knowing when reading `runs.jsonl`.
+
+Two consequences worth knowing:
+
+- The baseline **counts toward `max_iterations`**, since
+  `convergence.should_stop` counts every non-FAILED record. `run_loop.py`
+  therefore treats `--max-iterations` as a count of *research* iterations and
+  adds one slot for the baseline.
+- If nothing ever beats the baseline, `registry.best()` **is** the baseline —
+  and because bootstrapping runs it for real rather than trusting a recorded
+  score, a complete artifact (`result.json`, `checkpoint.npz`,
+  `val_predictions.npz`) actually exists at that path for a submission step to
+  use.
+
+`bootstrap_baseline()` is idempotent and crash-resume safe, keyed off the run
+log on disk. It is the second change outside the Coding agent's lane (after
+`executor.py`) and is isolated in its own commit for review.
 
 ## 4. What metric verification does *not* catch
 
