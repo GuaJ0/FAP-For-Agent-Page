@@ -1,0 +1,59 @@
+"""Orchestrator's on-disk checkpoint.
+
+Persisted after every step so a crash mid-idea resumes with fix_attempts,
+the in-flight idea, and the abandonment streak intact -- the alternative
+(losing this on crash) would silently reset tier-1/tier-2 counters and let
+a bad idea consume far more than its attempt budget across restarts.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from agent.agents import Idea
+
+
+@dataclass
+class OrchestratorState:
+    iteration: int = 0
+    current_idea: Optional[dict] = None        # Idea.__dict__ while an idea is in flight, else None
+    fix_attempts: int = 0
+    idea_start_time: Optional[float] = None     # epoch seconds; set when the idea was first proposed
+    last_failure_feedback: Optional[str] = None
+    consecutive_abandonments: int = 0
+    halted: bool = False
+    halt_reason: Optional[str] = None
+    run_start_time: Optional[float] = None       # epoch seconds; set once, for adaptive-seeding projections
+    seed_costs: list = field(default_factory=list)  # observed wall_s per completed seed run
+
+    def get_current_idea(self) -> Optional[Idea]:
+        return Idea(**self.current_idea) if self.current_idea else None
+
+    def set_current_idea(self, idea: Optional[Idea]) -> None:
+        self.current_idea = asdict(idea) if idea else None
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, d: dict) -> "OrchestratorState":
+        return cls(**d)
+
+
+class StateStore:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> OrchestratorState:
+        if not self.path.exists():
+            return OrchestratorState()
+        return OrchestratorState.from_json(json.loads(self.path.read_text()))
+
+    def save(self, state: OrchestratorState) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state.to_json(), indent=2))
+        os.replace(tmp, self.path)  # atomic on POSIX: a crash mid-write can't corrupt the live file
