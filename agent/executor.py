@@ -9,6 +9,11 @@ Two output channels come back from a run, and they must never merge:
      the value this module returns -- run_seed()'s return type has no field
      that could hold them, and assert_no_forbidden_keys() double-checks that
      before anything is handed back to the caller.
+
+A third, later addition: result.json is trusted for its *shape* but not for
+its *content*. run_seed() independently re-scores the raw predictions a run
+persists (via the vendored evaluate.py) and fails the run on a mismatch --
+see the SCORING INTEGRITY block in run_seed() and agent/verification.py.
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ from typing import Any, Optional
 
 from agent.config import Config, DEFAULT_CONFIG, FORBIDDEN_PAYLOAD_KEYS, TEST_METRICS_SENTINEL
 from agent.records import AggregateMetrics, FailureKind, SeedMetrics
+from agent.verification import verify_result
 from runlog.emit import append_line
 
 REQUIRED_RESULT_KEYS = {"primary", "gauc", "ndcg5", "epochs_run"}
@@ -73,6 +79,10 @@ def _tail(text: str, n: int) -> str:
 @dataclass
 class Executor:
     cfg: Config = DEFAULT_CONFIG
+    # SCORING INTEGRITY: cross-check every claimed metric against an
+    # independent re-score before trusting it (see run_seed). Off only for
+    # deliberate experiments -- leaving it on is the point.
+    verify_metrics: bool = True
 
     def run_seed(
         self,
@@ -139,6 +149,29 @@ class Executor:
                 wall_s=wall_s, failure_kind=FailureKind.BAD_OUTPUT,
                 traceback_tail=tail or "result.json missing, malformed, or missing required keys",
             )
+
+        # --- SCORING INTEGRITY -------------------------------------------
+        # Everything above this point establishes that result.json is *well
+        # formed*. Nothing so far establishes that it is *true*: the numbers
+        # are whatever the subprocess chose to write, and primary drives
+        # delta_vs_current_best, the Evaluator's ACCEPT/REVERT, the checkpoint
+        # registry and the convergence rule. evaluate.py is meant to be the
+        # sole scoring authority, so re-derive the score here from the raw
+        # (user_id, label, score) arrays the run persisted, and refuse to
+        # believe result.json if the two disagree.
+        #
+        # Solutions that persist no such arrays (fixtures/fake_train.py, and
+        # anything predating this change) verify as SKIPPED and are
+        # unaffected. See agent/verification.py for the rationale and limits.
+        if self.verify_metrics:
+            outcome = verify_result(out_dir, metrics)
+            if outcome.failed:
+                return SeedMetrics(
+                    seed=seed, primary=None, gauc=None, ndcg5=None, epochs_run=None,
+                    wall_s=wall_s, failure_kind=FailureKind.METRIC_MISMATCH,
+                    traceback_tail=outcome.detail,
+                )
+        # -----------------------------------------------------------------
 
         result = SeedMetrics(
             seed=seed, primary=metrics["primary"], gauc=metrics["gauc"],

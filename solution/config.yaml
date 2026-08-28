@@ -1,0 +1,24 @@
+# Iteration-0 config: the official FM baseline settings from
+# harness/baseline_scores.json ("fm_official".config). Reproduces
+# test primary 0.5946 +- 0.0008.
+#
+# The executor invokes: python train.py --config <this> --seed <n> --out <result.json>
+# Flat key/value only -- solution/train.py falls back to a tiny stdlib YAML
+# reader when PyYAML isn't installed, so nested structures won't parse.
+
+# Leave data_dir empty to fall back to $KUAIRAND_PATH (see .env.example).
+data_dir:
+
+loss: logloss
+k: 16
+lr: 0.001
+l2: 0.000001
+epochs: 40
+batch_size: 8192
+patience: 4
+
+# null = train on all ~1.14M rows. Set to e.g. 50000 for a fast smoke test.
+max_train_rows:
+
+emit_test_metrics: true
+write_raw_predictions: true

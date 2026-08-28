@@ -1,0 +1,14 @@
+# Harness + solutions: the starter kit is deliberately numpy-only, and every
+# generated train.py is held to that (see agent/coding/agent.py ALLOWED_IMPORTS).
+numpy>=1.24
+
+# Coding agent's LLM calls. Not needed to run the tests -- the default suite
+# uses ScriptedClient and never imports this.
+openai>=1.40
+
+# solution/config.yaml. Optional: train.py falls back to a stdlib flat-YAML
+# reader when this is absent, and a test asserts the two agree.
+PyYAML>=6.0
+
+# Tests.
+pytest>=8.0

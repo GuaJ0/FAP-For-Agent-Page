@@ -9,6 +9,11 @@ convergence.py's max_iterations cap, however, only counts records whose
 status != FAILED (i.e. SUCCESS, SUCCESS_AFTER_RETRY, ABANDONED) -- a FAILED
 record means "still retrying the same idea," not a new iteration of the
 research loop. See convergence.should_stop()'s docstring for why.
+
+Iteration 0 is reserved for the seeded baseline, established by
+bootstrap_baseline() before the research loop starts. Research-driven
+iterations are numbered from 1. A run that never calls bootstrap_baseline()
+simply has no iteration 0 and behaves exactly as it always did.
 """
 from __future__ import annotations
 
@@ -36,10 +41,27 @@ from agent.registry import CheckpointRegistry
 from agent.state import OrchestratorState, StateStore
 
 
+# Reserved for the seeded baseline (see Orchestrator.bootstrap_baseline).
+# _step() numbers research iterations from state.iteration + 1, and
+# state.iteration starts at 0, so the first research iteration is 1 and can
+# never collide with this.
+BOOTSTRAP_ITERATION = 0
+
+
 class OrchestratorHalted(RuntimeError):
     """Raised when tier-2 has fired: two consecutive tier-1 abandonments.
     The loop stops and waits for a human; call Orchestrator.resume_after_human()
     to clear the halt and continue."""
+
+
+class BootstrapError(RuntimeError):
+    """bootstrap_baseline() could not establish a usable iteration 0.
+
+    Raised rather than returned: without an incumbent, every downstream
+    delta, ACCEPT/REVERT decision and convergence check is computed against
+    nothing, which is the exact failure mode bootstrapping exists to prevent.
+    A caller that swallowed a soft failure would silently get that broken run
+    back."""
 
 
 def _iso_now() -> str:
@@ -78,6 +100,169 @@ class Orchestrator:
                 break
             self._step(history)
         return self.run_log.read_all()
+
+    def bootstrap_baseline(self, idea: Idea, diff: Diff) -> RunRecord:
+        """Run a known-good solution as iteration 0, before the research loop.
+
+        WHY THIS EXISTS
+        ---------------
+        `solution/` holds a real, already-verified baseline, but until it has
+        actually run through this loop the loop knows nothing about it:
+        runs.jsonl is empty, the registry is empty, and convergence's trailing
+        window has no scored iteration to trail. Three separate symptoms
+        follow, and they are all the same missing fact:
+
+          - `_handle_successful_run` computes
+            `delta = primary_mean - best.val_primary if best else primary_mean`,
+            so with an empty registry the first real iteration's "delta" is its
+            absolute score. An Evaluator that accepts on `delta > margin` then
+            accepts anything, including a result that lost to the baseline.
+          - `convergence.should_stop` needs `n_window + 1` scored records
+            before it evaluates progress at all, and the baseline was not one
+            of them -- so stalling near the baseline took an extra iteration to
+            notice.
+          - `Idea.parent_iteration` for the first hypothesis resolved to None
+            (empty history) even though it conceptually builds on the baseline.
+
+        Rather than patch delta computation, registry.py and convergence.py
+        separately, this makes the baseline a genuine iteration 0: a real
+        RunRecord in the history, registered through the same
+        `_register_checkpoint` an accepted iteration uses. All three symptoms
+        then resolve with no change to any of those files.
+
+        It runs the solution for real through `self.executor` rather than
+        taking a score on faith. Two reasons: the number stays honest as
+        `solution/` changes, and -- more concretely -- if nothing the Coding
+        agent tries ever beats the baseline, then `registry.best()` IS the
+        baseline, and whatever generates a submission needs a complete artifact
+        (result.json, checkpoint.npz) actually sitting at that path, not just a
+        number in a JSON file. Running it produces that as a side effect.
+
+        DELIBERATE CHOICES
+        ------------------
+        *The Evaluator is not consulted.* `EvaluatorAgent.judge` decides whether
+        to keep, discard, or give up on an iteration -- all three are incoherent
+        for the baseline. There is nothing to compare it against, and
+        "reverting" it would leave the run with no incumbent at all, which is
+        the state this method exists to escape. Worse, `FakeEvaluatorAgent`
+        judges on `delta_vs_current_best`, which is exactly the field that has
+        no meaning yet. So the decision is recorded as ACCEPT directly.
+
+        *`delta_vs_current_best` is None, not the absolute score.* There is no
+        current best -- establishing one is the point. Writing the raw score
+        into a field named "delta" is the original bug, not a workaround for
+        it. Nothing reads the field for the baseline: convergence.py keys off
+        `aggregate.primary_mean`, and the Evaluator is not called.
+
+        *The baseline counts toward `max_iterations`.* It is a concluded,
+        non-FAILED record, so `convergence.should_stop` counts it like any
+        other. That trades one research iteration for consistency; excluding it
+        would mean special-casing iteration 0 inside convergence.py, which is
+        the per-place patching this design avoids.
+
+        IDEMPOTENCE AND CRASH-RESUME
+        ----------------------------
+        Safe to call more than once and safe across a restart. The run log on
+        disk -- not in-memory state -- is the source of truth:
+
+          - a *successful* iteration 0 already in the log -> no-op, return it.
+          - any record from a later iteration -> raise, because the loop has
+            already produced real history and bootstrapping now would insert a
+            baseline underneath results that were computed without one.
+          - a *failed* iteration 0 and nothing else -> retry. A failed
+            bootstrap registers nothing, so there is no incumbent to
+            double-register, and re-running after fixing (say) the data path is
+            the obviously right behaviour.
+
+        Callers that never call this are completely unaffected: with no
+        iteration 0, everything behaves exactly as it did before.
+
+        Args:
+            idea: describes the baseline. `parent_iteration` is ignored --
+                iteration 0 is the root and has no parent.
+            diff: `solution_dir` is the directory the executor runs `train.py`
+                in; `diff_path` is the config file passed to it. Keeping the
+                config a sibling of `train.py` matters for anything that later
+                resolves a registry entry back to the source that produced it.
+
+        Returns:
+            The iteration-0 RunRecord -- freshly created, or the existing one
+            on a no-op.
+
+        Raises:
+            BootstrapError: the loop has already run, or the baseline failed.
+        """
+        history = self.run_log.read_all()
+
+        existing = next(
+            (r for r in history
+             if r.iteration == BOOTSTRAP_ITERATION and r.aggregate is not None),
+            None,
+        )
+        if existing is not None:
+            return existing
+
+        later = [r for r in history if r.iteration != BOOTSTRAP_ITERATION]
+        if later:
+            raise BootstrapError(
+                f"cannot bootstrap iteration {BOOTSTRAP_ITERATION}: the run log already holds "
+                f"{len(later)} record(s) from iteration(s) "
+                f"{sorted({r.iteration for r in later})}. Bootstrapping must happen before the "
+                "research loop starts, or the baseline would be inserted underneath results "
+                "that were already scored without it."
+            )
+
+        if self.state.run_start_time is None:
+            self.state.run_start_time = time.time()
+
+        seeds, agg = self.executor.run_seeds(
+            Path(diff.solution_dir), Path(diff.diff_path),
+            BOOTSTRAP_ITERATION, list(range(self._adaptive_n_seeds())),
+        )
+        self.state.seed_costs.extend(s.wall_s for s in seeds)
+
+        if agg is None:
+            # Record the failure before raising: the audit trail should show
+            # why bootstrapping failed, and a FAILED iteration-0 record does
+            # not block the retry (see IDEMPOTENCE above).
+            self.run_log.append(self._baseline_record(
+                idea, diff, seeds, agg=None,
+                detail="baseline run produced no usable validation metrics",
+            ))
+            self._save_state()
+            raise BootstrapError(
+                "the baseline itself failed to produce validation metrics, so there is no "
+                "incumbent to measure anything against. First seed reported: "
+                f"{self._feedback_from(seeds)}"
+            )
+
+        record = self._baseline_record(
+            idea, diff, seeds, agg=agg,
+            detail=f"baseline established as iteration {BOOTSTRAP_ITERATION}: "
+                   f"primary={agg.primary_mean:.4f} over {agg.n_seeds} seed(s)",
+        )
+        self.run_log.append(record)
+        self._register_checkpoint(BOOTSTRAP_ITERATION, diff, seeds, agg)
+        self._save_state()
+        return record
+
+    def _baseline_record(self, idea: Idea, diff: Diff, seeds, agg, detail: str) -> RunRecord:
+        succeeded = agg is not None
+        return RunRecord(
+            iteration=BOOTSTRAP_ITERATION,
+            parent_iteration=None,          # iteration 0 is the root
+            timestamp=_iso_now(),
+            hypothesis=idea.hypothesis,
+            diff_path=diff.diff_path,
+            status=Status.SUCCESS if succeeded else Status.FAILED,
+            seeds=seeds,
+            aggregate=agg,
+            # None, not the absolute score -- see the docstring.
+            delta_vs_current_best=None,
+            decision=Decision.ACCEPT if succeeded else None,
+            events=[Event(type="bootstrap", detail=detail, agent_action="orchestrator")],
+            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+        )
 
     def _step(self, history: list[RunRecord]) -> None:
         now = time.time()
@@ -188,17 +373,26 @@ class Orchestrator:
         self.run_log.append(record)
 
         if decision == Decision.ACCEPT:
-            # "The" checkpoint for a multi-seed run is the single seed that
-            # actually scored best -- primary_mean is an average across
-            # seeds and isn't any one checkpoint's number. Convention: a
-            # real train.py writes its checkpoint into the same directory as
-            # --out result.json, which is what artifact_dir points to.
-            ok_seeds = [s for s in seeds if s.failure_kind is None]
-            best_seed = max(ok_seeds, key=lambda s: s.primary)
-            checkpoint_path = best_seed.artifact_dir or diff.solution_dir
-            self.registry.register(iteration, checkpoint_path, agg.primary_mean)
+            self._register_checkpoint(iteration, diff, seeds, agg)
 
         self._close_idea(abandoned=False)
+
+    def _register_checkpoint(self, iteration: int, diff: Diff, seeds: list[SeedMetrics], agg) -> None:
+        """Register the accepted iteration's checkpoint.
+
+        "The" checkpoint for a multi-seed run is the single seed that actually
+        scored best -- primary_mean is an average across seeds and isn't any
+        one checkpoint's number. Convention: a real train.py writes its
+        checkpoint into the same directory as --out result.json, which is what
+        artifact_dir points to.
+
+        Extracted from _handle_successful_run so bootstrap_baseline() registers
+        through this exact code rather than a parallel copy of it.
+        """
+        ok_seeds = [s for s in seeds if s.failure_kind is None]
+        best_seed = max(ok_seeds, key=lambda s: s.primary)
+        checkpoint_path = best_seed.artifact_dir or diff.solution_dir
+        self.registry.register(iteration, checkpoint_path, agg.primary_mean)
 
     def _close_idea(self, abandoned: bool) -> None:
         if abandoned:

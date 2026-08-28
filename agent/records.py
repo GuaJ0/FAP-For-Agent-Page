@@ -37,6 +37,13 @@ class FailureKind(str, Enum):
     OOM = "oom"
     CRASH = "crash"
     BAD_OUTPUT = "bad_output"
+    # The run finished and produced a well-formed result.json, but the metrics
+    # it claimed did not survive an independent re-score of the raw predictions
+    # it persisted, through the vendored (authoritative) evaluate.py. Distinct
+    # from BAD_OUTPUT -- the output is *shaped* fine, it just isn't true -- so
+    # the Coding agent gets "your numbers are wrong" as feedback rather than
+    # "your file is malformed". See agent/verification.py.
+    METRIC_MISMATCH = "metric_mismatch"
 
 
 @dataclass(frozen=True)
