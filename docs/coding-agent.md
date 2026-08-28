@@ -130,3 +130,34 @@ predictions came from the validation split. A `train.py` that trained on
 validation, or that persisted test-split arrays, would verify clean. That is
 data hygiene rather than arithmetic honesty and would need the executor to know
 the split definitions.
+
+---
+
+# Running it
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # then set KUAIRAND_PATH (and OPENAI_API_KEY)
+```
+
+```bash
+# offline: no API key, no spend. Uses the hand-written template library.
+python scripts/run_loop.py --offline
+
+# live: real OpenAI generation.
+python scripts/run_loop.py --model gpt-5 \
+    --hypothesis "Replace pointwise logloss with a pairwise BPR ranking loss ..."
+```
+
+Outputs land in `logs/`: `runs.jsonl` (the agent-facing record),
+`coding_agent_usage.jsonl` (tokens + cost), `artifacts/` (per-seed
+`result.json`, `val_predictions.npz`, `checkpoint.npz`), and `quarantine/`
+(hidden-test metrics, which no agent ever reads).
+
+## Tests
+
+```bash
+pytest                                  # default: 100 tests, offline, ~2s
+RUN_SLOW_TESTS=1 KUAIRAND_PATH=... pytest -m slow    # real data, ~100s
+RUN_LLM_TESTS=1  OPENAI_API_KEY=...  pytest -m llm   # the only billable test
+```
