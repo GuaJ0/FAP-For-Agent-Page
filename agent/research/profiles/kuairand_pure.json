@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "profile_id": "kuairand-pure-long-view-v1",
+  "dataset_name": "KuaiRand-Pure",
+  "task": "within-user ranking of logged short-video impressions",
+  "label": "long_view",
+  "metrics": ["GAUC", "nDCG@5"],
+  "interaction_semantics": "Implicit-feedback impressions with chronological interaction, exposure-context, engagement, and watch-duration signals.",
+  "allowed_data_boundary": ["public_metadata", "train", "validation"],
+  "available_signals": [
+    {
+      "family": "identity",
+      "method_family": "feature_interaction",
+      "fields": ["user_id", "video_id", "author_id"],
+      "description": "Stable user, video, and creator identifiers support embeddings and interaction models."
+    },
+    {
+      "family": "exposure_context",
+      "method_family": "context_features",
+      "fields": ["tab"],
+      "description": "The logged feed surface provides exposure context for each impression."
+    },
+    {
+      "family": "content_duration",
+      "method_family": "watch_time",
+      "fields": ["duration_ms", "dur_bucket"],
+      "description": "Video duration supports duration-aware long-view and watch-time modelling."
+    },
+    {
+      "family": "behavior_sequence",
+      "method_family": "sequence_modeling",
+      "fields": ["user_id", "video_id", "date", "time_ms"],
+      "description": "Chronological impressions permit training-side recent-history and preference-drift features."
+    },
+    {
+      "family": "engagement",
+      "method_family": "multi_task",
+      "fields": ["is_click", "is_like", "is_follow", "is_comment", "is_forward"],
+      "description": "Related observed engagement labels may provide auxiliary supervision for long_view."
+    },
+    {
+      "family": "watch_behavior",
+      "method_family": "watch_time",
+      "fields": ["play_time_ms", "duration_ms"],
+      "description": "Observed play time and content duration provide training-side engagement-intensity signals."
+    },
+    {
+      "family": "user_profile",
+      "method_family": "context_features",
+      "fields": ["user_active_degree", "follow_user_num_range", "fans_user_num_range", "friend_user_num_range", "register_days_range"],
+      "description": "Public user-profile buckets describe activity and social-graph scale."
+    },
+    {
+      "family": "video_profile",
+      "method_family": "content_features",
+      "fields": ["video_type", "upload_type", "tag"],
+      "description": "Public video metadata supplies content-side categories beyond identity."
+    }
+  ],
+  "assumptions": [
+    "All method selection and outcome reasoning uses public metadata plus training and validation information only.",
+    "The primary objective is ranking each user's logged impressions rather than global probability calibration alone.",
+    "Method feasibility must be judged against the remaining iteration and wall-clock budget.",
+    "Available signals are capabilities, not permission to assume that the incumbent currently uses them."
+  ],
+  "public_sources": [
+    "https://arxiv.org/abs/2208.08696",
+    "https://github.com/chongminggao/KuaiRand"
+  ]
+}
