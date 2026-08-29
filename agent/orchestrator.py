@@ -332,7 +332,7 @@ class Orchestrator:
                 ),
                 agent_action="orchestrator",
             )],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            resources=self._resource_usage(sum(s.wall_s for s in seeds)),
         )
         self.run_log.append(record)
 
@@ -366,7 +366,7 @@ class Orchestrator:
             delta_vs_current_best=delta,
             decision=None,
             events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            resources=self._resource_usage(sum(s.wall_s for s in seeds)),
         )
         decision = self.evaluator.judge(record, history)
         record.decision = decision
@@ -410,6 +410,24 @@ class Orchestrator:
         self.state.fix_attempts = 0
         self.state.idea_start_time = None
         self.state.last_failure_feedback = None
+
+    def _resource_usage(self, wall_s: float) -> ResourceUsage:
+        """wall_s plus the Coding agent's token usage for the implement()
+        call that produced this iteration.
+
+        `last_usage` is a duck-typed extension, not part of the CodingAgent
+        Protocol: LLMCodingAgent sets it (scoped to exactly the most recent
+        implement() call, including any inner repair-loop retries -- see
+        agent/coding/llm.py's "COST ACCOUNTING" note, which flagged this as
+        the wiring needed here). FakeCodingAgent and any other implementer
+        without the attribute fall back to 0/0, same as before this existed.
+        """
+        usage = getattr(self.coding, "last_usage", {})
+        return ResourceUsage(
+            wall_s=wall_s,
+            tokens_in=usage.get("tokens_in", 0),
+            tokens_out=usage.get("tokens_out", 0),
+        )
 
     def _feedback_from(self, seeds: list[SeedMetrics]) -> str:
         failing = [s for s in seeds if s.failure_kind is not None]
