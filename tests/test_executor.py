@@ -129,3 +129,60 @@ def test_assert_no_forbidden_keys_guard():
         assert_no_forbidden_keys({"test_primary": 0.6})
     with pytest.raises(QuarantineLeakError):
         assert_no_forbidden_keys({"nested": [{"gauc_test": 0.6}]})
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-4: cpu_s must measure real CPU time (resource.getrusage deltas), not
+# stand in for wall_s under a different name. The two tests below are a pair
+# specifically because either one alone wouldn't prove that: a large cpu_s
+# could just mean "wall_s was copied here too," and a small one could just
+# mean "the fixture barely ran." Together they show the measurement tracks
+# actual CPU-bound work and does NOT count time spent merely sleeping.
+# ---------------------------------------------------------------------------
+
+def _cpu_burn_solution(tmp_path, burn_s):
+    """A minimal train.py that busy-loops on real CPU (via time.process_time,
+    not time.sleep) for ~burn_s seconds, then writes a valid result.json.
+    Deliberately not fake_train.py: that fixture's "work" is time.sleep,
+    which yields the CPU and would prove nothing about a CPU-time measurement."""
+    sol_dir = tmp_path / "sol"
+    sol_dir.mkdir(exist_ok=True)
+    (sol_dir / "train.py").write_text(f'''
+import argparse, json, time
+ap = argparse.ArgumentParser()
+ap.add_argument("--config", required=True)
+ap.add_argument("--seed", type=int, required=True)
+ap.add_argument("--out", required=True)
+a = ap.parse_args()
+t0 = time.process_time()
+x = 0
+while time.process_time() - t0 < {burn_s}:
+    x += 1  # real CPU-bound work, not a sleep
+json.dump({{"primary": 0.6, "gauc": 0.6, "ndcg5": 0.6, "epochs_run": 1}}, open(a.out, "w"))
+''')
+    config_path = sol_dir / "config.json"
+    config_path.write_text("{}")
+    return sol_dir, config_path
+
+
+def test_cpu_s_measures_real_cpu_bound_work(tmp_path):
+    sol_dir, config_path = _cpu_burn_solution(tmp_path, burn_s=0.3)
+    ex, _ = _executor(tmp_path)
+
+    result = ex.run_seed(sol_dir, config_path, seed=0, iteration=1)
+
+    assert result.failure_kind is None, result.traceback_tail
+    assert result.cpu_s >= 0.25, f"expected ~0.3s of measured CPU time, got {result.cpu_s}"
+
+
+def test_cpu_s_does_not_count_pure_sleep_as_cpu_time(tmp_path):
+    """The whole point of measuring via getrusage instead of wall_s: a
+    process that sleeps for 0.3s (yielding the CPU the entire time, like
+    fake_train.py's simulated training delay) must NOT show ~0.3s of cpu_s."""
+    sol_dir, config_path = _solution(tmp_path, mode="normal", sleep_s=0.3)
+    ex, _ = _executor(tmp_path)
+
+    result = ex.run_seed(sol_dir, config_path, seed=0, iteration=1)
+
+    assert result.failure_kind is None
+    assert result.cpu_s < 0.1, f"a 0.3s sleep should not register as CPU time, got {result.cpu_s}"

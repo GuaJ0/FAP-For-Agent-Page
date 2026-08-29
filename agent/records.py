@@ -61,6 +61,13 @@ class SeedMetrics:
     failure_kind: Optional[FailureKind] = None
     traceback_tail: Optional[str] = None  # last N stderr lines, only set on failure
     artifact_dir: Optional[str] = None    # persistent dir holding result.json (+ any checkpoint), set on success only
+    # Real measured CPU time (user+sys) the subprocess consumed, from
+    # resource.getrusage(RUSAGE_CHILDREN) deltas -- not wall_s. On a
+    # single-threaded workload these are close, but a BLAS backend that uses
+    # multiple threads for matrix ops would make wall_s understate actual
+    # compute consumed. Set on every path, including failures/timeouts: a
+    # crashed or timed-out run still burned real CPU. See agent/executor.py.
+    cpu_s: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -71,6 +78,7 @@ class SeedMetrics:
     def from_json(cls, d: dict[str, Any]) -> "SeedMetrics":
         d = dict(d)
         d.setdefault("artifact_dir", None)
+        d.setdefault("cpu_s", 0.0)
         if d.get("failure_kind") is not None:
             d["failure_kind"] = FailureKind(d["failure_kind"])
         return cls(**d)
@@ -114,13 +122,19 @@ class ResourceUsage:
     gpu_s: float = 0.0
     tokens_in: int = 0
     tokens_out: int = 0
+    # Real measured CPU time (sum of SeedMetrics.cpu_s across this iteration's
+    # seeds) in hours, not derived from wall_s. This system trains on numpy
+    # over CPU only -- gpu_s stays 0.0 by design, not by omission, and
+    # cpu_hours is what actually reports the compute Feasibility scoring asks
+    # for. See Orchestrator._resources().
+    cpu_hours: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "ResourceUsage":
-        return cls(**d)
+        return cls(**d)  # a missing cpu_hours key (old records) uses the field default
 
 
 @dataclass
