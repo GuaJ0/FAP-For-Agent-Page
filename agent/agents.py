@@ -20,9 +20,32 @@ class Idea:
 
 
 @dataclass(frozen=True)
+class AgentUsage:
+    """What one implement() call cost. Optional -- a CodingAgent that doesn't
+    track usage simply leaves Diff.usage as None.
+
+    `cost_usd` is carried here but deliberately does NOT get a field on
+    ResourceUsage. Token counts are ground truth from the API; a dollar figure
+    is derived from a mutable list-price table, so persisting one into an
+    append-only log freezes a number that silently goes stale as prices change.
+    Tokens are what's stored; cost stays derivable (agent/coding/llm.py's
+    pricing table) and is logged alongside the model name in
+    logs/coding_agent_usage.jsonl. The orchestrator also writes it into a
+    per-iteration Event so it's visible in runs.jsonl without a schema change.
+    """
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
 class Diff:
     diff_path: str      # where the change is recorded (patch file, commit ref, ...)
     solution_dir: str    # directory containing train.py + config.yaml, ready for the executor
+    # Optional: what producing this cost. orchestrator.py folds it into
+    # RunRecord.resources; None means "not tracked" and yields today's
+    # wall_s-only ResourceUsage.
+    usage: Optional[AgentUsage] = None
 
 
 class ResearchAgent(Protocol):

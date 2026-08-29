@@ -94,37 +94,30 @@ attempt.
 
 # Known gaps — for whoever picks this up
 
-## 1. `RunRecord.resources` is still not populated  ← the one I was asked to flag
+## 1. ~~`RunRecord.resources` is not populated~~ — FIXED
 
-`ResourceUsage(wall_s, gpu_s, tokens_in, tokens_out)` exists on every
-`RunRecord`, and `orchestrator.py` constructs it with `wall_s` only. Nothing
-ever sets `tokens_in` / `tokens_out`.
+**Was:** `ResourceUsage(wall_s, gpu_s, tokens_in, tokens_out)` sat on every
+`RunRecord` and only `wall_s` was ever set, so every record reported zero
+tokens regardless of what the run actually spent.
 
-Token and dollar figures are therefore written to their own file,
-`logs/coding_agent_usage.jsonl`, one line per LLM call:
+**Now:** `Diff` carries an optional `AgentUsage(tokens_in, tokens_out,
+cost_usd)`, `LLMCodingAgent` populates it with that `implement()` call's
+totals (repair cycles included), and `orchestrator.py` folds it into
+`ResourceUsage`. Both the success **and** the failure path — a failed attempt
+still costs tokens, and it's usually the most expensive one since it's the one
+that burned repairs.
 
-```json
-{"timestamp": …, "agent": "coding", "purpose": "generate", "attempt": 0,
- "model": "gpt-5", "is_real_model_call": true,
- "tokens_in": 8412, "tokens_out": 2170, "cost_usd": 0.032218, "idea": "…"}
-```
+`usage=None` (the default, and what `FakeCodingAgent` produces) yields exactly
+the old `wall_s`-only record, which is what keeps `tests/test_orchestrator.py`
+passing unmodified.
 
-Wiring this into `RunRecord.resources` means editing `orchestrator.py`, which
-was out of scope this round. When someone is authorised:
-
-- `LLMCodingAgent.last_usage` already holds the per-`implement()` totals, which
-  is the right granularity — one `RunRecord` is one iteration.
-- `UsageLog.as_resource_usage(wall_s)` is a ready-made shim, but it aggregates
-  the *whole run*, not one iteration. Prefer `last_usage`.
-- Both `_handle_successful_run` and `_handle_failed_run` build
-  `ResourceUsage(wall_s=...)` and both need the change, or failed attempts
-  (which still cost tokens — often the most) will report zero.
-
-**Caveat on the dollar column:** `PRICING_USD_PER_MTOK` in `agent/coding/llm.py`
-is a hardcoded list-price table and prices change. Token counts come straight
-from the API response and are always exact; only `cost_usd` depends on that
-table. Override without a code change via `OPENAI_PRICE_IN_PER_MTOK` /
-`OPENAI_PRICE_OUT_PER_MTOK`.
+**`cost_usd` deliberately has no `ResourceUsage` field.** Token counts are
+ground truth from the API response; a dollar figure is derived from a mutable
+list-price table, so persisting one into an append-only log freezes a number
+that goes quietly stale as prices change. Tokens are what's stored; cost stays
+derivable, is logged next to the model name in `logs/coding_agent_usage.jsonl`,
+and the orchestrator also writes it into a per-iteration `coding_usage` event
+so it's visible in `runs.jsonl` without a `records.py` schema change.
 
 ## 2. `Diff.diff_path` is really the config path
 

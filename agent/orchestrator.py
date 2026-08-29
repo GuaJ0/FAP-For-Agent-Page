@@ -265,7 +265,9 @@ class Orchestrator:
             delta_vs_current_best=None,
             decision=Decision.ACCEPT if succeeded else None,
             events=[Event(type="bootstrap", detail=detail, agent_action="orchestrator")],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            # The baseline is a pre-existing solution, not something an agent
+            # wrote, so it has no LLM usage to attribute.
+            resources=self._resources(diff, seeds),
         )
 
     def _step(self, history: list[RunRecord]) -> None:
@@ -335,8 +337,8 @@ class Orchestrator:
                     f"reason={'attempt_cap' if self.state.fix_attempts >= self.cfg.retry.max_fix_attempts else 'time_backstop' if should_abandon else 'will_retry'}"
                 ),
                 agent_action="orchestrator",
-            )],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            )] + self._usage_event(diff),
+            resources=self._resources(diff, seeds),
         )
         self.run_log.append(record)
 
@@ -369,8 +371,9 @@ class Orchestrator:
             aggregate=agg,
             delta_vs_current_best=delta,
             decision=None,
-            events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")]
+                   + self._usage_event(diff),
+            resources=self._resources(diff, seeds),
         )
         decision = self.evaluator.judge(record, history)
         record.decision = decision
@@ -380,6 +383,45 @@ class Orchestrator:
             self._register_checkpoint(iteration, diff, seeds, agg)
 
         self._close_idea(abandoned=False)
+
+    def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
+        """Build the iteration's ResourceUsage, including LLM tokens.
+
+        ResourceUsage has carried tokens_in/tokens_out since the schema was
+        written and nothing ever populated them, so every RunRecord reported
+        zero tokens no matter what the run actually spent. A CodingAgent that
+        tracks usage now reports it on the Diff it returns, and this folds it
+        in. `usage=None` (FakeCodingAgent, and any agent that doesn't track)
+        yields exactly the wall_s-only ResourceUsage as before.
+
+        Called from the failed path as well as the successful one: a failed
+        attempt still costs tokens, and it is often the most expensive kind,
+        since it is the one that burned repair cycles.
+        """
+        wall_s = sum(s.wall_s for s in seeds)
+        if diff.usage is None:
+            return ResourceUsage(wall_s=wall_s)
+        return ResourceUsage(
+            wall_s=wall_s,
+            tokens_in=diff.usage.tokens_in,
+            tokens_out=diff.usage.tokens_out,
+        )
+
+    @staticmethod
+    def _usage_event(diff: Diff) -> list[Event]:
+        """cost_usd has no field on ResourceUsage (see AgentUsage's docstring),
+        so it lands in the audit trail as an event instead -- visible in
+        runs.jsonl without changing records.py's schema. Emitted only when
+        there was real usage, so records from agents that don't track usage are
+        byte-identical to before."""
+        u = diff.usage
+        if u is None or (u.tokens_in == 0 and u.tokens_out == 0):
+            return []
+        return [Event(
+            type="coding_usage",
+            detail=f"tokens_in={u.tokens_in} tokens_out={u.tokens_out} cost_usd={u.cost_usd:.6f}",
+            agent_action="coding",
+        )]
 
     def _register_checkpoint(self, iteration: int, diff: Diff, seeds: list[SeedMetrics], agg) -> None:
         """Register the accepted iteration's checkpoint.

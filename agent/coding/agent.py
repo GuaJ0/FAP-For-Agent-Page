@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.agents import Diff, Idea
+from agent.agents import AgentUsage, Diff, Idea
 from agent.coding import prompts
 from agent.coding.llm import LLMClient, LLMResponse, UsageLog, default_client
 from agent.verification import Status as VerifyStatus, verify_result
@@ -306,7 +306,19 @@ class LLMCodingAgent:
         }
         self._write_manifest(sol_dir, idea, feedback, history, calls, time.time() - t0,
                              provenance=provenance)
-        return Diff(diff_path=str(config_path), solution_dir=str(sol_dir))
+        # Hand usage back so orchestrator.py can put it in RunRecord.resources.
+        # This is per-implement() totals -- one iteration's worth -- which is
+        # the granularity a RunRecord wants. It includes the inner repair
+        # cycles, since those are part of what this iteration cost.
+        return Diff(
+            diff_path=str(config_path),
+            solution_dir=str(sol_dir),
+            usage=AgentUsage(
+                tokens_in=self.last_usage["tokens_in"],
+                tokens_out=self.last_usage["tokens_out"],
+                cost_usd=self.last_usage["cost_usd"],
+            ),
+        )
 
     # -- internals -----------------------------------------------------------
 
