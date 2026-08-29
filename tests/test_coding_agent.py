@@ -650,3 +650,117 @@ def test_smoke_failure_feeds_the_diagnosis_into_the_repair_prompt(tmp_path):
     _, repair_user, purpose = client.calls[1]
     assert purpose == "repair"
     assert "verify" in repair_user and "mismatch" in repair_user
+
+
+# ---------------------------------------------------------------------------
+# Attempt directories are append-only.
+#
+# _counter used to reset to 0 in every process and the create path rmtree'd any
+# existing directory, so a second run against the same work_dir deleted the
+# first run's attempt_000 -- while runs.jsonl still recorded that path as the
+# iteration's diff_path/patch_path and _current_best_source() still resolved
+# the incumbent's train.py from it. Nothing raised; the artifact just stopped
+# describing the code it claimed to.
+# ---------------------------------------------------------------------------
+
+def test_a_second_process_does_not_overwrite_the_first_runs_attempt(tmp_path):
+    """The headline case: two agents over the same work_dir, as two runs are."""
+    work = tmp_path / "solutions"
+
+    first = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+    first.work_dir = work
+    first.__post_init__()
+    d1 = first.implement(Idea("first run idea", None), None)
+    marker = "# FIRST RUN MARKER\n"
+    (Path(d1.solution_dir) / "train.py").write_text(marker + RANKING_TEMPLATE)
+
+    # A brand-new agent over the same work_dir, as a restarted process is.
+    second = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+    second.work_dir = work
+    second.__post_init__()
+    d2 = second.implement(Idea("second run idea", None), None)
+
+    assert d1.solution_dir != d2.solution_dir
+    assert Path(d1.solution_dir).name == "attempt_000"
+    assert Path(d2.solution_dir).name == "attempt_001"
+    # The first run's source is still intact and still what runs.jsonl points at.
+    assert (Path(d1.solution_dir) / "train.py").read_text().startswith(marker)
+
+
+def test_numbering_resumes_past_whatever_is_already_on_disk(tmp_path):
+    work = tmp_path / "solutions"
+    for n in (0, 1, 2, 7):                      # 7 leaves a gap on purpose
+        (work / f"attempt_{n:03d}").mkdir(parents=True)
+
+    agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+    agent.work_dir = work
+    agent.__post_init__()
+
+    diff = agent.implement(Idea("an idea", None), None)
+
+    # Continues past the highest, rather than filling the gap or reusing 000.
+    assert Path(diff.solution_dir).name == "attempt_008"
+
+
+def test_unrelated_directories_do_not_break_numbering(tmp_path):
+    work = tmp_path / "solutions"
+    work.mkdir(parents=True)
+    (work / "attempt_004").mkdir()
+    (work / "attempt_notanumber").mkdir()       # must be ignored, not crash
+    (work / "scratch").mkdir()
+    (work / "attempt_009.txt").write_text("a file, not a directory")
+
+    agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+    agent.work_dir = work
+    agent.__post_init__()
+
+    diff = agent.implement(Idea("an idea", None), None)
+
+    assert Path(diff.solution_dir).name == "attempt_005"
+
+
+def test_an_existing_directory_is_skipped_not_deleted(tmp_path):
+    """Belt and braces: if the target appears after the initial scan, take the
+    next number. Deleting it is what caused the bug."""
+    work = tmp_path / "solutions"
+    work.mkdir(parents=True)
+    agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+    agent.work_dir = work
+    agent.__post_init__()
+
+    # Appears behind the agent's back, after it scanned.
+    squatter = work / "attempt_000"
+    squatter.mkdir()
+    (squatter / "precious.txt").write_text("must survive")
+
+    diff = agent.implement(Idea("an idea", None), None)
+
+    assert Path(diff.solution_dir).name == "attempt_001"
+    assert (squatter / "precious.txt").read_text() == "must survive"
+
+
+def test_successive_attempts_in_one_process_still_increment(tmp_path):
+    agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)] * 3)
+
+    names = [Path(agent.implement(Idea(f"idea {i}", None), None).solution_dir).name
+             for i in range(3)]
+
+    assert names == ["attempt_000", "attempt_001", "attempt_002"]
+
+
+def test_last_shipped_source_is_the_highest_numbered_not_the_lexical_last(tmp_path):
+    """Ordering is by attempt number. Zero-padding only sorts correctly below
+    attempt_999, and numbering now accumulates across runs instead of
+    restarting, so that ceiling became reachable."""
+    work = tmp_path / "solutions"
+    for n, marker in ((999, "# OLD\n"), (1000, "# NEWEST\n")):
+        d = work / f"attempt_{n:03d}"
+        d.mkdir(parents=True)
+        (d / "train.py").write_text(marker + RANKING_TEMPLATE)
+
+    agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+    agent.work_dir = work
+    agent.__post_init__()
+
+    # Lexically "attempt_1000" < "attempt_999", so a sorted() would pick 999.
+    assert agent._last_shipped_source().startswith("# NEWEST")

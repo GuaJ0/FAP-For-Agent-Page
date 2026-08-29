@@ -253,6 +253,10 @@ class LLMCodingAgent:
     def __post_init__(self) -> None:
         self.work_dir = Path(self.work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        # Resume numbering after whatever is already on disk. _counter used to
+        # start at 0 in every new process, so a second run against the same
+        # work_dir reused attempt_000 -- see _next_solution_dir.
+        self._counter = self._highest_existing_attempt() + 1
         if self.llm is None:
             self.llm = default_client()
         if self.usage_log_path is None:
@@ -271,12 +275,7 @@ class LLMCodingAgent:
         and tier-1 retry/abandonment does its job.
         """
         t0 = time.time()
-        n = self._counter
-        self._counter += 1
-        sol_dir = self.work_dir / f"attempt_{n:03d}"
-        if sol_dir.exists():
-            shutil.rmtree(sol_dir)
-        sol_dir.mkdir(parents=True)
+        sol_dir = self._next_solution_dir()
         self._scaffold(sol_dir)
 
         baseline, provenance = self._current_best_source()
@@ -409,6 +408,50 @@ class LLMCodingAgent:
             print(f"[coding-agent] could not resolve the current best, "
                   f"falling back to the static baseline: {type(e).__name__}: {e}", flush=True)
             return fallback
+
+    ATTEMPT_RE = re.compile(r"^attempt_(\d+)$")
+
+    def _highest_existing_attempt(self) -> int:
+        """Largest attempt number already in work_dir, or -1 if there are none.
+
+        Parsed from the directory names rather than tracked in a file: the
+        directories are the fact, and any sidecar counter could disagree with
+        them after a manual move or a partial cleanup.
+        """
+        highest = -1
+        for child in self.work_dir.iterdir():
+            if not child.is_dir():
+                continue
+            m = self.ATTEMPT_RE.match(child.name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+        return highest
+
+    def _next_solution_dir(self) -> Path:
+        """Create and return a fresh attempt directory. Never reuses one.
+
+        This previously took the next number from an in-memory counter that
+        reset to 0 in every process, then `shutil.rmtree`'d the directory if it
+        already existed. A second run against the same work_dir therefore
+        deleted the first run's attempt_000 -- while runs.jsonl still recorded
+        that path as the iteration's diff_path/patch_path, and
+        _current_best_source() still resolved the incumbent's train.py from it.
+        The graded artifact silently described code that was no longer there,
+        and the Coding agent built on the wrong source. Nothing raised.
+
+        So: numbering continues past whatever is on disk, and an existing
+        directory is skipped rather than destroyed. Attempt directories are
+        append-only, like the run log that points at them.
+        """
+        while True:
+            sol_dir = self.work_dir / f"attempt_{self._counter:03d}"
+            self._counter += 1
+            try:
+                sol_dir.mkdir(parents=True)
+                return sol_dir
+            except FileExistsError:
+                # Raced, or appeared since __post_init__ scanned. Take the next.
+                continue
 
     def _scaffold(self, sol_dir: Path) -> None:
         """Copy the vendored harness in so the dir is self-contained.
@@ -575,8 +618,20 @@ class LLMCodingAgent:
         (sol_dir / "changes.patch").write_text("".join(diff))
 
     def _last_shipped_source(self) -> Optional[str]:
-        prior = sorted(self.work_dir.glob("attempt_*/train.py"))
-        return prior[-1].read_text() if prior else None
+        """The most recent attempt's source, by attempt NUMBER.
+
+        Sorted numerically, not lexically: zero-padding only orders correctly
+        below attempt_999, and numbering now accumulates across runs rather
+        than restarting, so that ceiling is reachable in a way it wasn't before.
+        """
+        numbered = []
+        for train_py in self.work_dir.glob("attempt_*/train.py"):
+            m = self.ATTEMPT_RE.match(train_py.parent.name)
+            if m:
+                numbered.append((int(m.group(1)), train_py))
+        if not numbered:
+            return None
+        return max(numbered)[1].read_text()
 
     def _write_manifest(self, sol_dir, idea, feedback, history, calls, wall_s,
                         provenance: str = "") -> None:
