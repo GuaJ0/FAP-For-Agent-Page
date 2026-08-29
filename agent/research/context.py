@@ -1,6 +1,8 @@
 """Build the validation-only context used to choose the next hypothesis."""
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
@@ -48,6 +50,7 @@ class ResearchContext:
     remaining_iterations: int
     remaining_wall_s: float
     minimum_meaningful_delta: float
+    history_fingerprint: str
     task: str = "KuaiRand-Pure within-user ranking of logged impressions"
     label: str = "long_view"
     primary_metric: str = "mean(GAUC, nDCG@5)"
@@ -56,6 +59,22 @@ class ResearchContext:
         payload = asdict(self)
         assert_no_forbidden_keys(payload)
         return payload
+
+
+def build_history_fingerprint(history: Sequence[RunRecord]) -> str:
+    """Fingerprint the exact authoritative RunRecord sequence.
+
+    ResearchMemory uses the same digest to prove that its enrichment index was
+    reconciled against the context supplied to QueryPlanner.
+    """
+    payload = json.dumps(
+        [record.to_json() for record in history],
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -138,6 +157,7 @@ def build_research_context(
         remaining_iterations=remaining_iterations,
         remaining_wall_s=remaining_wall_s,
         minimum_meaningful_delta=cfg.epsilon,
+        history_fingerprint=build_history_fingerprint(records),
     )
     # Structural backstop: this is the exact JSON-compatible payload that will
     # later be placed in the Research prompt.
