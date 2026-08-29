@@ -146,17 +146,36 @@ def test_implement_returns_a_runnable_self_contained_solution_dir(tmp_path):
     assert (sol / "data.py").exists()
 
 
-def test_diff_path_is_the_config_file_the_orchestrator_will_pass_to_the_executor(tmp_path):
-    """orchestrator.py hands Diff.diff_path to Executor.run_seeds as the
-    config path, whatever agents.py's docstring calls the field. If this ever
-    stops being a readable config, every run fails at the first seed."""
+def test_config_path_is_what_the_orchestrator_will_pass_to_the_executor(tmp_path):
+    """orchestrator.py hands Diff.config_path to Executor.run_seeds. If this
+    ever stops being a readable config, every run fails at the first seed.
+
+    This test used to be named for `diff_path`, back when Diff had a single
+    field documented as a patch file but consumed as the config. The field is
+    now split into config_path and patch_path, and this pins the one the
+    executor depends on.
+    """
     agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
 
     diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
 
-    cfg_path = Path(diff.diff_path)
+    cfg_path = Path(diff.config_path)
     assert cfg_path.exists()
     assert json.loads(cfg_path.read_text())["data_dir"] == str(tmp_path / "data")
+
+
+def test_patch_path_points_at_the_real_unified_diff(tmp_path):
+    """The other half of the split: patch_path is an actual patch file, which
+    is what Diff's field was always documented to be."""
+    agent = _agent(tmp_path, [_fenced(RANKING_TEMPLATE)])
+
+    diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
+
+    assert diff.patch_path is not None
+    patch = Path(diff.patch_path)
+    assert patch.name == "changes.patch"
+    assert patch.exists()
+    assert patch.parent == Path(diff.solution_dir)
 
 
 def test_a_real_unified_diff_is_still_written_for_the_audit_trail(tmp_path):
@@ -174,7 +193,7 @@ def test_base_config_overrides_reach_the_config_file(tmp_path):
 
     diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
 
-    cfg = json.loads(Path(diff.diff_path).read_text())
+    cfg = json.loads(Path(diff.config_path).read_text())
     assert cfg["loss"] == "bpr" and cfg["epochs"] == 5
 
 
@@ -246,7 +265,7 @@ def test_repairs_are_capped_and_the_last_attempt_is_still_shipped(tmp_path):
     assert manifest["succeeded"] is False
     assert len(manifest["cycles"]) == 3          # 1 generate + 2 repairs, no more
     assert (Path(diff.solution_dir) / "train.py").exists()
-    assert Path(diff.diff_path).exists()
+    assert Path(diff.config_path).exists()
 
 
 def test_prose_only_response_is_treated_as_a_failed_cycle(tmp_path):

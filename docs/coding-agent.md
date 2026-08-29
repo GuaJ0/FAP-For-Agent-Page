@@ -44,6 +44,38 @@ it wrote instead of starting over and reintroducing solved bugs.
 orchestrator has no `try/except` around the call, so raising would kill the
 whole run instead of being recorded as one honest failed iteration.
 
+## Accumulation: each idea builds on the current best
+
+The agent used to start every idea from the static `solution/train.py`, so
+improvements never compounded — iteration 5 was written against the baseline,
+not against whatever iterations 1–4 had established.
+
+It now resolves the current best by chaining three things the harness already
+maintains:
+
+```
+registry.best()   → the accepted iteration with the best validation primary
+runs.jsonl        → that iteration's RunRecord
+record.diff_path  → the config the executor ran, whose sibling train.py is
+                    the source that actually produced the score
+```
+
+Pass `registry_path` and `run_log_path` to enable it (`run_loop.py` does).
+Both default to `None`, which keeps the old static-baseline behaviour exactly
+— so existing callers and tests are unaffected.
+
+A useful property falls out of `bootstrap_baseline()`: immediately after
+bootstrapping, the best is iteration 0 whose config is `solution/config.yaml`,
+so the sibling `train.py` **is** `solution/train.py`. "Current best" and
+"static baseline" resolve to the same file until something actually beats the
+baseline, which is what makes this safe to turn on by default. That identity
+is pinned by a test.
+
+Resolution fails soft in every direction — missing registry, empty registry,
+no matching record, a cleaned-up solution dir, a corrupt run log — falling
+back to the static baseline rather than raising. A provenance problem must not
+take down a run. Each attempt's `attempt.json` records what it was `built_from`.
+
 ## Clients
 
 | client | real model? | use |
@@ -62,51 +94,90 @@ attempt.
 
 # Known gaps — for whoever picks this up
 
-## 1. `RunRecord.resources` is still not populated  ← the one I was asked to flag
+## 1. ~~`RunRecord.resources` is not populated~~ — FIXED
 
-`ResourceUsage(wall_s, gpu_s, tokens_in, tokens_out)` exists on every
-`RunRecord`, and `orchestrator.py` constructs it with `wall_s` only. Nothing
-ever sets `tokens_in` / `tokens_out`.
+**Was:** `ResourceUsage(wall_s, gpu_s, tokens_in, tokens_out)` sat on every
+`RunRecord` and only `wall_s` was ever set, so every record reported zero
+tokens regardless of what the run actually spent.
 
-Token and dollar figures are therefore written to their own file,
-`logs/coding_agent_usage.jsonl`, one line per LLM call:
+**Now:** `Diff` carries an optional `AgentUsage(tokens_in, tokens_out,
+cost_usd)`, `LLMCodingAgent` populates it with that `implement()` call's
+totals (repair cycles included), and `orchestrator.py` folds it into
+`ResourceUsage`. Both the success **and** the failure path — a failed attempt
+still costs tokens, and it's usually the most expensive one since it's the one
+that burned repairs.
 
-```json
-{"timestamp": …, "agent": "coding", "purpose": "generate", "attempt": 0,
- "model": "gpt-5", "is_real_model_call": true,
- "tokens_in": 8412, "tokens_out": 2170, "cost_usd": 0.032218, "idea": "…"}
-```
+`usage=None` (the default, and what `FakeCodingAgent` produces) yields exactly
+the old `wall_s`-only record, which is what keeps `tests/test_orchestrator.py`
+passing unmodified.
 
-Wiring this into `RunRecord.resources` means editing `orchestrator.py`, which
-was out of scope this round. When someone is authorised:
+**`cost_usd` deliberately has no `ResourceUsage` field.** Token counts are
+ground truth from the API response; a dollar figure is derived from a mutable
+list-price table, so persisting one into an append-only log freezes a number
+that goes quietly stale as prices change. Tokens are what's stored; cost stays
+derivable, is logged next to the model name in `logs/coding_agent_usage.jsonl`,
+and the orchestrator also writes it into a per-iteration `coding_usage` event
+so it's visible in `runs.jsonl` without a `records.py` schema change.
 
-- `LLMCodingAgent.last_usage` already holds the per-`implement()` totals, which
-  is the right granularity — one `RunRecord` is one iteration.
-- `UsageLog.as_resource_usage(wall_s)` is a ready-made shim, but it aggregates
-  the *whole run*, not one iteration. Prefer `last_usage`.
-- Both `_handle_successful_run` and `_handle_failed_run` build
-  `ResourceUsage(wall_s=...)` and both need the change, or failed attempts
-  (which still cost tokens — often the most) will report zero.
+## 2. ~~`Diff.diff_path` is really the config path~~ — FIXED
 
-**Caveat on the dollar column:** `PRICING_USD_PER_MTOK` in `agent/coding/llm.py`
-is a hardcoded list-price table and prices change. Token counts come straight
-from the API response and are always exact; only `cost_usd` depends on that
-table. Override without a code change via `OPENAI_PRICE_IN_PER_MTOK` /
-`OPENAI_PRICE_OUT_PER_MTOK`.
+**Was:** `agents.py` documented `Diff.diff_path` as "where the change is
+recorded (patch file, commit ref, ...)", but `orchestrator.py` passed it
+straight to `Executor.run_seeds()` as the config path. Documented meaning and
+executable meaning had drifted, and the executable one was load-bearing.
 
-## 2. `Diff.diff_path` is really the config path
+**Now:** `Diff` carries `config_path` (what the executor runs) and
+`patch_path` (a real unified diff, `None` when the agent doesn't produce one).
 
-`agents.py` documents `diff_path` as "where the change is recorded (patch file,
-commit ref, ...)", but `orchestrator.py` passes it straight to
-`Executor.run_seeds()` as `config_path`. The executable meaning wins, so this
-agent puts the config file there. A real unified diff against the baseline is
-still written as `changes.patch` in the solution dir and referenced from
-`attempt.json` — it just can't live in the field named after it.
+**The name `diff_path` is deliberately gone from `Diff` rather than reused for
+the patch.** `RunRecord.diff_path` in `records.py` still means "the config the
+executor ran", so keeping the name on `Diff` with a *different* meaning one
+layer up would have replaced the old ambiguity with a worse one — two fields,
+same name, adjacent layers, opposite meanings, crossing in `orchestrator.py`.
+With the name gone there is exactly one `diff_path` in the codebase and it has
+one meaning.
 
-The clean fix is to give `Diff` a separate `config_path` field, or rename
-`diff_path`. Both need an `orchestrator.py` change. There is a test
-(`test_diff_path_is_the_config_file_the_orchestrator_will_pass_to_the_executor`)
-pinning the current behaviour so the swap is a deliberate act.
+`RunRecord.diff_path` keeps taking the **config** path, for three reasons
+(spelled out in `Orchestrator._record_diff_path`):
+
+1. `runs.jsonl`'s meaning is unchanged — repointing it would silently make old
+   and new lines mean different things in an append-only log with no version
+   marker.
+2. It's the only path always present: `FakeCodingAgent` and the bootstrapped
+   baseline produce no patch.
+3. Accumulation resolves the current best by taking this path's **sibling
+   `train.py`**, which works precisely because a config lives inside its
+   solution dir.
+
+### The permanent record carries both paths
+
+`RunRecord` now has `patch_path` alongside `diff_path`, so `runs.jsonl` alone
+answers *what code did this iteration actually run* — previously it got you
+only to the settings file, and finding the diff meant hunting for the solution
+directory by hand. That matters because the hypothesis log is a graded artifact
+and an LLM wrote the code: verifying "did this iteration implement what its
+hypothesis claimed" should be a matter of following the run log.
+
+| field | holds | `None` when |
+|---|---|---|
+| `diff_path` | the **config** the executor ran | never (always recorded) |
+| `patch_path` | the **unified diff** of the code change | the producer makes no patch — `FakeCodingAgent`, and the bootstrapped baseline, which is a pre-existing solution rather than an edit to one |
+
+`diff_path`'s meaning and how it's populated are untouched — this is purely
+additive.
+
+**Backward compatibility.** `runs.jsonl` is append-only and permanent, so
+`from_json()` reads the new field with `d.get("patch_path")`, following the
+precedent `manual_intervention` already set. Lines written before the field
+existed load with `patch_path=None`, which reads correctly: absent is
+indistinguishable from "the producer never made one". Verified against 12
+records in 6 run logs written before the field existed, plus tests in
+`tests/test_records_serialization.py`.
+
+**Residual, knowingly left:** a field named `diff_path` holding a config path.
+Renaming it means deciding what already-written JSONL lines mean — a bigger
+call, and a separate one. Now at least the record is no longer *missing*
+the thing the name suggests; it's in `patch_path` next door.
 
 ## 3. ~~First-iteration `delta_vs_current_best` is meaningless~~ — FIXED
 
@@ -140,10 +211,11 @@ did. Worth knowing when reading `runs.jsonl`.
 
 Two consequences worth knowing:
 
-- The baseline **counts toward `max_iterations`**, since
-  `convergence.should_stop` counts every non-FAILED record. `run_loop.py`
-  therefore treats `--max-iterations` as a count of *research* iterations and
-  adds one slot for the baseline.
+- The baseline does **not** consume a `max_iterations` slot.
+  `convergence.should_stop` excludes `BOOTSTRAP_ITERATION` from that count, so
+  `max_iterations=50` gets you 50 real research attempts and callers need no
+  arithmetic. (Briefly after bootstrapping first landed, the baseline *did*
+  count and `run_loop.py` compensated with a `+1`; both are gone.)
 - If nothing ever beats the baseline, `registry.best()` **is** the baseline —
   and because bootstrapping runs it for real rather than trusting a recorded
   score, a complete artifact (`result.json`, `checkpoint.npz`,
@@ -153,6 +225,27 @@ Two consequences worth knowing:
 `bootstrap_baseline()` is idempotent and crash-resume safe, keyed off the run
 log on disk. It is the second change outside the Coding agent's lane (after
 `executor.py`) and is isolated in its own commit for review.
+
+### How the baseline interacts with each stopping rule
+
+`should_stop()` has three checks, the baseline record is visible to all three,
+and each wants something different from it. The asymmetry is deliberate —
+"making it consistent" in either direction is a plausible and wrong edit, so
+it is pinned by tests in `tests/test_convergence.py`.
+
+| check | baseline counted? | why |
+|---|---|---|
+| `max_iterations` | **no** | counts *research attempts*; the baseline is the incumbent they're measured against, not an attempt |
+| stalled-progress window | **yes** | counts *scored results*; the baseline is the score everything must beat, so it's the window's first data point |
+| `max_wall_s` | **yes** | records are timestamped at *completion*, so the iteration-0 record marks when research **began** — its own runtime is already outside the window |
+
+That last one is the easy one to get backwards. Excluding the baseline would
+restart the clock at iteration 1's *completion* and silently drop iteration 1's
+duration from the 6h budget — less accurate and more permissive than counting
+it. `BOOTSTRAP_ITERATION` lives in `agent/config.py` (not `orchestrator.py`)
+because `convergence.py` needs it too and `orchestrator.py` already imports
+`should_stop` from `convergence.py`; `config.py` is imported by both and
+imports neither.
 
 ## 4. What metric verification does *not* catch
 

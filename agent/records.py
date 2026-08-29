@@ -1,7 +1,10 @@
 """The result record schema: one RunRecord per orchestrator iteration.
 
 RunRecord is the sole shape that crosses from executor.py into the agent
-loop (research/coding/evaluator) and into logs/runs.jsonl. It structurally
+loop (research/coding/evaluator) and into logs/runs.jsonl. It carries two
+paths and they are not the same thing: `diff_path` is the config file the
+executor ran, `patch_path` the unified diff of the code change (when there
+was one). Both are optional to a reader -- see from_json. It structurally
 cannot hold a hidden-test metric -- there is no field for it anywhere in this
 module. Test-split numbers live only in the quarantine file written by
 executor.py, which nothing here ever reads.
@@ -135,6 +138,19 @@ class RunRecord:
     events: list[Event]
     resources: ResourceUsage
     manual_intervention: bool = False
+    # Path to the unified diff for this iteration's code change, when the
+    # CodingAgent produced one. `diff_path` above holds the *config* the
+    # executor ran (see Orchestrator._record_diff_path for why that name and
+    # meaning are left alone); this is the actual code change, so the run log
+    # can answer "did this iteration implement what its hypothesis claimed"
+    # without hunting for the solution directory by hand.
+    #
+    # Optional, and appended after the existing defaulted field rather than
+    # slotted next to diff_path, so positional construction keeps working.
+    # None whenever the producer makes no patch -- FakeCodingAgent, and the
+    # bootstrapped baseline, which is a pre-existing solution rather than an
+    # edit to one.
+    patch_path: Optional[str] = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -151,6 +167,7 @@ class RunRecord:
             "events": [e.to_json() for e in self.events],
             "resources": self.resources.to_json(),
             "manual_intervention": self.manual_intervention,
+            "patch_path": self.patch_path,
         }
 
     @classmethod
@@ -169,6 +186,12 @@ class RunRecord:
             events=[Event.from_json(e) for e in d["events"]],
             resources=ResourceUsage.from_json(d["resources"]),
             manual_intervention=d.get("manual_intervention", False),
+            # .get(), not [], for the same reason as manual_intervention above:
+            # runs.jsonl is append-only, so lines written before this field
+            # existed must keep reading. Absent means None, i.e. "no patch
+            # recorded", which is indistinguishable from a producer that never
+            # made one -- and that is the correct reading for old lines.
+            patch_path=d.get("patch_path"),
         )
 
 

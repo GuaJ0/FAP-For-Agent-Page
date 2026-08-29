@@ -74,14 +74,11 @@ def load_dotenv(path: Path) -> None:
 
 def build_config(root: Path, args) -> Config:
     logs = root / "logs"
-    # --max-iterations counts *research* iterations. The baseline is a real
-    # concluded iteration and convergence.should_stop counts every non-FAILED
-    # record, so bootstrapping needs one extra slot -- otherwise
-    # --max-iterations 1 would be entirely consumed by the baseline and no
-    # hypothesis would ever run.
-    max_iterations = args.max_iterations + (0 if args.skip_baseline else 1)
+    # No baseline compensation here: convergence.should_stop() excludes the
+    # bootstrap iteration from its max_iterations count, so this is passed
+    # straight through and means exactly what it says. It used to need a +1.
     return Config(
-        convergence=ConvergenceConfig(max_iterations=max_iterations, max_wall_s=args.max_wall_s),
+        convergence=ConvergenceConfig(max_iterations=args.max_iterations, max_wall_s=args.max_wall_s),
         retry=RetryConfig(),
         executor=ExecutorConfig(per_run_timeout_s=args.timeout_s),
         seeding=SeedingConfig(max_seeds=args.seeds, min_seeds=1),
@@ -109,7 +106,8 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--loss", default="bpr")
     ap.add_argument("--max-iterations", type=int, default=1,
-                    help="number of research iterations (the baseline gets its own slot)")
+                    help="number of research iterations. The bootstrap baseline is not "
+                         "one of them and does not consume a slot.")
     ap.add_argument("--skip-baseline", action="store_true",
                     help="do not run solution/ as iteration 0. The registry then starts "
                          "empty, so the first result becomes the incumbent whatever it scores.")
@@ -145,6 +143,11 @@ def main() -> int:
         llm=client,
         usage_log_path=cfg.paths.logs_dir / "coding_agent_usage.jsonl",
         base_config={"loss": args.loss, "epochs": args.epochs, "patience": 3},
+        # ACCUMULATION: build each new idea on the best accepted solution so
+        # far rather than always on the static solution/train.py. Right after
+        # bootstrapping these resolve to iteration 0, i.e. solution/ itself.
+        registry_path=cfg.paths.registry_json,
+        run_log_path=cfg.paths.runs_jsonl,
     )
     orc = Orchestrator(
         research=FakeResearchAgent([args.hypothesis]),
@@ -164,11 +167,12 @@ def main() -> int:
         # so deltas, ACCEPT/REVERT and convergence all have an incumbent to
         # measure against. Idempotent: a no-op if a previous run already did it.
         #
-        # diff_path is solution/config.yaml, a sibling of solution/train.py --
+        # config_path is solution/config.yaml, a sibling of solution/train.py --
         # that adjacency is what lets a registry entry be resolved back to the
-        # source that produced it.
+        # source that produced it (see LLMCodingAgent._current_best_source).
+        # No patch_path: the baseline is a pre-existing solution, not an edit.
         baseline = Diff(
-            diff_path=str(REPO_ROOT / "solution" / "config.yaml"),
+            config_path=str(REPO_ROOT / "solution" / "config.yaml"),
             solution_dir=str(REPO_ROOT / "solution"),
         )
         try:

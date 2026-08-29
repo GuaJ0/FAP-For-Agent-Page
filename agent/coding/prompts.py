@@ -105,10 +105,14 @@ def build_generate_prompt(
     baseline_source: str,
     ideas_md: Optional[str] = None,
 ) -> str:
+    """`baseline_source` is whatever the agent resolved as the current best --
+    the static solution/train.py early on, and the best accepted iteration's
+    train.py once something has been accepted. See
+    LLMCodingAgent._current_best_source()."""
     parts = [
         "## Hypothesis to implement\n",
         hypothesis.strip(),
-        "\n\n## Current baseline train.py (the code you are modifying)\n",
+        "\n\n## Current best train.py (the code you are modifying)\n",
         "```python\n" + baseline_source + "\n```\n",
     ]
     if ideas_md:

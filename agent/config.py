@@ -24,6 +24,18 @@ FORBIDDEN_PAYLOAD_KEYS = frozenset({
 })
 
 
+# Iteration number reserved for the seeded baseline established by
+# Orchestrator.bootstrap_baseline() before the research loop starts.
+# Research-driven iterations are numbered from 1.
+#
+# It lives here rather than in orchestrator.py because convergence.py needs it
+# too (to keep the baseline out of the max_iterations count) and orchestrator.py
+# already imports should_stop FROM convergence.py -- so convergence importing it
+# back would be a cycle. config.py is imported by both and imports neither,
+# which is exactly what this module is for.
+BOOTSTRAP_ITERATION = 0
+
+
 @dataclass(frozen=True)
 class ConvergenceConfig:
     """Competition stopping rule: whichever of the three fires first."""

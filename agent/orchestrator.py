@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent
-from agent.config import Config, DEFAULT_CONFIG
+from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
 from agent.convergence import should_stop
 from agent.executor import Executor
 from agent.records import (
@@ -41,11 +41,15 @@ from agent.registry import CheckpointRegistry
 from agent.state import OrchestratorState, StateStore
 
 
-# Reserved for the seeded baseline (see Orchestrator.bootstrap_baseline).
+# Re-exported from agent.config, which is where it now lives so convergence.py
+# can import it too without a cycle (orchestrator imports should_stop FROM
+# convergence). Kept importable from here because that is where callers and
+# tests already reach for it.
+#
 # _step() numbers research iterations from state.iteration + 1, and
 # state.iteration starts at 0, so the first research iteration is 1 and can
 # never collide with this.
-BOOTSTRAP_ITERATION = 0
+__all__ = ["BOOTSTRAP_ITERATION", "BootstrapError", "Orchestrator", "OrchestratorHalted"]
 
 
 class OrchestratorHalted(RuntimeError):
@@ -181,7 +185,7 @@ class Orchestrator:
             idea: describes the baseline. `parent_iteration` is ignored --
                 iteration 0 is the root and has no parent.
             diff: `solution_dir` is the directory the executor runs `train.py`
-                in; `diff_path` is the config file passed to it. Keeping the
+                in; `config_path` is the config file passed to it. Keeping the
                 config a sibling of `train.py` matters for anything that later
                 resolves a registry entry back to the source that produced it.
 
@@ -216,7 +220,7 @@ class Orchestrator:
             self.state.run_start_time = time.time()
 
         seeds, agg = self.executor.run_seeds(
-            Path(diff.solution_dir), Path(diff.diff_path),
+            Path(diff.solution_dir), Path(diff.config_path),
             BOOTSTRAP_ITERATION, list(range(self._adaptive_n_seeds())),
         )
         self.state.seed_costs.extend(s.wall_s for s in seeds)
@@ -253,7 +257,8 @@ class Orchestrator:
             parent_iteration=None,          # iteration 0 is the root
             timestamp=_iso_now(),
             hypothesis=idea.hypothesis,
-            diff_path=diff.diff_path,
+            diff_path=self._record_diff_path(diff),
+            patch_path=diff.patch_path,
             status=Status.SUCCESS if succeeded else Status.FAILED,
             seeds=seeds,
             aggregate=agg,
@@ -261,7 +266,9 @@ class Orchestrator:
             delta_vs_current_best=None,
             decision=Decision.ACCEPT if succeeded else None,
             events=[Event(type="bootstrap", detail=detail, agent_action="orchestrator")],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            # The baseline is a pre-existing solution, not something an agent
+            # wrote, so it has no LLM usage to attribute.
+            resources=self._resources(diff, seeds),
         )
 
     def _step(self, history: list[RunRecord]) -> None:
@@ -283,7 +290,7 @@ class Orchestrator:
         n_seeds = self._adaptive_n_seeds()
         iteration = self.state.iteration + 1
         seeds, agg = self.executor.run_seeds(
-            Path(diff.solution_dir), Path(diff.diff_path), iteration, list(range(n_seeds)),
+            Path(diff.solution_dir), Path(diff.config_path), iteration, list(range(n_seeds)),
         )
         self.state.seed_costs.extend(s.wall_s for s in seeds)
 
@@ -318,7 +325,8 @@ class Orchestrator:
             parent_iteration=idea.parent_iteration,
             timestamp=_iso_now(),
             hypothesis=idea.hypothesis,
-            diff_path=diff.diff_path,
+            diff_path=self._record_diff_path(diff),
+            patch_path=diff.patch_path,
             status=Status.ABANDONED if should_abandon else Status.FAILED,
             seeds=seeds,
             aggregate=None,
@@ -331,8 +339,8 @@ class Orchestrator:
                     f"reason={'attempt_cap' if self.state.fix_attempts >= self.cfg.retry.max_fix_attempts else 'time_backstop' if should_abandon else 'will_retry'}"
                 ),
                 agent_action="orchestrator",
-            )],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            )] + self._usage_event(diff),
+            resources=self._resources(diff, seeds),
         )
         self.run_log.append(record)
 
@@ -359,14 +367,16 @@ class Orchestrator:
             parent_iteration=idea.parent_iteration,
             timestamp=_iso_now(),
             hypothesis=idea.hypothesis,
-            diff_path=diff.diff_path,
+            diff_path=self._record_diff_path(diff),
+            patch_path=diff.patch_path,
             status=status,
             seeds=seeds,
             aggregate=agg,
             delta_vs_current_best=delta,
             decision=None,
-            events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")],
-            resources=ResourceUsage(wall_s=sum(s.wall_s for s in seeds)),
+            events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")]
+                   + self._usage_event(diff),
+            resources=self._resources(diff, seeds),
         )
         decision = self.evaluator.judge(record, history)
         record.decision = decision
@@ -376,6 +386,70 @@ class Orchestrator:
             self._register_checkpoint(iteration, diff, seeds, agg)
 
         self._close_idea(abandoned=False)
+
+    def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
+        """Build the iteration's ResourceUsage, including LLM tokens.
+
+        ResourceUsage has carried tokens_in/tokens_out since the schema was
+        written and nothing ever populated them, so every RunRecord reported
+        zero tokens no matter what the run actually spent. A CodingAgent that
+        tracks usage now reports it on the Diff it returns, and this folds it
+        in. `usage=None` (FakeCodingAgent, and any agent that doesn't track)
+        yields exactly the wall_s-only ResourceUsage as before.
+
+        Called from the failed path as well as the successful one: a failed
+        attempt still costs tokens, and it is often the most expensive kind,
+        since it is the one that burned repair cycles.
+        """
+        wall_s = sum(s.wall_s for s in seeds)
+        if diff.usage is None:
+            return ResourceUsage(wall_s=wall_s)
+        return ResourceUsage(
+            wall_s=wall_s,
+            tokens_in=diff.usage.tokens_in,
+            tokens_out=diff.usage.tokens_out,
+        )
+
+    @staticmethod
+    def _record_diff_path(diff: Diff) -> str:
+        """What goes into RunRecord.diff_path.
+
+        Deliberately the CONFIG path, not diff.patch_path, for three reasons:
+
+          1. It keeps runs.jsonl's meaning unchanged. That field has always
+             held the config the executor was pointed at; repointing it would
+             silently make old and new lines mean different things in an
+             append-only log, with no version marker to tell them apart.
+          2. It is the only path always present. FakeCodingAgent and the
+             bootstrapped baseline produce no patch, so patch_path is None for
+             them and the field would be half-empty.
+          3. LLMCodingAgent._current_best_source() resolves the current best
+             solution by taking the sibling train.py of this path. That works
+             precisely because a config lives inside its solution dir.
+
+        The residual mismatch -- a field named diff_path holding a config path
+        -- is knowingly left. Fixing it means renaming a field in records.py
+        and migrating what already-written JSONL lines mean, which is a bigger
+        call than this change. agents.py's Diff no longer has a `diff_path` at
+        all, so at least there is exactly one in the codebase with one meaning.
+        """
+        return diff.config_path
+
+    @staticmethod
+    def _usage_event(diff: Diff) -> list[Event]:
+        """cost_usd has no field on ResourceUsage (see AgentUsage's docstring),
+        so it lands in the audit trail as an event instead -- visible in
+        runs.jsonl without changing records.py's schema. Emitted only when
+        there was real usage, so records from agents that don't track usage are
+        byte-identical to before."""
+        u = diff.usage
+        if u is None or (u.tokens_in == 0 and u.tokens_out == 0):
+            return []
+        return [Event(
+            type="coding_usage",
+            detail=f"tokens_in={u.tokens_in} tokens_out={u.tokens_out} cost_usd={u.cost_usd:.6f}",
+            agent_action="coding",
+        )]
 
     def _register_checkpoint(self, iteration: int, diff: Diff, seeds: list[SeedMetrics], agg) -> None:
         """Register the accepted iteration's checkpoint.

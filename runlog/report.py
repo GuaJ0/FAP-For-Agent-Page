@@ -18,6 +18,13 @@ def summarize(run_log_path: Path) -> str:
         if n:
             lines.append(f"  {status.value}: {n}")
 
+    # Whether an iteration's code change can actually be inspected.
+    # RunRecord.patch_path is None for producers that make no diff -- the
+    # bootstrapped baseline (a pre-existing solution, not an edit) and
+    # FakeCodingAgent -- so a count below the total is normal, not a fault.
+    with_patch = sum(1 for r in records if r.patch_path)
+    lines.append(f"code diffs recorded: {with_patch}/{len(records)} iterations")
+
     scored = [r for r in records if r.aggregate is not None]
     if scored:
         best = max(scored, key=lambda r: r.aggregate.primary_mean)
