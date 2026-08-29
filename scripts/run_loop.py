@@ -1,21 +1,30 @@
 """Run the agent loop end to end.
 
-Wires the deterministic OfflineResearchAgent, real CodingAgent, and real
-LLMEvaluatorAgent into the existing Orchestrator. Research selects a
-history-aware proposal from its validated offline backlog in both modes.
---offline additionally uses FakeEvaluatorAgent (the same deterministic margin
-rule LLMEvaluatorAgent falls back to internally) and the Coding agent's
-hand-written template library, so it makes no API calls.
+Wires the Research, Coding, and Evaluator agents into the existing
+Orchestrator. OfflineResearchAgent is the default Research implementation and
+selects a history-aware proposal from its validated offline backlog.
+--live-research instead enables LLMResearchAgent using the same live client as
+Coding and Evaluator. Here "live Research" means LLM-generated proposals
+grounded in the bundled citation catalog; it does not perform scholarly/web
+retrieval.
+
+--offline keeps Research deterministic and additionally uses
+FakeEvaluatorAgent (the same deterministic margin rule LLMEvaluatorAgent falls
+back to internally) and the Coding agent's hand-written template library, so it
+makes no API calls.
 
     # offline: no API key, no spend, uses the hand-written template library
     python scripts/run_loop.py --offline
 
-    # live Coding/Evaluator, deterministic offline Research
+    # live Coding/Evaluator, deterministic offline Research (the default)
     # (needs OPENAI_API_KEY in .env)
     python scripts/run_loop.py --model gpt-5
 
+    # live Research/Coding/Evaluator sharing one client; bundled citations only
+    python scripts/run_loop.py --live-research --model gpt-5
+
 The legacy --hypothesis flag remains accepted for CLI compatibility, but the
-offline Research backlog selects the proposal during this integration stage.
+selected Research agent produces the proposal.
 
 Reads KUAIRAND_PATH (and OPENAI_API_KEY) from .env if present.
 """
@@ -44,7 +53,7 @@ from agent.evaluator import LLMEvaluatorAgent  # noqa: E402
 from agent.executor import Executor  # noqa: E402
 from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
-from agent.research import OfflineResearchAgent  # noqa: E402
+from agent.research import LLMResearchAgent, OfflineResearchAgent  # noqa: E402
 from agent.registry import CheckpointRegistry  # noqa: E402
 from agent.state import StateStore  # noqa: E402
 
@@ -107,6 +116,12 @@ def main() -> int:
     ap.add_argument("--hypothesis", default=DEFAULT_HYPOTHESIS)
     ap.add_argument("--offline", action="store_true",
                     help="use the hand-written template library instead of an LLM (no spend)")
+    ap.add_argument(
+        "--live-research",
+        action="store_true",
+        help=("use LLM-backed Research proposal generation grounded in the bundled "
+              "citation catalog; requires live Coding/Evaluator mode"),
+    )
     ap.add_argument("--model", default=os.environ.get("CODING_AGENT_MODEL", "gpt-5"))
     ap.add_argument("--data-dir", default=None, help="defaults to $KUAIRAND_PATH")
     ap.add_argument("--root", default=str(REPO_ROOT), help="where logs/ and solutions/ go")
@@ -123,6 +138,9 @@ def main() -> int:
     ap.add_argument("--timeout-s", type=float, default=900.0)
     args = ap.parse_args()
 
+    if args.offline and args.live_research:
+        ap.error("--offline and --live-research are incompatible; live Research requires a live LLM client")
+
     load_dotenv(REPO_ROOT / ".env")
 
     data_dir = args.data_dir or os.environ.get("KUAIRAND_PATH")
@@ -137,9 +155,6 @@ def main() -> int:
 
     root = Path(args.root)
     cfg = build_config(root, args)
-    # Use the same convergence limits as the Orchestrator so offline Research
-    # ranks ideas against the actual remaining iteration and wall-time budget.
-    research = OfflineResearchAgent(convergence=cfg.convergence)
 
     if args.offline:
         client = TemplateLibraryClient()
@@ -147,6 +162,17 @@ def main() -> int:
     else:
         client = OpenAIClient(model=args.model)
         print(f"[llm] OpenAI, model={args.model} -- this run costs money")
+
+    # All live agents share this exact client instance. Offline Research stays
+    # the default and uses no LLM even when Coding/Evaluator are live.
+    if args.live_research:
+        research = LLMResearchAgent(
+            llm=client,
+            usage_log_path=cfg.paths.logs_dir / "research_agent_usage.jsonl",
+            convergence=cfg.convergence,
+        )
+    else:
+        research = OfflineResearchAgent(convergence=cfg.convergence)
 
     coding = LLMCodingAgent(
         work_dir=root / "solutions",
@@ -223,6 +249,10 @@ def main() -> int:
     print(f"coding LLM usage: {cfg.paths.logs_dir / 'coding_agent_usage.jsonl'}")
     print(f"quarantine:       {cfg.paths.test_metrics_jsonl}  (agents never read this)")
     print(f"coding totals:    {coding.usage.totals()}")
+    research_usage = getattr(research, "usage", None)  # OfflineResearchAgent has none
+    if research_usage is not None:
+        print(f"research usage:   {cfg.paths.logs_dir / 'research_agent_usage.jsonl'}")
+        print(f"research totals:  {research_usage.totals()}")
     evaluator_usage = getattr(evaluator, "usage", None)  # FakeEvaluatorAgent (--offline) has none
     if evaluator_usage is not None:
         print(f"evaluator usage:  {cfg.paths.logs_dir / 'evaluator_usage.jsonl'}")
