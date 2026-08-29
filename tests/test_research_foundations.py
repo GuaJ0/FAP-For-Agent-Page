@@ -125,6 +125,23 @@ def test_proposal_rejects_forbidden_split_keys_recursively():
         ResearchProposal.from_dict(raw)
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_proposal_rejects_non_finite_numbers_recursively(invalid):
+    raw = _proposal()
+    raw["implementation"]["hyperparameters"]["invalid_numeric"] = invalid
+
+    with pytest.raises(ProposalValidationError, match="finite"):
+        ResearchProposal.from_json(json.dumps(raw))
+
+
+def test_proposal_rejects_unsupported_metric_alignment():
+    raw = _proposal()
+    raw["rationale"]["metric_alignment"] = ["GAUC", "AUC"]
+
+    with pytest.raises(ProposalValidationError, match="unsupported challenge metrics"):
+        ResearchProposal.from_dict(raw)
+
+
 def test_curated_catalog_resolves_claim_level_evidence():
     proposal = ResearchProposal.from_dict(_proposal())
     catalog = JsonCitationCatalog()

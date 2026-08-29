@@ -7,6 +7,7 @@ route the pipeline, implement model code, or make evaluation decisions.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -50,7 +51,7 @@ class ResearchOutputError(ResearchAgentError):
 
 
 class DuplicateHypothesisError(ProposalValidationError):
-    """A reverted or abandoned hypothesis was proposed again unchanged."""
+    """An attempted hypothesis or hypothesis ID was proposed again unchanged."""
 
 
 @dataclass
@@ -112,6 +113,19 @@ def _historical_hypothesis(record: RunRecord) -> str:
     return _section(record.hypothesis, "HYPOTHESIS") or record.hypothesis
 
 
+def _historical_hypothesis_id(record: RunRecord) -> Optional[str]:
+    if not record.hypothesis.lstrip().startswith("[RESEARCH_PROPOSAL v1]"):
+        return None
+    match = re.search(r"(?m)^ID:\s*([^\r\n]+?)\s*$", record.hypothesis)
+    return match.group(1) if match else None
+
+
+def _was_attempted(record: RunRecord) -> bool:
+    return record.decision in {Decision.ACCEPT, Decision.REVERT, Decision.ABANDON} or (
+        record.status == Status.ABANDONED
+    )
+
+
 def _meaningful_variation(proposal: ResearchProposal, record: RunRecord) -> bool:
     """Conservative deterministic check for a changed experiment.
 
@@ -149,16 +163,62 @@ def _meaningful_variation(proposal: ResearchProposal, record: RunRecord) -> bool
 
 def _reject_duplicate(proposal: ResearchProposal, history: Sequence[RunRecord]) -> None:
     for record in history:
-        was_rejected = record.decision == Decision.REVERT or record.status == Status.ABANDONED
-        if not was_rejected:
+        if not _was_attempted(record):
             continue
         prior = _historical_hypothesis(record)
         similarity = SequenceMatcher(None, _normalise(proposal.hypothesis), _normalise(prior)).ratio()
         if similarity >= 0.92 and not _meaningful_variation(proposal, record):
+            outcome = record.decision.value if record.decision is not None else record.status.value
             raise DuplicateHypothesisError(
-                f"proposal duplicates {record.status.value} iteration {record.iteration} "
+                f"proposal duplicates {outcome} iteration {record.iteration} "
                 "without a meaningful mechanism, implementation, or hyperparameter variation"
             )
+
+
+def _validate_proposal_against_context(
+    proposal: ResearchProposal,
+    context: ResearchContext,
+    history: Sequence[RunRecord],
+) -> None:
+    if proposal.parent_iteration != context.parent_iteration:
+        raise ProposalValidationError(
+            "proposal.parent_iteration must equal the current accepted incumbent "
+            f"({context.parent_iteration!r}), got {proposal.parent_iteration!r}"
+        )
+
+    available_iterations = {item.iteration for item in context.iterations}
+    unavailable = sorted(set(proposal.rationale.prior_results_used) - available_iterations)
+    if unavailable:
+        raise ProposalValidationError(
+            "proposal.rationale.prior_results_used refers to iterations not available "
+            f"in Research history: {unavailable}"
+        )
+
+    if not math.isclose(
+        proposal.evaluation.minimum_primary_delta,
+        context.minimum_meaningful_delta,
+        rel_tol=1e-9,
+        abs_tol=1e-12,
+    ):
+        raise ProposalValidationError(
+            "proposal.evaluation.minimum_primary_delta must equal the configured "
+            "minimum meaningful improvement threshold "
+            f"({context.minimum_meaningful_delta:g}); the schema has no explicit "
+            "justification field for overriding it"
+        )
+
+    proposed_id = proposal.hypothesis_id.casefold()
+    for record in history:
+        if not _was_attempted(record):
+            continue
+        prior_id = _historical_hypothesis_id(record)
+        if prior_id is not None and prior_id.casefold() == proposed_id:
+            raise DuplicateHypothesisError(
+                f"proposal.hypothesis_id {proposal.hypothesis_id!r} was already used by "
+                f"attempted iteration {record.iteration}"
+            )
+
+    _reject_duplicate(proposal, history)
 
 
 _UNSAFE_TEXT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
@@ -278,13 +338,8 @@ class LLMResearchAgent:
         history: Sequence[RunRecord],
     ) -> ResearchProposal:
         proposal = ResearchProposal.from_json(text)
-        if proposal.parent_iteration != context.parent_iteration:
-            raise ProposalValidationError(
-                "proposal.parent_iteration must equal the current accepted incumbent "
-                f"({context.parent_iteration!r}), got {proposal.parent_iteration!r}"
-            )
+        _validate_proposal_against_context(proposal, context, history)
         validate_proposal_citations(proposal, self.citation_source)
-        _reject_duplicate(proposal, history)
         return proposal
 
     @staticmethod

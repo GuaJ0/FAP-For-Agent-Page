@@ -18,7 +18,7 @@ from agent.research.agent import (
     DuplicateHypothesisError,
     ResearchAgentError,
     _assert_validation_only_context,
-    _reject_duplicate,
+    _validate_proposal_against_context,
 )
 from agent.research.citations import (
     CitationSource,
@@ -433,7 +433,7 @@ class OfflineResearchAgent:
             try:
                 proposal = entry.build(context)
                 validate_proposal_citations(proposal, self.citation_source)
-                _reject_duplicate(proposal, history)
+                _validate_proposal_against_context(proposal, context, history)
             except DuplicateHypothesisError:
                 rejected_duplicates += 1
                 continue
@@ -445,5 +445,5 @@ class OfflineResearchAgent:
 
         raise OfflineBacklogExhausted(
             "offline Research backlog exhausted: no untried proposal fits the remaining "
-            f"budget ({len(viable)} feasible, {rejected_duplicates} already rejected/abandoned)"
+            f"budget ({len(viable)} feasible, {rejected_duplicates} already attempted)"
         )

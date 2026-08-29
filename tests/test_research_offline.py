@@ -67,6 +67,16 @@ def _concluded_from_idea(iteration, idea, *, abandoned=False):
     )
 
 
+def _accepted_from_idea(iteration, idea):
+    return _record(
+        iteration,
+        0.64,
+        Decision.ACCEPT,
+        hypothesis=idea.hypothesis,
+        parent=idea.parent_iteration,
+    )
+
+
 def test_offline_output_is_deterministic_for_the_same_history():
     history = [_baseline()]
 
@@ -96,6 +106,19 @@ def test_offline_agent_skips_an_abandoned_backlog_idea():
     history = [_baseline()]
     first = agent.propose(history)
     history.append(_concluded_from_idea(4, first, abandoned=True))
+
+    second = agent.propose(history)
+
+    assert "OFFLINE-HYBRID-BPR" in first.hypothesis
+    assert "OFFLINE-HYBRID-BPR" not in second.hypothesis
+    assert "OFFLINE-GAUC-WEIGHTED-BPR" in second.hypothesis
+
+
+def test_offline_agent_does_not_repeat_an_accepted_proposal():
+    agent = OfflineResearchAgent()
+    history = [_baseline()]
+    first = agent.propose(history)
+    history.append(_accepted_from_idea(4, first))
 
     second = agent.propose(history)
 

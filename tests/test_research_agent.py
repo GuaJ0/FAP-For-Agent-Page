@@ -15,12 +15,21 @@ from agent.research.agent import (
     ResearchOutputError,
 )
 from agent.research.citations import JsonCitationCatalog
+from agent.research.schemas import ResearchProposal
 
 
-def _proposal(parent=3, *, hypothesis=None, citation_id="rendle2009bpr", claim_id="pairwise-ranking-objective"):
+def _proposal(
+    parent=3,
+    *,
+    hypothesis=None,
+    hypothesis_id="H-0004",
+    citation_id="rendle2009bpr",
+    claim_id="pairwise-ranking-objective",
+    minimum_primary_delta=0.002,
+):
     return {
         "schema_version": 1,
-        "hypothesis_id": "H-0004",
+        "hypothesis_id": hypothesis_id,
         "parent_iteration": parent,
         "title": "Hybrid pointwise and pairwise objective",
         "hypothesis": hypothesis or (
@@ -56,7 +65,7 @@ def _proposal(parent=3, *, hypothesis=None, citation_id="rendle2009bpr", claim_i
         "evaluation": {
             "reference_iteration": parent,
             "primary_metric": "primary",
-            "minimum_primary_delta": 0.002,
+            "minimum_primary_delta": minimum_primary_delta,
             "expected_secondary_effects": {
                 "GAUC": "increase through improved within-user ordering",
                 "nDCG@5": "remain neutral or improve",
@@ -132,7 +141,7 @@ def test_custom_convergence_config_is_used_in_llm_research_context(tmp_path):
     )
     agent, client = _agent(
         tmp_path,
-        [json.dumps(_proposal(parent=3))],
+        [json.dumps(_proposal(parent=3, minimum_primary_delta=0.007))],
         convergence=convergence,
     )
 
@@ -192,6 +201,50 @@ def test_invalid_citation_is_rejected(tmp_path):
         agent.propose([_record(3, 0.62, Decision.ACCEPT)])
 
 
+def test_prior_results_must_exist_in_research_history(tmp_path):
+    raw = _proposal(parent=3)
+    raw["rationale"]["prior_results_used"] = [3, 999]
+    agent, _ = _agent(tmp_path, [json.dumps(raw)], max_repair_attempts=0)
+
+    with pytest.raises(ResearchOutputError, match="iterations not available"):
+        agent.propose([_record(3, 0.62, Decision.ACCEPT)])
+
+
+def test_hypothesis_id_cannot_collide_with_an_attempted_id(tmp_path):
+    historical = ResearchProposal.from_dict(
+        _proposal(
+            parent=3,
+            hypothesis_id="H-USED",
+            hypothesis="Calibrate the incumbent scores with a held-out monotonic mapping.",
+        )
+    ).to_handoff_text()
+    history = [
+        _record(3, 0.62, Decision.ACCEPT),
+        _record(4, 0.64, Decision.ACCEPT, hypothesis=historical),
+    ]
+    candidate = _proposal(
+        parent=4,
+        hypothesis_id="h-used",
+        hypothesis="Add a recent behavior encoder to represent short-term user intent.",
+    )
+    agent, _ = _agent(tmp_path, [json.dumps(candidate)], max_repair_attempts=0)
+
+    with pytest.raises(ResearchOutputError, match="already used"):
+        agent.propose(history)
+
+
+def test_minimum_delta_must_match_configured_meaningful_threshold(tmp_path):
+    agent, _ = _agent(
+        tmp_path,
+        [json.dumps(_proposal(parent=3, minimum_primary_delta=0.002))],
+        max_repair_attempts=0,
+        convergence=ConvergenceConfig(epsilon=0.005),
+    )
+
+    with pytest.raises(ResearchOutputError, match="minimum meaningful improvement threshold"):
+        agent.propose([_record(3, 0.62, Decision.ACCEPT)])
+
+
 def test_duplicate_reverted_hypothesis_is_rejected(tmp_path):
     duplicate = _proposal(parent=3)["hypothesis"]
     history = [
@@ -206,6 +259,33 @@ def test_duplicate_reverted_hypothesis_is_rejected(tmp_path):
 
     with pytest.raises(ResearchOutputError, match="duplicates"):
         agent.propose(history)
+
+
+def test_meaningful_follow_up_to_accepted_hypothesis_is_allowed_with_a_new_id(tmp_path):
+    original = _proposal(parent=3, hypothesis_id="H-ORIGINAL")
+    history = [
+        _record(3, 0.62, Decision.ACCEPT),
+        _record(
+            4,
+            0.64,
+            Decision.ACCEPT,
+            hypothesis=ResearchProposal.from_dict(original).to_handoff_text(),
+        ),
+    ]
+    follow_up = _proposal(
+        parent=4,
+        hypothesis=original["hypothesis"],
+        hypothesis_id="H-FOLLOW-UP",
+    )
+    follow_up["implementation"]["steps"].append(
+        "Anneal the pairwise coefficient linearly during the first four epochs."
+    )
+    follow_up["implementation"]["hyperparameters"]["anneal_epochs"] = 4
+    agent, _ = _agent(tmp_path, [json.dumps(follow_up)])
+
+    idea = agent.propose(history)
+
+    assert "ID: H-FOLLOW-UP" in idea.hypothesis
 
 
 def test_parent_is_selected_from_best_accepted_incumbent(tmp_path):

@@ -8,6 +8,8 @@ produces the structured string placed in ``Idea.hypothesis`` and
 from __future__ import annotations
 
 import json
+import math
+import re
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -16,6 +18,10 @@ from agent.config import FORBIDDEN_PAYLOAD_KEYS
 
 class ProposalValidationError(ValueError):
     """The model response does not satisfy the Research proposal contract."""
+
+
+SUPPORTED_CHALLENGE_METRICS = frozenset({"GAUC", "nDCG@5"})
+_HYPOTHESIS_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -40,6 +46,15 @@ def _text(value: Any, path: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProposalValidationError(f"{path} must be a non-empty string")
     return value.strip()
+
+
+def _hypothesis_id(value: Any, path: str) -> str:
+    identifier = _text(value, path)
+    if _HYPOTHESIS_ID_PATTERN.fullmatch(identifier) is None:
+        raise ProposalValidationError(
+            f"{path} must be a single identifier containing only letters, numbers, '.', '_', ':', or '-'"
+        )
+    return identifier
 
 
 def _text_tuple(value: Any, path: str, *, allow_empty: bool = False) -> tuple[str, ...]:
@@ -70,6 +85,8 @@ def _json_safe(value: Any, path: str = "proposal") -> None:
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         for i, child in enumerate(value):
             _json_safe(child, f"{path}[{i}]")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ProposalValidationError(f"{path} must be finite; NaN and Infinity are not allowed")
     elif value is not None and not isinstance(value, (str, int, float, bool)):
         raise ProposalValidationError(f"{path} is not JSON-serialisable")
 
@@ -121,9 +138,16 @@ class Rationale:
         )
         if not evidence:
             raise ProposalValidationError(f"{path}.evidence must contain at least one citation")
+        metric_alignment = _text_tuple(data["metric_alignment"], f"{path}.metric_alignment")
+        unsupported_metrics = sorted(set(metric_alignment) - SUPPORTED_CHALLENGE_METRICS)
+        if unsupported_metrics:
+            raise ProposalValidationError(
+                f"{path}.metric_alignment contains unsupported challenge metrics "
+                f"{unsupported_metrics}; supported metrics are {sorted(SUPPORTED_CHALLENGE_METRICS)}"
+            )
         return cls(
             mechanism=_text(data["mechanism"], f"{path}.mechanism"),
-            metric_alignment=_text_tuple(data["metric_alignment"], f"{path}.metric_alignment"),
+            metric_alignment=metric_alignment,
             prior_results_used=tuple(int(item) for item in prior),
             evidence=evidence,
         )
@@ -214,8 +238,15 @@ class EvaluationPlan:
             path,
         )
         delta = data["minimum_primary_delta"]
-        if not isinstance(delta, (int, float)) or isinstance(delta, bool) or delta < 0:
-            raise ProposalValidationError(f"{path}.minimum_primary_delta must be a non-negative number")
+        if (
+            not isinstance(delta, (int, float))
+            or isinstance(delta, bool)
+            or not math.isfinite(float(delta))
+            or delta < 0
+        ):
+            raise ProposalValidationError(
+                f"{path}.minimum_primary_delta must be a finite non-negative number"
+            )
         secondary_raw = _mapping(data["expected_secondary_effects"], f"{path}.expected_secondary_effects")
         secondary = {
             _text(key, f"{path}.expected_secondary_effects key"): _text(
@@ -287,7 +318,7 @@ class ResearchProposal:
             )
         return cls(
             schema_version=1,
-            hypothesis_id=_text(data["hypothesis_id"], "proposal.hypothesis_id"),
+            hypothesis_id=_hypothesis_id(data["hypothesis_id"], "proposal.hypothesis_id"),
             parent_iteration=parent,
             title=_text(data["title"], "proposal.title"),
             hypothesis=_text(data["hypothesis"], "proposal.hypothesis"),
