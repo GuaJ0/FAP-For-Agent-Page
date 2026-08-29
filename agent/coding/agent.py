@@ -214,6 +214,13 @@ class LLMCodingAgent:
 
     base_config: dict[str, Any] = field(default_factory=dict)
 
+    # ACCUMULATION: where to look up "the current best solution" so a new idea
+    # builds on what has been accepted rather than always on the static
+    # solution/train.py. Both default to None, which keeps exactly the old
+    # behaviour for callers (and tests) that don't pass them.
+    registry_path: Optional[Path] = None
+    run_log_path: Optional[Path] = None
+
     _counter: int = field(default=0, init=False)
     last_usage: dict[str, Any] = field(default_factory=dict, init=False)
 
@@ -246,7 +253,7 @@ class LLMCodingAgent:
         sol_dir.mkdir(parents=True)
         self._scaffold(sol_dir)
 
-        baseline = prompts.load_baseline_source()
+        baseline, provenance = self._current_best_source()
         system = prompts.SYSTEM_PROMPT
         calls: list[LLMResponse] = []
         history: list[AttemptOutcome] = []
@@ -297,10 +304,72 @@ class LLMCodingAgent:
             "llm_calls": len(calls),
             "real_model_calls": sum(1 for c in calls if c.is_real_model_call),
         }
-        self._write_manifest(sol_dir, idea, feedback, history, calls, time.time() - t0)
+        self._write_manifest(sol_dir, idea, feedback, history, calls, time.time() - t0,
+                             provenance=provenance)
         return Diff(diff_path=str(config_path), solution_dir=str(sol_dir))
 
     # -- internals -----------------------------------------------------------
+
+    def _current_best_source(self) -> tuple[str, str]:
+        """The source a new idea should be built from, plus a provenance label.
+
+        Without this the agent restarted from the static solution/train.py on
+        every idea, so improvements never compounded: iteration 5 was built on
+        the baseline, not on whatever iterations 1-4 had established.
+
+        The lookup chains three things the harness already maintains:
+
+            registry.best()      -> the accepted iteration with the best
+                                    validation primary
+            runs.jsonl           -> that iteration's RunRecord
+            record.diff_path     -> the config the executor was pointed at,
+                                    whose sibling train.py is the source that
+                                    actually produced the score
+
+        Note this reads RunRecord.diff_path, which orchestrator.py populates
+        from the config path -- see the naming discussion in this module's
+        docstring. The adjacency of config and train.py inside a solution dir
+        is what makes the last hop work, and both the CodingAgent's own
+        attempt dirs and the seeded solution/ satisfy it.
+
+        Every failure mode falls back to the static baseline rather than
+        raising: a missing registry, an empty one, a record that can't be
+        found, a solution dir that has been cleaned up. implement() must not
+        crash the whole run because provenance couldn't be resolved.
+        """
+        fallback = (prompts.load_baseline_source(), "solution/train.py (static baseline)")
+        if self.registry_path is None or self.run_log_path is None:
+            return fallback
+
+        try:
+            from agent.records import RunLog
+            from agent.registry import CheckpointRegistry
+
+            best = CheckpointRegistry(Path(self.registry_path)).best()
+            if best is None:
+                return fallback
+
+            record = next(
+                (r for r in RunLog(Path(self.run_log_path)).read_all()
+                 if r.iteration == best.iteration),
+                None,
+            )
+            if record is None or not record.diff_path:
+                return fallback
+
+            train_py = Path(record.diff_path).parent / "train.py"
+            if not train_py.exists():
+                return fallback
+
+            return (
+                train_py.read_text(),
+                f"iteration {best.iteration} (val primary {best.val_primary:.4f}) "
+                f"via {train_py}",
+            )
+        except Exception as e:  # noqa: BLE001 - provenance is best-effort
+            print(f"[coding-agent] could not resolve the current best, "
+                  f"falling back to the static baseline: {type(e).__name__}: {e}", flush=True)
+            return fallback
 
     def _scaffold(self, sol_dir: Path) -> None:
         """Copy the vendored harness in so the dir is self-contained.
@@ -456,9 +525,13 @@ class LLMCodingAgent:
         prior = sorted(self.work_dir.glob("attempt_*/train.py"))
         return prior[-1].read_text() if prior else None
 
-    def _write_manifest(self, sol_dir, idea, feedback, history, calls, wall_s) -> None:
+    def _write_manifest(self, sol_dir, idea, feedback, history, calls, wall_s,
+                        provenance: str = "") -> None:
         (sol_dir / "attempt.json").write_text(json.dumps({
             "hypothesis": idea.hypothesis,
+            # What this attempt was built ON -- the static baseline, or the
+            # accepted iteration it accumulated from.
+            "built_from": provenance,
             "parent_iteration": idea.parent_iteration,
             "had_orchestrator_feedback": feedback is not None,
             "wall_s": round(wall_s, 2),

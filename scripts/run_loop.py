@@ -143,6 +143,11 @@ def main() -> int:
         llm=client,
         usage_log_path=cfg.paths.logs_dir / "coding_agent_usage.jsonl",
         base_config={"loss": args.loss, "epochs": args.epochs, "patience": 3},
+        # ACCUMULATION: build each new idea on the best accepted solution so
+        # far rather than always on the static solution/train.py. Right after
+        # bootstrapping these resolve to iteration 0, i.e. solution/ itself.
+        registry_path=cfg.paths.registry_json,
+        run_log_path=cfg.paths.runs_jsonl,
     )
     orc = Orchestrator(
         research=FakeResearchAgent([args.hypothesis]),

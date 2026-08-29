@@ -44,6 +44,38 @@ it wrote instead of starting over and reintroducing solved bugs.
 orchestrator has no `try/except` around the call, so raising would kill the
 whole run instead of being recorded as one honest failed iteration.
 
+## Accumulation: each idea builds on the current best
+
+The agent used to start every idea from the static `solution/train.py`, so
+improvements never compounded — iteration 5 was written against the baseline,
+not against whatever iterations 1–4 had established.
+
+It now resolves the current best by chaining three things the harness already
+maintains:
+
+```
+registry.best()   → the accepted iteration with the best validation primary
+runs.jsonl        → that iteration's RunRecord
+record.diff_path  → the config the executor ran, whose sibling train.py is
+                    the source that actually produced the score
+```
+
+Pass `registry_path` and `run_log_path` to enable it (`run_loop.py` does).
+Both default to `None`, which keeps the old static-baseline behaviour exactly
+— so existing callers and tests are unaffected.
+
+A useful property falls out of `bootstrap_baseline()`: immediately after
+bootstrapping, the best is iteration 0 whose config is `solution/config.yaml`,
+so the sibling `train.py` **is** `solution/train.py`. "Current best" and
+"static baseline" resolve to the same file until something actually beats the
+baseline, which is what makes this safe to turn on by default. That identity
+is pinned by a test.
+
+Resolution fails soft in every direction — missing registry, empty registry,
+no matching record, a cleaned-up solution dir, a corrupt run log — falling
+back to the static baseline rather than raising. A provenance problem must not
+take down a run. Each attempt's `attempt.json` records what it was `built_from`.
+
 ## Clients
 
 | client | real model? | use |
