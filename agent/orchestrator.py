@@ -400,14 +400,43 @@ class Orchestrator:
             resources=self._resources(diff, seeds),
             manual_intervention=self._consume_manual_intervention_flag(),
         )
-        decision = self.evaluator.judge(record, history)
-        record.decision = decision
+
+        verdict = self.evaluator.judge(record, history)
+        record.decision = verdict.decision
+        if verdict.commentary:
+            # The write-back to Research: whatever a real Evaluator reasoned
+            # about this result lands in the shared history, not a channel
+            # only the orchestrator sees.
+            record.events.append(Event(
+                type="evaluator_commentary", detail=verdict.commentary, agent_action="evaluator",
+            ))
+        if verdict.usage is not None:
+            # ResourceUsage is frozen -- rebuild it rather than mutate, adding
+            # the Evaluator's tokens on top of whatever the CodingAgent already
+            # contributed via self._resources(). An LLM-backed Evaluator
+            # spends real tokens judging a result; that cost is exactly as
+            # real as the CodingAgent's and belongs in the same total.
+            r = record.resources
+            record.resources = ResourceUsage(
+                wall_s=r.wall_s, cpu_hours=r.cpu_hours,
+                tokens_in=r.tokens_in + verdict.usage.tokens_in,
+                tokens_out=r.tokens_out + verdict.usage.tokens_out,
+            )
+
         self.run_log.append(record)
 
-        if decision == Decision.ACCEPT:
+        if verdict.decision == Decision.ACCEPT:
             self._register_checkpoint(iteration, diff, seeds, agg)
 
-        self._close_idea(abandoned=False)
+        # AUDIT-EVALUATOR: previously hardcoded False, so an Evaluator that
+        # returned ABANDON (a documented, legitimate verdict) was silently
+        # treated exactly like REVERT -- consecutive_abandonments never
+        # incremented, and tier-2 could never fire from an Evaluator's own
+        # judgment that a hypothesis was a dead end, only from tier-1's
+        # attempt-cap exhaustion. FakeEvaluatorAgent never exercised this path
+        # (it never returns ABANDON), which is why it went unnoticed until a
+        # real Evaluator that can made it observable.
+        self._close_idea(abandoned=(verdict.decision == Decision.ABANDON))
 
     def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
         """Build the iteration's ResourceUsage, including LLM tokens and CPU time.

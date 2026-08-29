@@ -1,9 +1,11 @@
 """Run the agent loop end to end.
 
-Wires the real CodingAgent into the EXISTING Orchestrator. Research and
-Evaluator are still the Fakes from agent/agents.py -- there are no real
-implementations of those yet -- so this drives one fixed hypothesis rather
-than proposing its own.
+Wires the real CodingAgent and the real LLMEvaluatorAgent into the EXISTING
+Orchestrator. Research is still the Fake from agent/agents.py -- there is no
+real implementation of it yet -- so this drives one fixed hypothesis rather
+than proposing its own. --offline uses FakeEvaluatorAgent (the same
+deterministic margin rule LLMEvaluatorAgent falls back to internally) instead
+of a real judge call, matching the Coding agent's own --offline behavior.
 
     # offline: no API key, no spend, uses the hand-written template library
     python scripts/run_loop.py --offline
@@ -34,6 +36,7 @@ from agent.config import (  # noqa: E402
     RetryConfig,
     SeedingConfig,
 )
+from agent.evaluator import LLMEvaluatorAgent  # noqa: E402
 from agent.executor import Executor  # noqa: E402
 from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
@@ -149,10 +152,16 @@ def main() -> int:
         registry_path=cfg.paths.registry_json,
         run_log_path=cfg.paths.runs_jsonl,
     )
+    # Same client as the CodingAgent when live: one model, one API key, no
+    # separate --evaluator-model flag to keep in sync. --offline keeps the
+    # deterministic margin rule instead of spending on judge calls too.
+    evaluator = FakeEvaluatorAgent() if args.offline else LLMEvaluatorAgent(
+        llm=client, usage_log_path=cfg.paths.logs_dir / "evaluator_usage.jsonl",
+    )
     orc = Orchestrator(
         research=FakeResearchAgent([args.hypothesis]),
         coding=coding,
-        evaluator=FakeEvaluatorAgent(),
+        evaluator=evaluator,
         executor=Executor(cfg=cfg),
         run_log=RunLog(cfg.paths.runs_jsonl),
         registry=CheckpointRegistry(cfg.paths.registry_json),
@@ -198,11 +207,18 @@ def main() -> int:
                   f"{s.failure_kind.value if s.failure_kind else None} wall={s.wall_s:.0f}s")
             if s.failure_kind:
                 print(f"      {(s.traceback_tail or '')[:400]}")
+        for e in r.events:
+            if e.type == "evaluator_commentary":
+                print(f"  evaluator: {e.detail}")
 
-    print(f"\nrun log:      {cfg.paths.runs_jsonl}")
-    print(f"LLM usage:    {cfg.paths.logs_dir / 'coding_agent_usage.jsonl'}")
-    print(f"quarantine:   {cfg.paths.test_metrics_jsonl}  (agents never read this)")
-    print(f"LLM totals:   {coding.usage.totals()}")
+    print(f"\nrun log:          {cfg.paths.runs_jsonl}")
+    print(f"coding LLM usage: {cfg.paths.logs_dir / 'coding_agent_usage.jsonl'}")
+    print(f"quarantine:       {cfg.paths.test_metrics_jsonl}  (agents never read this)")
+    print(f"coding totals:    {coding.usage.totals()}")
+    evaluator_usage = getattr(evaluator, "usage", None)  # FakeEvaluatorAgent (--offline) has none
+    if evaluator_usage is not None:
+        print(f"evaluator usage:  {cfg.paths.logs_dir / 'evaluator_usage.jsonl'}")
+        print(f"evaluator totals: {evaluator_usage.totals()}")
     return 0
 
 

@@ -1,6 +1,6 @@
 import pytest
 
-from agent.agents import FakeCodingAgent
+from agent.agents import AgentUsage, FakeCodingAgent, Verdict
 from agent.orchestrator import OrchestratorHalted
 from agent.records import Decision, Status
 from conftest import make_orchestrator, make_test_config
@@ -252,3 +252,107 @@ def test_manual_intervention_flag_is_set_on_the_record_right_after_a_resume(tmp_
         "the flag must be one-shot -- the record after that must NOT be flagged"
     # And nothing before the halt was retroactively flagged.
     assert all(r.manual_intervention is False for r in history[:6])
+
+
+# ---------------------------------------------------------------------------
+# EvaluatorAgent.judge() now returns a Verdict (decision + commentary +
+# usage), not a bare Decision -- these three tests cover exactly what that
+# unlocked, including a real pre-existing bug: _close_idea's `abandoned` flag
+# was hardcoded False in the success path, so an Evaluator-issued ABANDON was
+# silently treated like REVERT and never counted toward tier-2. It went
+# unnoticed because FakeEvaluatorAgent never returns ABANDON.
+# ---------------------------------------------------------------------------
+
+class _ScriptedEvaluator:
+    """Returns one scripted Verdict per judge() call, in order."""
+
+    def __init__(self, verdicts):
+        self._verdicts = iter(verdicts)
+
+    def judge(self, record, history):
+        return next(self._verdicts)
+
+
+def test_evaluator_issued_abandon_counts_toward_tier2_like_a_tier1_exhaustion(tmp_path):
+    cfg = make_test_config(tmp_path)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}] * 2
+    evaluator = _ScriptedEvaluator([Verdict(Decision.ABANDON), Verdict(Decision.ABANDON)])
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=("A", "B"), evaluator=evaluator)
+
+    orc._step(orc.run_log.read_all())
+    assert orc.state.consecutive_abandonments == 1, \
+        "a single Evaluator ABANDON must increment the same counter tier-1 exhaustion does"
+    assert orc.state.halted is False
+
+    orc._step(orc.run_log.read_all())
+    assert orc.state.consecutive_abandonments == 2
+    assert orc.state.halted is True, "two Evaluator-issued ABANDONs in a row must trip tier-2, same as tier-1"
+
+    history = orc.run_log.read_all()
+    assert [r.decision for r in history] == [Decision.ABANDON, Decision.ABANDON]
+
+
+def test_evaluator_accept_still_resets_the_abandonment_streak(tmp_path):
+    """The fix must not make ACCEPT/REVERT behave like ABANDON -- only an
+    actual ABANDON verdict should feed the tier-2 counter."""
+    cfg = make_test_config(tmp_path)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}] * 2
+    evaluator = _ScriptedEvaluator([Verdict(Decision.ABANDON), Verdict(Decision.ACCEPT)])
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=("A", "B"), evaluator=evaluator)
+
+    orc._step(orc.run_log.read_all())
+    assert orc.state.consecutive_abandonments == 1
+
+    orc._step(orc.run_log.read_all())
+    assert orc.state.consecutive_abandonments == 0, "ACCEPT must reset the streak, not extend it"
+    assert orc.state.halted is False
+
+
+def test_evaluator_commentary_is_written_back_as_an_event(tmp_path):
+    cfg = make_test_config(tmp_path)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    evaluator = _ScriptedEvaluator([
+        Verdict(Decision.REVERT, commentary="This underperforms the baseline by 0.05, likely due to an unweighted sampler."),
+    ])
+    orc = make_orchestrator(tmp_path, cfg, outcomes, evaluator=evaluator)
+
+    orc._step(orc.run_log.read_all())
+
+    record = orc.run_log.read_all()[-1]
+    commentary_events = [e for e in record.events if e.type == "evaluator_commentary"]
+    assert len(commentary_events) == 1
+    assert commentary_events[0].detail == "This underperforms the baseline by 0.05, likely due to an unweighted sampler."
+    assert commentary_events[0].agent_action == "evaluator"
+
+
+def test_no_commentary_event_when_verdict_carries_none(tmp_path):
+    """FakeEvaluatorAgent and any Verdict with commentary="" must not litter
+    the events list with an empty evaluator_commentary entry."""
+    cfg = make_test_config(tmp_path)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes)  # default FakeEvaluatorAgent
+
+    orc._step(orc.run_log.read_all())
+
+    record = orc.run_log.read_all()[-1]
+    assert not any(e.type == "evaluator_commentary" for e in record.events)
+
+
+def test_evaluator_usage_is_folded_into_resources_on_top_of_codings(tmp_path):
+    cfg = make_test_config(tmp_path)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    evaluator = _ScriptedEvaluator([
+        Verdict(Decision.ACCEPT, usage=AgentUsage(tokens_in=500, tokens_out=120, cost_usd=0.01)),
+    ])
+    orc = make_orchestrator(tmp_path, cfg, outcomes, evaluator=evaluator)
+    # FakeCodingAgent's Diff carries no usage, so the record's tokens should
+    # be exactly the Evaluator's -- proving they're additive, not overwriting,
+    # requires a case with a non-zero CodingAgent contribution too (covered
+    # separately by tests/test_resource_usage.py for the CodingAgent side);
+    # here the point is that the Evaluator's own usage reaches resources at all.
+
+    orc._step(orc.run_log.read_all())
+
+    record = orc.run_log.read_all()[-1]
+    assert record.resources.tokens_in == 500
+    assert record.resources.tokens_out == 120
