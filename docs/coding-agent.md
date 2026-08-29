@@ -149,10 +149,35 @@ one meaning.
    `train.py`**, which works precisely because a config lives inside its
    solution dir.
 
-**Residual, knowingly left:** a field named `diff_path` holding a config path,
-now only at the `RunRecord` level. Fixing that means renaming a field in
-`records.py` and deciding what already-written JSONL lines mean — a bigger call
-than this change, and a separate one.
+### The permanent record carries both paths
+
+`RunRecord` now has `patch_path` alongside `diff_path`, so `runs.jsonl` alone
+answers *what code did this iteration actually run* — previously it got you
+only to the settings file, and finding the diff meant hunting for the solution
+directory by hand. That matters because the hypothesis log is a graded artifact
+and an LLM wrote the code: verifying "did this iteration implement what its
+hypothesis claimed" should be a matter of following the run log.
+
+| field | holds | `None` when |
+|---|---|---|
+| `diff_path` | the **config** the executor ran | never (always recorded) |
+| `patch_path` | the **unified diff** of the code change | the producer makes no patch — `FakeCodingAgent`, and the bootstrapped baseline, which is a pre-existing solution rather than an edit to one |
+
+`diff_path`'s meaning and how it's populated are untouched — this is purely
+additive.
+
+**Backward compatibility.** `runs.jsonl` is append-only and permanent, so
+`from_json()` reads the new field with `d.get("patch_path")`, following the
+precedent `manual_intervention` already set. Lines written before the field
+existed load with `patch_path=None`, which reads correctly: absent is
+indistinguishable from "the producer never made one". Verified against 12
+records in 6 run logs written before the field existed, plus tests in
+`tests/test_records_serialization.py`.
+
+**Residual, knowingly left:** a field named `diff_path` holding a config path.
+Renaming it means deciding what already-written JSONL lines mean — a bigger
+call, and a separate one. Now at least the record is no longer *missing*
+the thing the name suggests; it's in `patch_path` next door.
 
 ## 3. ~~First-iteration `delta_vs_current_best` is meaningless~~ — FIXED
 

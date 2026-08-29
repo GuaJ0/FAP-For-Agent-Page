@@ -112,3 +112,131 @@ def test_failed_iterations_also_record_the_config_path(tmp_path):
     record = orc.run_log.read_all()[-1]
     assert record.status == Status.FAILED
     assert Path(record.diff_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# RunRecord.patch_path: the permanent record now remembers the code change,
+# not just the settings.
+#
+# The hypothesis log is a graded artifact and an LLM wrote the code, so
+# "did this iteration actually implement what its hypothesis claimed" has to
+# be answerable by following runs.jsonl -- not by hunting for the solution
+# directory by hand.
+# ---------------------------------------------------------------------------
+
+def test_a_real_coding_agent_run_records_a_readable_patch(tmp_path):
+    """End to end through the real LLMCodingAgent and the real Orchestrator.
+
+    Asserts the file on disk, not just that the field holds a string: a path
+    that doesn't resolve, or resolves to an empty file, would satisfy a
+    type check while being useless for the verification this exists for.
+    """
+    from agent.coding import LLMCodingAgent, ScriptedClient
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    template = (REPO_ROOT / "agent" / "coding" / "templates" / "train_ranking.py").read_text()
+
+    cfg = make_test_config(tmp_path)
+    coding = LLMCodingAgent(
+        work_dir=tmp_path / "solutions",
+        data_dir=str(tmp_path),
+        llm=ScriptedClient([f"```python\n{template}\n```\n"]),
+        usage_log_path=tmp_path / "usage.jsonl",
+        run_smoke_test=False,
+    )
+    # The generated train.py needs the real data to run, which this test does
+    # not have -- the executor failing is fine and is itself the failed-path
+    # case. What matters is the patch the CodingAgent recorded on the way.
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], coding=coding)
+
+    orc._step(orc.run_log.read_all())
+
+    record = orc.run_log.read_all()[-1]
+    assert record.patch_path is not None, "the real agent produced no patch_path"
+
+    patch = Path(record.patch_path)
+    assert patch.exists(), f"patch_path points at nothing: {patch}"
+    content = patch.read_text()
+    assert content.strip(), "the recorded patch is empty"
+    assert patch.name == "changes.patch"
+    # It is a real unified diff of the change this hypothesis made.
+    assert "@@" in content or content.startswith("---")
+    assert "bpr" in content.lower()
+
+    # And it is genuinely a different artifact from the config.
+    assert record.diff_path != record.patch_path
+    assert Path(record.diff_path).exists()
+
+
+def test_patch_path_survives_the_jsonl_round_trip_in_a_real_run(tmp_path):
+    """It has to still be there after the record has been through disk."""
+    from agent.coding import LLMCodingAgent, ScriptedClient
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    template = (REPO_ROOT / "agent" / "coding" / "templates" / "train_ranking.py").read_text()
+
+    cfg = make_test_config(tmp_path)
+    coding = LLMCodingAgent(
+        work_dir=tmp_path / "solutions", data_dir=str(tmp_path),
+        llm=ScriptedClient([f"```python\n{template}\n```\n"]),
+        usage_log_path=tmp_path / "usage.jsonl", run_smoke_test=False,
+    )
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], coding=coding)
+
+    orc._step(orc.run_log.read_all())
+
+    raw = json.loads(cfg.paths.runs_jsonl.read_text().strip().splitlines()[-1])
+    assert raw["patch_path"] == orc.run_log.read_all()[-1].patch_path
+    assert Path(raw["patch_path"]).exists()
+
+
+def test_fake_agent_records_no_patch_path(tmp_path):
+    """FakeCodingAgent copies a fixture rather than editing anything. None,
+    not an error and not a bogus path."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[{"mode": "normal", "sleep_s": 0.0}])
+
+    orc._step(orc.run_log.read_all())
+
+    record = orc.run_log.read_all()[-1]
+    assert record.patch_path is None
+    assert record.diff_path is not None      # the config is still recorded
+
+
+def test_failed_iterations_record_the_patch_too(tmp_path):
+    """A failed attempt is exactly when you most want to see what code ran."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[{"mode": "crash", "sleep_s": 0.0}])
+
+    orc._step(orc.run_log.read_all())
+
+    record = orc.run_log.read_all()[-1]
+    assert record.status == Status.FAILED
+    assert record.patch_path is None         # the Fake makes no patch
+
+
+def test_bootstrap_baseline_records_no_patch_path(tmp_path):
+    """The seeded baseline is a pre-existing solution, not an edit to one, so
+    there is no diff for it to point at."""
+    import shutil
+
+    from agent.agents import Diff, Idea
+
+    FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "fake_train.py"
+    sol = tmp_path / "baseline"
+    sol.mkdir()
+    shutil.copy(FIXTURE, sol / "train.py")
+    cfg_file = sol / "config.json"
+    cfg_file.write_text(json.dumps({"mode": "normal", "sleep_s": 0.0, "mean": 0.6015, "std": 0.0}))
+
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[])
+
+    record = orc.bootstrap_baseline(
+        Idea("baseline", None),
+        Diff(config_path=str(cfg_file), solution_dir=str(sol)),
+    )
+
+    assert record.patch_path is None
+    assert record.diff_path == str(cfg_file)
+    assert orc.run_log.read_all()[0].patch_path is None
