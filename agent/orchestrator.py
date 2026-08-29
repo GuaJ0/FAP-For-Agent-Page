@@ -185,7 +185,7 @@ class Orchestrator:
             idea: describes the baseline. `parent_iteration` is ignored --
                 iteration 0 is the root and has no parent.
             diff: `solution_dir` is the directory the executor runs `train.py`
-                in; `diff_path` is the config file passed to it. Keeping the
+                in; `config_path` is the config file passed to it. Keeping the
                 config a sibling of `train.py` matters for anything that later
                 resolves a registry entry back to the source that produced it.
 
@@ -220,7 +220,7 @@ class Orchestrator:
             self.state.run_start_time = time.time()
 
         seeds, agg = self.executor.run_seeds(
-            Path(diff.solution_dir), Path(diff.diff_path),
+            Path(diff.solution_dir), Path(diff.config_path),
             BOOTSTRAP_ITERATION, list(range(self._adaptive_n_seeds())),
         )
         self.state.seed_costs.extend(s.wall_s for s in seeds)
@@ -257,7 +257,7 @@ class Orchestrator:
             parent_iteration=None,          # iteration 0 is the root
             timestamp=_iso_now(),
             hypothesis=idea.hypothesis,
-            diff_path=diff.diff_path,
+            diff_path=self._record_diff_path(diff),
             status=Status.SUCCESS if succeeded else Status.FAILED,
             seeds=seeds,
             aggregate=agg,
@@ -289,7 +289,7 @@ class Orchestrator:
         n_seeds = self._adaptive_n_seeds()
         iteration = self.state.iteration + 1
         seeds, agg = self.executor.run_seeds(
-            Path(diff.solution_dir), Path(diff.diff_path), iteration, list(range(n_seeds)),
+            Path(diff.solution_dir), Path(diff.config_path), iteration, list(range(n_seeds)),
         )
         self.state.seed_costs.extend(s.wall_s for s in seeds)
 
@@ -324,7 +324,7 @@ class Orchestrator:
             parent_iteration=idea.parent_iteration,
             timestamp=_iso_now(),
             hypothesis=idea.hypothesis,
-            diff_path=diff.diff_path,
+            diff_path=self._record_diff_path(diff),
             status=Status.ABANDONED if should_abandon else Status.FAILED,
             seeds=seeds,
             aggregate=None,
@@ -365,7 +365,7 @@ class Orchestrator:
             parent_iteration=idea.parent_iteration,
             timestamp=_iso_now(),
             hypothesis=idea.hypothesis,
-            diff_path=diff.diff_path,
+            diff_path=self._record_diff_path(diff),
             status=status,
             seeds=seeds,
             aggregate=agg,
@@ -406,6 +406,31 @@ class Orchestrator:
             tokens_in=diff.usage.tokens_in,
             tokens_out=diff.usage.tokens_out,
         )
+
+    @staticmethod
+    def _record_diff_path(diff: Diff) -> str:
+        """What goes into RunRecord.diff_path.
+
+        Deliberately the CONFIG path, not diff.patch_path, for three reasons:
+
+          1. It keeps runs.jsonl's meaning unchanged. That field has always
+             held the config the executor was pointed at; repointing it would
+             silently make old and new lines mean different things in an
+             append-only log, with no version marker to tell them apart.
+          2. It is the only path always present. FakeCodingAgent and the
+             bootstrapped baseline produce no patch, so patch_path is None for
+             them and the field would be half-empty.
+          3. LLMCodingAgent._current_best_source() resolves the current best
+             solution by taking the sibling train.py of this path. That works
+             precisely because a config lives inside its solution dir.
+
+        The residual mismatch -- a field named diff_path holding a config path
+        -- is knowingly left. Fixing it means renaming a field in records.py
+        and migrating what already-written JSONL lines mean, which is a bigger
+        call than this change. agents.py's Diff no longer has a `diff_path` at
+        all, so at least there is exactly one in the codebase with one meaning.
+        """
+        return diff.config_path
 
     @staticmethod
     def _usage_event(diff: Diff) -> list[Event]:

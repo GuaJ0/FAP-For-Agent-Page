@@ -38,7 +38,7 @@ def _baseline_solution(tmp_path, primary=0.6015, name="baseline"):
     cfg = sol / "config.json"
     cfg.write_text(json.dumps({"mode": "normal", "sleep_s": 0.0, "mean": primary, "std": 0.0}))
     # The config is a sibling of train.py, as the real solution/ layout is.
-    return Diff(diff_path=str(cfg), solution_dir=str(sol))
+    return Diff(config_path=str(cfg), solution_dir=str(sol))
 
 
 def _orc(tmp_path, cfg, outcomes=(), **kw):
@@ -285,7 +285,7 @@ def test_a_failing_baseline_is_logged_then_raised(tmp_path):
     sol.mkdir()
     shutil.copy(FIXTURE, sol / "train.py")
     (sol / "config.json").write_text(json.dumps({"mode": "crash", "sleep_s": 0.0}))
-    diff = Diff(diff_path=str(sol / "config.json"), solution_dir=str(sol))
+    diff = Diff(config_path=str(sol / "config.json"), solution_dir=str(sol))
 
     with pytest.raises(BootstrapError, match="baseline itself failed"):
         orc.bootstrap_baseline(BASELINE_IDEA, diff)
@@ -308,7 +308,7 @@ def test_bootstrap_can_be_retried_after_a_failure(tmp_path):
     shutil.copy(FIXTURE, sol / "train.py")
     cfg_path = sol / "config.json"
     cfg_path.write_text(json.dumps({"mode": "crash", "sleep_s": 0.0}))
-    diff = Diff(diff_path=str(cfg_path), solution_dir=str(sol))
+    diff = Diff(config_path=str(cfg_path), solution_dir=str(sol))
 
     with pytest.raises(BootstrapError):
         orc.bootstrap_baseline(BASELINE_IDEA, diff)

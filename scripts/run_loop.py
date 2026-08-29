@@ -167,11 +167,12 @@ def main() -> int:
         # so deltas, ACCEPT/REVERT and convergence all have an incumbent to
         # measure against. Idempotent: a no-op if a previous run already did it.
         #
-        # diff_path is solution/config.yaml, a sibling of solution/train.py --
+        # config_path is solution/config.yaml, a sibling of solution/train.py --
         # that adjacency is what lets a registry entry be resolved back to the
-        # source that produced it.
+        # source that produced it (see LLMCodingAgent._current_best_source).
+        # No patch_path: the baseline is a pre-existing solution, not an edit.
         baseline = Diff(
-            diff_path=str(REPO_ROOT / "solution" / "config.yaml"),
+            config_path=str(REPO_ROOT / "solution" / "config.yaml"),
             solution_dir=str(REPO_ROOT / "solution"),
         )
         try:

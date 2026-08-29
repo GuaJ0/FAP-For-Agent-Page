@@ -26,16 +26,19 @@ been shown to start, train, score, and produce a verifiable result.json.
 is a retry of an idea whose *full* run failed, so the last attempt's source and
 that failure are both put in the repair prompt.
 
-WHAT `Diff.diff_path` MEANS HERE -- WORTH A LOOK IN REVIEW
-----------------------------------------------------------
-agents.py documents `Diff.diff_path` as "where the change is recorded (patch
-file, commit ref, ...)", but orchestrator.py passes it straight to
-`Executor.run_seeds(...)` as the config path. The executable meaning wins, so
-diff_path is the config file. A real unified diff against the baseline is
-still written, as `changes.patch` in the solution dir, and referenced from
-`attempt.json` -- it just can't live in the field named after it. Renaming the
-field, or giving Diff a separate `config_path`, would be the clean fix and
-needs an orchestrator.py change.
+WHAT THIS RETURNS
+-----------------
+A `Diff` with `config_path` (what the executor runs), `solution_dir`,
+`patch_path` (a real unified diff against the source this was built from), and
+`usage` (tokens/cost for this implement() call, which orchestrator.py folds
+into RunRecord.resources).
+
+`Diff` used to have a single `diff_path` documented as a patch file but
+consumed by orchestrator.py as the config path. That is now split into two
+explicitly named fields and the ambiguous name is gone. Note that
+RunRecord.diff_path (records.py) still holds the CONFIG path -- see
+Orchestrator._record_diff_path for why that was left alone, and why
+_current_best_source() below depends on it.
 """
 from __future__ import annotations
 
@@ -311,8 +314,9 @@ class LLMCodingAgent:
         # the granularity a RunRecord wants. It includes the inner repair
         # cycles, since those are part of what this iteration cost.
         return Diff(
-            diff_path=str(config_path),
+            config_path=str(config_path),
             solution_dir=str(sol_dir),
+            patch_path=str(sol_dir / "changes.patch") if source is not None else None,
             usage=AgentUsage(
                 tokens_in=self.last_usage["tokens_in"],
                 tokens_out=self.last_usage["tokens_out"],

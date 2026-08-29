@@ -119,19 +119,40 @@ derivable, is logged next to the model name in `logs/coding_agent_usage.jsonl`,
 and the orchestrator also writes it into a per-iteration `coding_usage` event
 so it's visible in `runs.jsonl` without a `records.py` schema change.
 
-## 2. `Diff.diff_path` is really the config path
+## 2. ~~`Diff.diff_path` is really the config path~~ — FIXED
 
-`agents.py` documents `diff_path` as "where the change is recorded (patch file,
-commit ref, ...)", but `orchestrator.py` passes it straight to
-`Executor.run_seeds()` as `config_path`. The executable meaning wins, so this
-agent puts the config file there. A real unified diff against the baseline is
-still written as `changes.patch` in the solution dir and referenced from
-`attempt.json` — it just can't live in the field named after it.
+**Was:** `agents.py` documented `Diff.diff_path` as "where the change is
+recorded (patch file, commit ref, ...)", but `orchestrator.py` passed it
+straight to `Executor.run_seeds()` as the config path. Documented meaning and
+executable meaning had drifted, and the executable one was load-bearing.
 
-The clean fix is to give `Diff` a separate `config_path` field, or rename
-`diff_path`. Both need an `orchestrator.py` change. There is a test
-(`test_diff_path_is_the_config_file_the_orchestrator_will_pass_to_the_executor`)
-pinning the current behaviour so the swap is a deliberate act.
+**Now:** `Diff` carries `config_path` (what the executor runs) and
+`patch_path` (a real unified diff, `None` when the agent doesn't produce one).
+
+**The name `diff_path` is deliberately gone from `Diff` rather than reused for
+the patch.** `RunRecord.diff_path` in `records.py` still means "the config the
+executor ran", so keeping the name on `Diff` with a *different* meaning one
+layer up would have replaced the old ambiguity with a worse one — two fields,
+same name, adjacent layers, opposite meanings, crossing in `orchestrator.py`.
+With the name gone there is exactly one `diff_path` in the codebase and it has
+one meaning.
+
+`RunRecord.diff_path` keeps taking the **config** path, for three reasons
+(spelled out in `Orchestrator._record_diff_path`):
+
+1. `runs.jsonl`'s meaning is unchanged — repointing it would silently make old
+   and new lines mean different things in an append-only log with no version
+   marker.
+2. It's the only path always present: `FakeCodingAgent` and the bootstrapped
+   baseline produce no patch.
+3. Accumulation resolves the current best by taking this path's **sibling
+   `train.py`**, which works precisely because a config lives inside its
+   solution dir.
+
+**Residual, knowingly left:** a field named `diff_path` holding a config path,
+now only at the `RunRecord` level. Fixing that means renaming a field in
+`records.py` and deciding what already-written JSONL lines mean — a bigger call
+than this change, and a separate one.
 
 ## 3. ~~First-iteration `delta_vs_current_best` is meaningless~~ — FIXED
 

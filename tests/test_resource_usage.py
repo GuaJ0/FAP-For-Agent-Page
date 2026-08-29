@@ -37,7 +37,8 @@ class _UsageCodingAgent:
 
     def implement(self, idea, feedback):
         d = self.inner.implement(idea, feedback)
-        return Diff(diff_path=d.diff_path, solution_dir=d.solution_dir, usage=self.usage)
+        return Diff(config_path=d.config_path, solution_dir=d.solution_dir,
+                    patch_path=d.patch_path, usage=self.usage)
 
 
 # ---------------------------------------------------------------------------
@@ -186,4 +187,4 @@ def test_zero_usage_emits_no_event(tmp_path):
 
 
 def test_diff_usage_defaults_to_none():
-    assert Diff(diff_path="c", solution_dir="d").usage is None
+    assert Diff(config_path="c", solution_dir="d").usage is None
