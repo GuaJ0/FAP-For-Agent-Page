@@ -1,0 +1,299 @@
+"""Production LLM-backed implementation of the existing ResearchAgent protocol.
+
+This module owns only Agent 1 concerns.  It consumes validation-only
+``RunRecord`` history and returns the existing ``Idea`` handoff; it does not
+route the pipeline, implement model code, or make evaluation decisions.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+from agent.agents import Idea
+from agent.coding.llm import LLMClient, LLMResponse
+from agent.config import FORBIDDEN_PAYLOAD_KEYS, TEST_METRICS_SENTINEL
+from agent.records import Decision, RunRecord, Status
+from agent.research.citations import (
+    CitationSource,
+    CitationValidationError,
+    JsonCitationCatalog,
+    validate_proposal_citations,
+)
+from agent.research.context import ResearchContext, build_research_context
+from agent.research.prompts import SYSTEM_PROMPT, build_proposal_prompt, build_repair_prompt
+from agent.research.schemas import ProposalValidationError, ResearchProposal
+from runlog.emit import append_line, read_lines
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+class ResearchAgentError(RuntimeError):
+    """Base error raised by the production Research Agent."""
+
+
+class ResearchInputError(ResearchAgentError):
+    """Agent-facing history is unsafe or insufficient to construct a prompt."""
+
+
+class ResearchOutputError(ResearchAgentError):
+    """The model failed to produce a valid proposal within the repair budget."""
+
+
+class DuplicateHypothesisError(ProposalValidationError):
+    """A reverted or abandoned hypothesis was proposed again unchanged."""
+
+
+@dataclass
+class ResearchUsageLog:
+    """Append-only accounting for Research calls only.
+
+    The Coding Agent's UsageLog intentionally remains untouched.  Token counts
+    and estimated cost are copied from the shared ``LLMResponse`` abstraction.
+    """
+
+    path: Path
+
+    def record(
+        self,
+        response: LLMResponse,
+        *,
+        purpose: str,
+        attempt: int,
+        parent_iteration: Optional[int],
+    ) -> None:
+        append_line(self.path, {
+            "timestamp": time.time(),
+            "agent": "research",
+            "purpose": purpose,
+            "attempt": attempt,
+            "parent_iteration": parent_iteration,
+            "model": response.model,
+            "is_real_model_call": response.is_real_model_call,
+            "tokens_in": response.tokens_in,
+            "tokens_out": response.tokens_out,
+            "cost_usd": round(response.cost_usd, 6),
+        })
+
+    def totals(self) -> dict[str, Any]:
+        rows = list(read_lines(self.path))
+        return {
+            "calls": len(rows),
+            "real_model_calls": sum(bool(row.get("is_real_model_call")) for row in rows),
+            "tokens_in": sum(int(row.get("tokens_in", 0)) for row in rows),
+            "tokens_out": sum(int(row.get("tokens_out", 0)) for row in rows),
+            "cost_usd": round(sum(float(row.get("cost_usd", 0.0)) for row in rows), 6),
+        }
+
+
+def _normalise(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _section(text: str, heading: str) -> Optional[str]:
+    """Extract a section from the deterministic Phase 1 handoff format."""
+    match = re.search(
+        rf"(?ms)^{re.escape(heading)}:\s*\n(.*?)(?=\n[A-Z][A-Z ]+:\s*\n|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else None
+
+
+def _historical_hypothesis(record: RunRecord) -> str:
+    return _section(record.hypothesis, "HYPOTHESIS") or record.hypothesis
+
+
+def _meaningful_variation(proposal: ResearchProposal, record: RunRecord) -> bool:
+    """Conservative deterministic check for a changed experiment.
+
+    For a structured historical handoff, changed implementation steps or
+    hyperparameters can establish a variation.  For legacy free-text history,
+    the variation must be explicit in the new hypothesis itself because the
+    old record contains no implementation detail to compare safely.
+    """
+    current_hypothesis = _normalise(proposal.hypothesis)
+    prior_hypothesis = _normalise(_historical_hypothesis(record))
+    if not prior_hypothesis:
+        return True
+
+    similarity = SequenceMatcher(None, current_hypothesis, prior_hypothesis).ratio()
+    if similarity < 0.92:
+        return True
+
+    if not record.hypothesis.lstrip().startswith("[RESEARCH_PROPOSAL v1]"):
+        # Legacy records cannot prove that an unchanged hypothesis carries a
+        # genuinely different implementation. Require the variation in the
+        # hypothesis wording itself.
+        current_tokens = set(current_hypothesis.split())
+        prior_tokens = set(prior_hypothesis.split())
+        return len(current_tokens - prior_tokens) >= 3
+
+    variation_text = " ".join([
+        *proposal.implementation.target_components,
+        *proposal.implementation.steps,
+        json.dumps(proposal.implementation.hyperparameters, sort_keys=True),
+    ])
+    prior_text = _normalise(record.hypothesis)
+    variation_tokens = set(_normalise(variation_text).split())
+    return len(variation_tokens - set(prior_text.split())) >= 3
+
+
+def _reject_duplicate(proposal: ResearchProposal, history: Sequence[RunRecord]) -> None:
+    for record in history:
+        was_rejected = record.decision == Decision.REVERT or record.status == Status.ABANDONED
+        if not was_rejected:
+            continue
+        prior = _historical_hypothesis(record)
+        similarity = SequenceMatcher(None, _normalise(proposal.hypothesis), _normalise(prior)).ratio()
+        if similarity >= 0.92 and not _meaningful_variation(proposal, record):
+            raise DuplicateHypothesisError(
+                f"proposal duplicates {record.status.value} iteration {record.iteration} "
+                "without a meaningful mechanism, implementation, or hyperparameter variation"
+            )
+
+
+_UNSAFE_TEXT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    re.escape(TEST_METRICS_SENTINEL),
+    r"\bhidden[\s_-]*test\b",
+    r"\btest[\s_-]*(?:primary|gauc|ndcg5|metrics)\b",
+    r"\b(?:primary|gauc|ndcg5)[\s_-]*test\b",
+))
+
+
+def _assert_validation_only_context(context: ResearchContext) -> None:
+    """Fail closed if prohibited split information reached a prompt field."""
+    payload = json.dumps(context.to_prompt_dict(), sort_keys=True)
+    lowered = payload.lower()
+    for key in FORBIDDEN_PAYLOAD_KEYS:
+        if key in lowered:
+            raise ResearchInputError(
+                f"research context contains hidden-test material (forbidden key {key!r})"
+            )
+    for pattern in _UNSAFE_TEXT_PATTERNS:
+        if pattern.search(payload):
+            raise ResearchInputError(
+                "research context contains hidden-test material; refusing to construct an LLM prompt"
+            )
+
+
+@dataclass
+class LLMResearchAgent:
+    """ResearchAgent implementation backed by the existing ``LLMClient``."""
+
+    llm: LLMClient
+    citation_source: CitationSource = field(default_factory=JsonCitationCatalog)
+    usage_log_path: Path = field(
+        default_factory=lambda: REPO_ROOT / "logs" / "research_agent_usage.jsonl"
+    )
+    max_repair_attempts: int = 1
+    citation_limit: int = 20
+
+    last_usage: dict[str, Any] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        if self.max_repair_attempts not in (0, 1):
+            raise ValueError("max_repair_attempts must be 0 or 1")
+        if self.citation_limit < 1:
+            raise ValueError("citation_limit must be positive")
+        self.usage_log_path = Path(self.usage_log_path)
+        self.usage = ResearchUsageLog(self.usage_log_path)
+
+    def propose(self, history: list[RunRecord]) -> Idea:
+        """Return one validated, evidence-backed proposal as the existing Idea."""
+        context = build_research_context(history)
+        _assert_validation_only_context(context)
+
+        query = self._citation_query(context)
+        citations = self.citation_source.search(query, limit=self.citation_limit)
+        if not citations:
+            raise ResearchInputError(
+                "the configured CitationSource returned no evidence for the Research prompt"
+            )
+
+        initial_prompt = build_proposal_prompt(context, citations)
+        calls: list[LLMResponse] = []
+        errors: list[str] = []
+        user_prompt = initial_prompt
+
+        for attempt in range(self.max_repair_attempts + 1):
+            purpose = "propose" if attempt == 0 else "repair"
+            try:
+                response = self.llm.complete(SYSTEM_PROMPT, user_prompt, purpose=purpose)
+            except Exception as exc:
+                self._set_last_usage(calls)
+                raise ResearchAgentError(
+                    f"Research Agent LLM call failed during {purpose}: {exc}"
+                ) from exc
+            calls.append(response)
+            self.usage.record(
+                response,
+                purpose=purpose,
+                attempt=attempt,
+                parent_iteration=context.parent_iteration,
+            )
+
+            try:
+                proposal = self._validate_response(response.text, context, history)
+            except (ProposalValidationError, CitationValidationError) as exc:
+                errors.append(str(exc))
+                if attempt >= self.max_repair_attempts:
+                    self._set_last_usage(calls)
+                    raise ResearchOutputError(
+                        "Research Agent failed to produce a valid proposal after "
+                        f"{len(calls)} call(s): " + " | ".join(
+                            f"attempt {i + 1}: {error}" for i, error in enumerate(errors)
+                        )
+                    ) from exc
+                user_prompt = build_repair_prompt(
+                    original_prompt=initial_prompt,
+                    original_response=response.text,
+                    validation_error=str(exc),
+                )
+                continue
+
+            self._set_last_usage(calls)
+            return Idea(
+                hypothesis=proposal.to_handoff_text(),
+                # Use the selected incumbent from trusted context, rather than
+                # trusting the model to choose its own parent.
+                parent_iteration=context.parent_iteration,
+            )
+
+        raise AssertionError("unreachable")
+
+    def _validate_response(
+        self,
+        text: str,
+        context: ResearchContext,
+        history: Sequence[RunRecord],
+    ) -> ResearchProposal:
+        proposal = ResearchProposal.from_json(text)
+        if proposal.parent_iteration != context.parent_iteration:
+            raise ProposalValidationError(
+                "proposal.parent_iteration must equal the current accepted incumbent "
+                f"({context.parent_iteration!r}), got {proposal.parent_iteration!r}"
+            )
+        validate_proposal_citations(proposal, self.citation_source)
+        _reject_duplicate(proposal, history)
+        return proposal
+
+    @staticmethod
+    def _citation_query(context: ResearchContext) -> str:
+        recent = " ".join(item.hypothesis for item in context.iterations[-5:])
+        return (
+            f"{context.task} ranking recommendation behavior sequence multi-task "
+            f"watch time feature interactions {recent}"
+        )
+
+    def _set_last_usage(self, calls: Sequence[LLMResponse]) -> None:
+        self.last_usage = {
+            "llm_calls": len(calls),
+            "real_model_calls": sum(response.is_real_model_call for response in calls),
+            "tokens_in": sum(response.tokens_in for response in calls),
+            "tokens_out": sum(response.tokens_out for response in calls),
+            "cost_usd": round(sum(response.cost_usd for response in calls), 6),
+        }

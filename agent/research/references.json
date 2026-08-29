@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "references": [
+    {
+      "citation_id": "rendle2009bpr",
+      "title": "BPR: Bayesian Personalized Ranking from Implicit Feedback",
+      "authors": ["Steffen Rendle", "Christoph Freudenthaler", "Zeno Gantner", "Lars Schmidt-Thieme"],
+      "year": 2009,
+      "venue": "UAI",
+      "url": "https://arxiv.org/abs/1205.2618",
+      "tags": ["ranking", "pairwise-loss", "implicit-feedback"],
+      "claims": [
+        {
+          "claim_id": "pairwise-ranking-objective",
+          "text": "BPR directly optimizes pairwise ordering preferences derived from implicit feedback rather than a pointwise classification objective."
+        }
+      ]
+    },
+    {
+      "citation_id": "zhou2018din",
+      "title": "Deep Interest Network for Click-Through Rate Prediction",
+      "authors": ["Guorui Zhou", "Chengru Song", "Xiaoqiang Zhu", "Ying Fan", "Han Zhu", "Xiao Ma", "Yanghui Yan", "Junqi Jin", "Han Li", "Kun Gai"],
+      "year": 2018,
+      "venue": "KDD",
+      "url": "https://arxiv.org/abs/1706.06978",
+      "tags": ["behavior-sequence", "attention", "click-through-rate"],
+      "claims": [
+        {
+          "claim_id": "candidate-conditioned-interest",
+          "text": "DIN uses an attention-like activation unit to represent user interests adaptively with respect to the candidate item."
+        }
+      ]
+    },
+    {
+      "citation_id": "ma2018esmm",
+      "title": "Entire Space Multi-Task Model: An Effective Approach for Estimating Post-Click Conversion Rate",
+      "authors": ["Xiao Ma", "Liqin Zhao", "Guan Huang", "Zhi Wang", "Zelin Hu", "Xiaoqiang Zhu", "Kun Gai"],
+      "year": 2018,
+      "venue": "SIGIR",
+      "url": "https://arxiv.org/abs/1804.07931",
+      "tags": ["multi-task", "shared-representation", "recommendation"],
+      "claims": [
+        {
+          "claim_id": "shared-representation-transfer",
+          "text": "A multi-task architecture can transfer information through shared representations while optimizing related user-response objectives jointly."
+        }
+      ]
+    },
+    {
+      "citation_id": "guo2017deepfm",
+      "title": "DeepFM: A Factorization-Machine based Neural Network for CTR Prediction",
+      "authors": ["Huifeng Guo", "Ruiming Tang", "Yunming Ye", "Zhenguo Li", "Xiuqiang He"],
+      "year": 2017,
+      "venue": "IJCAI",
+      "url": "https://arxiv.org/abs/1703.04247",
+      "tags": ["factorization-machine", "feature-interactions", "deep-learning"],
+      "claims": [
+        {
+          "claim_id": "joint-low-high-order-interactions",
+          "text": "DeepFM combines an FM component for low-order interactions with a neural component for higher-order interactions using shared feature embeddings."
+        }
+      ]
+    },
+    {
+      "citation_id": "covington2016youtube",
+      "title": "Deep Neural Networks for YouTube Recommendations",
+      "authors": ["Paul Covington", "Jay Adams", "Emre Sargin"],
+      "year": 2016,
+      "venue": "RecSys",
+      "url": "https://doi.org/10.1145/2959100.2959190",
+      "tags": ["recommendation", "ranking", "watch-time"],
+      "claims": [
+        {
+          "claim_id": "ranking-objective-and-watch-time",
+          "text": "The ranking stage can optimize an expected-watch-time objective rather than relying only on click probability."
+        }
+      ]
+    }
+  ]
+}
