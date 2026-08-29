@@ -1,17 +1,21 @@
 """Run the agent loop end to end.
 
-Wires the real CodingAgent and the real LLMEvaluatorAgent into the EXISTING
-Orchestrator. Research is still the Fake from agent/agents.py -- there is no
-real implementation of it yet -- so this drives one fixed hypothesis rather
-than proposing its own. --offline uses FakeEvaluatorAgent (the same
-deterministic margin rule LLMEvaluatorAgent falls back to internally) instead
-of a real judge call, matching the Coding agent's own --offline behavior.
+Wires the deterministic OfflineResearchAgent, real CodingAgent, and real
+LLMEvaluatorAgent into the existing Orchestrator. Research selects a
+history-aware proposal from its validated offline backlog in both modes.
+--offline additionally uses FakeEvaluatorAgent (the same deterministic margin
+rule LLMEvaluatorAgent falls back to internally) and the Coding agent's
+hand-written template library, so it makes no API calls.
 
     # offline: no API key, no spend, uses the hand-written template library
     python scripts/run_loop.py --offline
 
-    # live: real OpenAI generation (needs OPENAI_API_KEY in .env)
-    python scripts/run_loop.py --hypothesis "..." --model gpt-5
+    # live Coding/Evaluator, deterministic offline Research
+    # (needs OPENAI_API_KEY in .env)
+    python scripts/run_loop.py --model gpt-5
+
+The legacy --hypothesis flag remains accepted for CLI compatibility, but the
+offline Research backlog selects the proposal during this integration stage.
 
 Reads KUAIRAND_PATH (and OPENAI_API_KEY) from .env if present.
 """
@@ -26,7 +30,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from agent.agents import Diff, FakeEvaluatorAgent, FakeResearchAgent, Idea  # noqa: E402
+from agent.agents import Diff, FakeEvaluatorAgent, Idea  # noqa: E402
 from agent.coding import LLMCodingAgent, OpenAIClient, TemplateLibraryClient  # noqa: E402
 from agent.config import (  # noqa: E402
     Config,
@@ -40,6 +44,7 @@ from agent.evaluator import LLMEvaluatorAgent  # noqa: E402
 from agent.executor import Executor  # noqa: E402
 from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
+from agent.research import OfflineResearchAgent  # noqa: E402
 from agent.registry import CheckpointRegistry  # noqa: E402
 from agent.state import StateStore  # noqa: E402
 
@@ -132,6 +137,9 @@ def main() -> int:
 
     root = Path(args.root)
     cfg = build_config(root, args)
+    # Use the same convergence limits as the Orchestrator so offline Research
+    # ranks ideas against the actual remaining iteration and wall-time budget.
+    research = OfflineResearchAgent(convergence=cfg.convergence)
 
     if args.offline:
         client = TemplateLibraryClient()
@@ -159,7 +167,7 @@ def main() -> int:
         llm=client, usage_log_path=cfg.paths.logs_dir / "evaluator_usage.jsonl",
     )
     orc = Orchestrator(
-        research=FakeResearchAgent([args.hypothesis]),
+        research=research,
         coding=coding,
         evaluator=evaluator,
         executor=Executor(cfg=cfg),

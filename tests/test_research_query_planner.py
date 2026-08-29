@@ -645,8 +645,14 @@ def test_reverse_metric_divergence_prioritizes_gauc_recovery():
 
 
 def test_zero_remaining_iterations_produces_no_retrieval_work():
+    completed_research = _record(
+        1,
+        parent=0,
+        hypothesis="Completed research experiment.",
+        decision=Decision.REVERT,
+    )
     plan, _, _ = _plan(
-        [_baseline()],
+        [_baseline(), completed_research],
         convergence=ConvergenceConfig(max_iterations=1, max_wall_s=1000.0),
     )
 
