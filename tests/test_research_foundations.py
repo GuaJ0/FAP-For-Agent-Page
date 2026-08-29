@@ -194,9 +194,62 @@ def test_context_uses_best_accepted_incumbent_not_latest_record_or_iteration_zer
     assert context.incumbent.iteration == 3
     assert context.parent_iteration == 3
     assert context.minimum_meaningful_delta == pytest.approx(0.003)
-    assert context.remaining_iterations == 6
+    assert context.remaining_iterations == 7
     assert context.remaining_wall_s == pytest.approx(40)
     assert context.iterations[-1].status == "abandoned"
+
+
+def test_bootstrap_only_leaves_one_research_iteration_and_remains_in_context():
+    baseline = _record(0, 0.60, Decision.ACCEPT, seconds=0)
+
+    context = build_research_context(
+        [baseline],
+        ConvergenceConfig(max_iterations=1),
+    )
+
+    assert context.remaining_iterations == 1
+    assert [summary.iteration for summary in context.iterations] == [0]
+    assert context.iterations[0].primary_mean == pytest.approx(0.60)
+    assert context.incumbent.iteration == 0
+    assert context.incumbent.primary_mean == pytest.approx(0.60)
+    assert context.parent_iteration == 0
+
+
+def test_completed_research_iteration_exhausts_one_iteration_budget_after_bootstrap():
+    history = [
+        _record(0, 0.60, Decision.ACCEPT, seconds=0),
+        _record(1, 0.61, Decision.REVERT, parent=0, seconds=10),
+    ]
+
+    context = build_research_context(
+        history,
+        ConvergenceConfig(max_iterations=1),
+    )
+
+    assert context.remaining_iterations == 0
+    assert [summary.iteration for summary in context.iterations] == [0, 1]
+    assert context.incumbent.iteration == 0
+
+
+def test_bootstrap_only_leaves_two_research_iterations_when_cap_is_two():
+    context = build_research_context(
+        [_record(0, 0.60, Decision.ACCEPT)],
+        ConvergenceConfig(max_iterations=2),
+    )
+
+    assert context.remaining_iterations == 2
+
+
+def test_research_iteration_budget_without_bootstrap_still_counts_completed_records():
+    context = build_research_context(
+        [_record(1, 0.61, Decision.ACCEPT, parent=None)],
+        ConvergenceConfig(max_iterations=2),
+    )
+
+    assert context.remaining_iterations == 1
+    assert [summary.iteration for summary in context.iterations] == [1]
+    assert context.incumbent.iteration == 1
+    assert context.parent_iteration == 1
 
 
 def test_empty_context_has_no_parent_and_can_establish_first_incumbent():

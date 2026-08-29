@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
-from agent.config import ConvergenceConfig, DEFAULT_CONFIG
+from agent.config import BOOTSTRAP_ITERATION, ConvergenceConfig, DEFAULT_CONFIG
 from agent.executor import assert_no_forbidden_keys
 from agent.records import Decision, RunRecord, Status
 
@@ -141,8 +141,16 @@ def build_research_context(
     """
     records = list(history)
     incumbent = _incumbent(records)
-    concluded = sum(record.status != Status.FAILED for record in records)
-    remaining_iterations = max(0, cfg.max_iterations - concluded)
+    # Match convergence.should_stop() exactly: concluded research experiments
+    # consume max_iterations, but the bootstrap incumbent at iteration 0 does
+    # not. Keep the bootstrap in ``records`` for metrics, incumbent selection,
+    # prompt history, wall-clock accounting, and the authoritative fingerprint.
+    concluded_research = sum(
+        record.status != Status.FAILED
+        and record.iteration != BOOTSTRAP_ITERATION
+        for record in records
+    )
+    remaining_iterations = max(0, cfg.max_iterations - concluded_research)
     elapsed = 0.0
     if len(records) >= 2:
         elapsed = max(

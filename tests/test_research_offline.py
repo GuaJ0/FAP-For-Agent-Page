@@ -87,6 +87,29 @@ def test_offline_output_is_deterministic_for_the_same_history():
     assert "OFFLINE-HYBRID-BPR" in first.hypothesis
 
 
+def test_offline_agent_can_propose_with_one_iteration_cap_after_bootstrap():
+    agent = OfflineResearchAgent(
+        convergence=ConvergenceConfig(max_iterations=1),
+    )
+
+    idea = agent.propose([_baseline(iteration=0, primary=0.60)])
+
+    assert idea.parent_iteration == 0
+    assert idea.hypothesis.startswith("[RESEARCH_PROPOSAL v1]\n")
+
+
+def test_offline_agent_exhausts_one_iteration_cap_after_research_experiment():
+    agent = OfflineResearchAgent(
+        convergence=ConvergenceConfig(max_iterations=1),
+    )
+    history = [_baseline(iteration=0, primary=0.60)]
+    idea = agent.propose(history)
+    history.append(_concluded_from_idea(1, idea))
+
+    with pytest.raises(OfflineBacklogExhausted, match="budget is exhausted"):
+        agent.propose(history)
+
+
 def test_offline_proposal_uses_current_best_accepted_parent():
     history = [
         _record(0, 0.60, Decision.ACCEPT),
