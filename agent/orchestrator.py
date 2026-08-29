@@ -410,7 +410,7 @@ class Orchestrator:
         self._close_idea(abandoned=False)
 
     def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
-        """Build the iteration's ResourceUsage, including LLM tokens.
+        """Build the iteration's ResourceUsage, including LLM tokens and CPU time.
 
         ResourceUsage has carried tokens_in/tokens_out since the schema was
         written and nothing ever populated them, so every RunRecord reported
@@ -419,15 +419,23 @@ class Orchestrator:
         in. `usage=None` (FakeCodingAgent, and any agent that doesn't track)
         yields exactly the wall_s-only ResourceUsage as before.
 
+        cpu_hours sums SeedMetrics.cpu_s -- real measured CPU time from
+        executor.py's getrusage deltas, not derived from wall_s -- across
+        every seed. gpu_s stays 0.0: this system trains on numpy over CPU
+        only, by design, and cpu_hours is what actually reports the compute
+        a Feasibility scorer would otherwise find only a bare zero for.
+
         Called from the failed path as well as the successful one: a failed
-        attempt still costs tokens, and it is often the most expensive kind,
-        since it is the one that burned repair cycles.
+        attempt still costs tokens and CPU time, and is often the most
+        expensive kind of either, since it is the one that burned repairs.
         """
         wall_s = sum(s.wall_s for s in seeds)
+        cpu_hours = sum(s.cpu_s for s in seeds) / 3600.0
         if diff.usage is None:
-            return ResourceUsage(wall_s=wall_s)
+            return ResourceUsage(wall_s=wall_s, cpu_hours=cpu_hours)
         return ResourceUsage(
             wall_s=wall_s,
+            cpu_hours=cpu_hours,
             tokens_in=diff.usage.tokens_in,
             tokens_out=diff.usage.tokens_out,
         )
