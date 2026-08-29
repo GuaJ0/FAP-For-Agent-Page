@@ -356,3 +356,228 @@ def test_evaluator_usage_is_folded_into_resources_on_top_of_codings(tmp_path):
     record = orc.run_log.read_all()[-1]
     assert record.resources.tokens_in == 500
     assert record.resources.tokens_out == 120
+
+
+# ---------------------------------------------------------------------------
+# logs/summary.json: a cost/progress account that survives a hard kill.
+#
+# "Summarise when the run finishes" cannot satisfy this -- nothing after a
+# SIGKILL executes. The file has to be correct on disk BEFORE any kill, so it
+# is rewritten after every appended RunRecord. These tests check it exists and
+# is valid after each step (not just at the end), and that wall_s is derived
+# from persisted timestamps so it stays correct across a resume.
+# ---------------------------------------------------------------------------
+
+def _summary(cfg):
+    import json
+    return json.loads((cfg.paths.logs_dir / "summary.json").read_text())
+
+
+def test_summary_is_written_and_valid_after_every_step(tmp_path):
+    cfg = make_test_config(tmp_path)
+    outcomes = [{"mode": "normal", "sleep_s": 0.0, "mean": 0.6, "std": 0.0}] * 3
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=("a", "b", "c"))
+
+    for expected in (1, 2, 3):
+        orc._step(orc.run_log.read_all())
+        # Readable mid-run, after every single step -- not only at the end.
+        assert _summary(cfg)["iterations_concluded"] == expected
+
+
+def test_summary_reports_best_iteration_and_score(tmp_path):
+    cfg = make_test_config(tmp_path)
+    means = [0.50, 0.65, 0.55]
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": m} for m in means]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=("a", "b", "c"))
+
+    for _ in range(3):
+        orc._step(orc.run_log.read_all())
+
+    summary = _summary(cfg)
+    assert summary["best_iteration"] == 2                      # 0.65, not the latest
+    assert summary["best_val_primary"] == pytest.approx(0.65, abs=1e-6)
+
+
+def test_summary_best_is_null_before_anything_is_accepted(tmp_path):
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "crash", "sleep_s": 0.0}])
+
+    orc._step(orc.run_log.read_all())
+
+    summary = _summary(cfg)
+    assert summary["best_iteration"] is None
+    assert summary["best_val_primary"] is None
+    assert summary["iterations_concluded"] == 0                # a FAILED retry isn't concluded
+
+
+def test_summary_is_written_even_when_the_iteration_failed(tmp_path):
+    """A failed attempt still costs tokens and time; the account must include
+    it, or cost-to-convergence is understated."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "crash", "sleep_s": 0.0}])
+
+    orc._step(orc.run_log.read_all())
+
+    assert (cfg.paths.logs_dir / "summary.json").exists()
+
+
+def test_summary_wall_s_spans_the_crash_boundary(tmp_path):
+    """The point of deriving wall_s from persisted timestamps rather than
+    time.time(): an in-process timer restarts at ~0 on resume and would report
+    only the second process's uptime.
+
+    Simulates a crash the same way
+    test_resume_after_simulated_crash_preserves_fix_attempts_and_idea does --
+    a brand-new Orchestrator over the same on-disk paths.
+    """
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    cfg = make_test_config(tmp_path)
+    orc1 = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}])
+    orc1._step(orc1.run_log.read_all())
+
+    # Backdate the first record by an hour: a resumed process cannot know that
+    # elapsed time from its own clock, only from the persisted timestamp.
+    path = cfg.paths.runs_jsonl
+    lines = path.read_text().strip().splitlines()
+    first = json.loads(lines[0])
+    started = datetime.now(timezone.utc) - timedelta(hours=1)
+    first["timestamp"] = started.isoformat()
+    path.write_text("\n".join([json.dumps(first)] + lines[1:]) + "\n")
+
+    # Fresh Orchestrator over the same files, as a restarted process would be.
+    orc2 = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}])
+    orc2._step(orc2.run_log.read_all())
+
+    summary = _summary(cfg)
+    assert summary["iterations_concluded"] == 2
+    assert summary["wall_s"] >= 3600, (
+        f"wall_s={summary['wall_s']} -- it measured only the new process's uptime "
+        "instead of the span since the first persisted record"
+    )
+
+
+def test_summary_wall_s_matches_the_convergence_budget_calculation(tmp_path):
+    """summary.json's elapsed time and the rule that actually stops the run
+    must be the same number, or the reported budget is fiction."""
+    from agent.convergence import _parse_ts
+
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}] * 2,
+                            hypotheses=("a", "b"))
+    for _ in range(2):
+        orc._step(orc.run_log.read_all())
+
+    history = orc.run_log.read_all()
+    expected = (_parse_ts(history[-1].timestamp) - _parse_ts(history[0].timestamp)).total_seconds()
+
+    assert _summary(cfg)["wall_s"] == pytest.approx(expected)
+
+
+def test_agents_without_a_usage_log_report_null_not_zero(tmp_path):
+    """FakeCodingAgent/FakeResearchAgent/FakeEvaluatorAgent track no usage.
+    null says "not measured"; 0 would claim "measured, and it was free"."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}])
+
+    orc._step(orc.run_log.read_all())
+
+    usage = _summary(cfg)["usage"]
+    assert set(usage) == {"coding", "research", "evaluator"}
+    assert all(v is None for v in usage.values())
+
+
+def test_an_agent_whose_usage_is_not_a_log_does_not_break_the_run(tmp_path):
+    """`usage` is a plausible attribute name for other things. Duck-testing on
+    the attribute alone would raise here and kill a live run from a purely
+    observational write."""
+    from agent.agents import AgentUsage, Diff
+
+    class _OddCodingAgent:
+        def __init__(self, inner):
+            self.inner = inner
+            self.usage = AgentUsage(tokens_in=5, tokens_out=7)   # not a UsageLog
+
+        def implement(self, idea, feedback):
+            d = self.inner.implement(idea, feedback)
+            return Diff(config_path=d.config_path, solution_dir=d.solution_dir)
+
+    cfg = make_test_config(tmp_path)
+    inner = FakeCodingAgent(tmp_path / "sols", [{"mode": "normal", "sleep_s": 0.0}])
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], coding=_OddCodingAgent(inner))
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.SUCCESS   # the run survived
+    assert _summary(cfg)["usage"]["coding"] is None
+
+
+def test_a_usage_log_reports_its_totals(tmp_path):
+    """Positive control for the two tests above: when an agent does have a real
+    usage log, the summary carries its numbers rather than null."""
+    from agent.agents import Diff
+    from agent.coding.llm import LLMResponse, UsageLog
+
+    class _TrackedCodingAgent:
+        def __init__(self, inner, path):
+            self.inner = inner
+            self.usage = UsageLog(path)
+            self.usage.record(LLMResponse("x", "gpt-5", 1200, 800, 0.0095),
+                              purpose="generate", idea="i", attempt=0)
+
+        def implement(self, idea, feedback):
+            d = self.inner.implement(idea, feedback)
+            return Diff(config_path=d.config_path, solution_dir=d.solution_dir)
+
+    cfg = make_test_config(tmp_path)
+    inner = FakeCodingAgent(tmp_path / "sols", [{"mode": "normal", "sleep_s": 0.0}])
+    coding = _TrackedCodingAgent(inner, tmp_path / "coding_usage.jsonl")
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], coding=coding)
+
+    orc._step(orc.run_log.read_all())
+
+    coding_usage = _summary(cfg)["usage"]["coding"]
+    assert coding_usage["tokens_in"] == 1200
+    assert coding_usage["tokens_out"] == 800
+    assert coding_usage["cost_usd"] == pytest.approx(0.0095)
+
+
+def test_summary_is_written_after_bootstrap_before_any_research_iteration(tmp_path):
+    """A kill during the first research iteration should still find a correct
+    account of iteration 0 -- which ran real seeds and took real time."""
+    import json
+    import shutil
+    from pathlib import Path
+
+    from agent.agents import Diff, Idea
+
+    fixture = Path(__file__).resolve().parent.parent / "fixtures" / "fake_train.py"
+    sol = tmp_path / "baseline"
+    sol.mkdir()
+    shutil.copy(fixture, sol / "train.py")
+    cfg_file = sol / "config.json"
+    cfg_file.write_text(json.dumps({"mode": "normal", "sleep_s": 0.0, "mean": 0.6015, "std": 0.0}))
+
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[])
+
+    orc.bootstrap_baseline(Idea("baseline", None),
+                           Diff(config_path=str(cfg_file), solution_dir=str(sol)))
+
+    summary = _summary(cfg)
+    assert summary["iterations_concluded"] == 1
+    assert summary["best_iteration"] == 0
+    assert summary["best_val_primary"] == pytest.approx(0.6015, abs=1e-3)
+
+
+def test_summary_write_is_atomic_leaving_no_tmp_file(tmp_path):
+    """temp + os.replace, as registry.py and state.py already do: a crash
+    mid-write must never leave a partial or corrupt summary.json."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}])
+
+    orc._step(orc.run_log.read_all())
+
+    assert (cfg.paths.logs_dir / "summary.json").exists()
+    assert not list(cfg.paths.logs_dir.glob("summary*.tmp"))
