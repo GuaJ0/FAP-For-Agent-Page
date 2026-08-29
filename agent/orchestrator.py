@@ -89,10 +89,25 @@ class Orchestrator:
     def resume_after_human(self) -> None:
         """Clear a tier-2 halt so run() can continue. Does not reset the
         abandonment streak -- that's a judgment call for whoever's driving,
-        made by calling this at all."""
+        made by calling this at all.
+
+        Marks manual_intervention_pending so the next RunRecord produced is
+        stamped manual_intervention=True -- see _consume_manual_intervention_flag.
+        AUDIT-3(a): before this, resuming from a tier-2 halt left no trace in
+        runs.jsonl at all; the graded run's "manual intervention count" had no
+        way to ever be non-zero from an auto-detected halt/resume.
+        """
         self.state.halted = False
         self.state.halt_reason = None
+        self.state.manual_intervention_pending = True
         self._save_state()
+
+    def _consume_manual_intervention_flag(self) -> bool:
+        """One-shot read-and-clear: True exactly for the first RunRecord built
+        after a resume_after_human() call, False for every one after that."""
+        pending = self.state.manual_intervention_pending
+        self.state.manual_intervention_pending = False
+        return pending
 
     def run(self) -> list[RunRecord]:
         while True:
@@ -269,6 +284,11 @@ class Orchestrator:
             # The baseline is a pre-existing solution, not something an agent
             # wrote, so it has no LLM usage to attribute.
             resources=self._resources(diff, seeds),
+            # In the normal call order this is always False -- bootstrapping
+            # happens before run() ever starts, so nothing could have set the
+            # flag yet. Wired anyway so the invariant ("next record after a
+            # resume gets the flag") holds regardless of call order.
+            manual_intervention=self._consume_manual_intervention_flag(),
         )
 
     def _step(self, history: list[RunRecord]) -> None:
@@ -341,6 +361,7 @@ class Orchestrator:
                 agent_action="orchestrator",
             )] + self._usage_event(diff),
             resources=self._resources(diff, seeds),
+            manual_intervention=self._consume_manual_intervention_flag(),
         )
         self.run_log.append(record)
 
@@ -377,6 +398,7 @@ class Orchestrator:
             events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")]
                    + self._usage_event(diff),
             resources=self._resources(diff, seeds),
+            manual_intervention=self._consume_manual_intervention_flag(),
         )
         decision = self.evaluator.judge(record, history)
         record.decision = decision
@@ -388,7 +410,7 @@ class Orchestrator:
         self._close_idea(abandoned=False)
 
     def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
-        """Build the iteration's ResourceUsage, including LLM tokens.
+        """Build the iteration's ResourceUsage, including LLM tokens and CPU time.
 
         ResourceUsage has carried tokens_in/tokens_out since the schema was
         written and nothing ever populated them, so every RunRecord reported
@@ -397,15 +419,23 @@ class Orchestrator:
         in. `usage=None` (FakeCodingAgent, and any agent that doesn't track)
         yields exactly the wall_s-only ResourceUsage as before.
 
+        cpu_hours sums SeedMetrics.cpu_s -- real measured CPU time from
+        executor.py's getrusage deltas, not derived from wall_s -- across
+        every seed. gpu_s stays 0.0: this system trains on numpy over CPU
+        only, by design, and cpu_hours is what actually reports the compute
+        a Feasibility scorer would otherwise find only a bare zero for.
+
         Called from the failed path as well as the successful one: a failed
-        attempt still costs tokens, and it is often the most expensive kind,
-        since it is the one that burned repair cycles.
+        attempt still costs tokens and CPU time, and is often the most
+        expensive kind of either, since it is the one that burned repairs.
         """
         wall_s = sum(s.wall_s for s in seeds)
+        cpu_hours = sum(s.cpu_s for s in seeds) / 3600.0
         if diff.usage is None:
-            return ResourceUsage(wall_s=wall_s)
+            return ResourceUsage(wall_s=wall_s, cpu_hours=cpu_hours)
         return ResourceUsage(
             wall_s=wall_s,
+            cpu_hours=cpu_hours,
             tokens_in=diff.usage.tokens_in,
             tokens_out=diff.usage.tokens_out,
         )

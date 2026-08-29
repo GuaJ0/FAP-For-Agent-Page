@@ -28,6 +28,11 @@ class OrchestratorState:
     halt_reason: Optional[str] = None
     run_start_time: Optional[float] = None       # epoch seconds; set once, for adaptive-seeding projections
     seed_costs: list = field(default_factory=list)  # observed wall_s per completed seed run
+    # One-shot: set True by resume_after_human(), consumed (reset to False) by
+    # the next RunRecord produced, which is stamped manual_intervention=True.
+    # Marks exactly the iteration that only happened because a human cleared
+    # a tier-2 halt -- not every iteration for the rest of the run.
+    manual_intervention_pending: bool = False
 
     def get_current_idea(self) -> Optional[Idea]:
         return Idea(**self.current_idea) if self.current_idea else None

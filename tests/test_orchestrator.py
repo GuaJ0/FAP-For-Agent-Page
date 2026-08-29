@@ -165,3 +165,90 @@ def test_adaptive_seeding_drops_to_min_seeds_when_budget_projected_to_blow(tmp_p
     orc.state.run_start_time = time.time() - 8.0  # 2s of the 10s budget left
     orc.state.seed_costs = [5.0, 5.0]
     assert orc._adaptive_n_seeds() == 1
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-2: the registry pointer must actually track validation-best, not just
+# "the last accepted iteration" -- these two coincide in every other test in
+# this file, since none of them run more than one accepted iteration. std=0
+# in fake_train.py's config makes `primary` land on `mean` exactly (no
+# seed-to-seed noise to account for), so each iteration's score is pinned by
+# construction rather than approximately achieved.
+# ---------------------------------------------------------------------------
+
+def test_registry_advances_to_each_new_best_across_accepted_iterations(tmp_path):
+    cfg = make_test_config(tmp_path)
+    means = [0.50, 0.55, 0.60, 0.65]
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": m} for m in means]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=tuple(f"idea {i}" for i in range(4)))
+
+    observed = []
+    for _ in range(4):
+        orc._step(orc.run_log.read_all())
+        best = orc.registry.best()
+        observed.append((best.iteration, best.val_primary))
+
+    history = orc.run_log.read_all()
+    assert [r.decision for r in history] == [Decision.ACCEPT] * 4, \
+        "test is only meaningful if every iteration was actually accepted"
+
+    # The pointer must advance on every single step, landing on that step's
+    # own iteration -- not lag behind, and not jump straight to the final one.
+    assert observed == [(1, 0.50), (2, 0.55), (3, 0.60), (4, 0.65)], observed
+
+
+def test_registry_stays_pinned_to_the_earlier_best_after_a_regression(tmp_path):
+    cfg = make_test_config(tmp_path)
+    means = [0.50, 0.60, 0.55]  # improve, improve, then regress below 0.60
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": m} for m in means]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=tuple(f"idea {i}" for i in range(3)))
+
+    observed = []
+    for _ in range(3):
+        orc._step(orc.run_log.read_all())
+        best = orc.registry.best()
+        observed.append((best.iteration, best.val_primary))
+
+    history = orc.run_log.read_all()
+    assert [r.decision for r in history] == [Decision.ACCEPT, Decision.ACCEPT, Decision.REVERT], \
+        "test is only meaningful if the third iteration was actually reverted, not accepted"
+
+    # Iteration 3 (0.55) must NOT move the pointer: it stays on iteration 2
+    # (0.60) through all three steps, even though a third, worse-scoring
+    # iteration exists in the run log right alongside it.
+    assert observed == [(1, 0.50), (2, 0.60), (2, 0.60)], observed
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-3(a): a tier-2 halt/resume must leave a trace in runs.jsonl. Before
+# this, resume_after_human() cleared the halt silently -- nothing distinguished
+# "this iteration ran because a human intervened" from any other iteration.
+# ---------------------------------------------------------------------------
+
+def test_manual_intervention_flag_is_set_on_the_record_right_after_a_resume(tmp_path):
+    cfg = make_test_config(tmp_path)
+    # 6 crashes = 2 ideas x 3 attempts each -> tier-2 halts after the 2nd
+    # abandonment. Then 2 more normal outcomes for the post-resume ideas.
+    outcomes = (
+        [{"mode": "crash", "sleep_s": 0.0}] * 6
+        + [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.55}] * 2
+    )
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=("A", "B", "C", "D"))
+
+    for _ in range(6):
+        orc._step(orc.run_log.read_all())
+    assert orc.state.halted is True, "test setup didn't actually reach tier-2"
+
+    orc.resume_after_human()
+    assert orc.state.manual_intervention_pending is True
+
+    orc._step(orc.run_log.read_all())   # the record produced right after resume
+    orc._step(orc.run_log.read_all())   # the one after that
+
+    history = orc.run_log.read_all()
+    assert history[-2].manual_intervention is True, \
+        "the first record after resume_after_human() must be flagged"
+    assert history[-1].manual_intervention is False, \
+        "the flag must be one-shot -- the record after that must NOT be flagged"
+    # And nothing before the halt was retroactively flagged.
+    assert all(r.manual_intervention is False for r in history[:6])

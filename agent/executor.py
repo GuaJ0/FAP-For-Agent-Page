@@ -26,6 +26,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import resource  # POSIX only -- unavailable on Windows
+except ImportError:  # pragma: no cover - not exercised on this project's dev/CI platforms
+    resource = None
+
 from agent.config import Config, DEFAULT_CONFIG, FORBIDDEN_PAYLOAD_KEYS, TEST_METRICS_SENTINEL
 from agent.records import AggregateMetrics, FailureKind, SeedMetrics
 from agent.verification import verify_result
@@ -76,6 +81,18 @@ def _tail(text: str, n: int) -> str:
     return "\n".join(text.splitlines()[-n:])
 
 
+def _children_cpu_s() -> float:
+    """Cumulative user+sys CPU time of all terminated child processes so
+    far, this process's whole lifetime. Not scoped to one subprocess by
+    itself -- callers take a before/after delta around a single
+    subprocess.run() to isolate that one run's CPU time. 0.0 if the
+    `resource` module isn't available (non-POSIX platforms)."""
+    if resource is None:
+        return 0.0
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
+
+
 @dataclass
 class Executor:
     cfg: Config = DEFAULT_CONFIG
@@ -113,6 +130,7 @@ class Executor:
         out_path = out_dir / "result.json"
 
         t0 = time.time()
+        cpu0 = _children_cpu_s()
         try:
             proc = subprocess.run(
                 cmd + ["--out", str(out_path)],
@@ -120,14 +138,18 @@ class Executor:
             )
         except subprocess.TimeoutExpired as e:
             wall_s = time.time() - t0
+            # subprocess.run() kills and reaps the child before raising, so
+            # its CPU time up to the kill is already reflected here.
+            cpu_s = max(0.0, _children_cpu_s() - cpu0)
             self._quarantine_if_present(e.stdout or "", iteration, seed)
             return SeedMetrics(
                 seed=seed, primary=None, gauc=None, ndcg5=None, epochs_run=None,
-                wall_s=wall_s, failure_kind=FailureKind.TIMEOUT,
+                wall_s=wall_s, cpu_s=cpu_s, failure_kind=FailureKind.TIMEOUT,
                 traceback_tail=f"timed out after {timeout_s}s",
             )
 
         wall_s = time.time() - t0
+        cpu_s = max(0.0, _children_cpu_s() - cpu0)
         self._quarantine_if_present(proc.stdout, iteration, seed)
 
         if proc.returncode != 0:
@@ -138,7 +160,7 @@ class Executor:
             tail = _tail(_strip_test_metrics_lines(proc.stderr), self.cfg.executor.traceback_tail_lines)
             return SeedMetrics(
                 seed=seed, primary=None, gauc=None, ndcg5=None, epochs_run=None,
-                wall_s=wall_s, failure_kind=kind, traceback_tail=tail,
+                wall_s=wall_s, cpu_s=cpu_s, failure_kind=kind, traceback_tail=tail,
             )
 
         metrics = self._parse_result(out_path)
@@ -146,7 +168,7 @@ class Executor:
             tail = _tail(_strip_test_metrics_lines(proc.stdout), self.cfg.executor.traceback_tail_lines)
             return SeedMetrics(
                 seed=seed, primary=None, gauc=None, ndcg5=None, epochs_run=None,
-                wall_s=wall_s, failure_kind=FailureKind.BAD_OUTPUT,
+                wall_s=wall_s, cpu_s=cpu_s, failure_kind=FailureKind.BAD_OUTPUT,
                 traceback_tail=tail or "result.json missing, malformed, or missing required keys",
             )
 
@@ -168,7 +190,7 @@ class Executor:
             if outcome.failed:
                 return SeedMetrics(
                     seed=seed, primary=None, gauc=None, ndcg5=None, epochs_run=None,
-                    wall_s=wall_s, failure_kind=FailureKind.METRIC_MISMATCH,
+                    wall_s=wall_s, cpu_s=cpu_s, failure_kind=FailureKind.METRIC_MISMATCH,
                     traceback_tail=outcome.detail,
                 )
         # -----------------------------------------------------------------
@@ -176,7 +198,7 @@ class Executor:
         result = SeedMetrics(
             seed=seed, primary=metrics["primary"], gauc=metrics["gauc"],
             ndcg5=metrics["ndcg5"], epochs_run=metrics["epochs_run"], wall_s=wall_s,
-            artifact_dir=str(out_dir),
+            cpu_s=cpu_s, artifact_dir=str(out_dir),
         )
         assert_no_forbidden_keys(result.to_json())
         return result
