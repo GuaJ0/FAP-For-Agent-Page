@@ -140,10 +140,11 @@ did. Worth knowing when reading `runs.jsonl`.
 
 Two consequences worth knowing:
 
-- The baseline **counts toward `max_iterations`**, since
-  `convergence.should_stop` counts every non-FAILED record. `run_loop.py`
-  therefore treats `--max-iterations` as a count of *research* iterations and
-  adds one slot for the baseline.
+- The baseline does **not** consume a `max_iterations` slot.
+  `convergence.should_stop` excludes `BOOTSTRAP_ITERATION` from that count, so
+  `max_iterations=50` gets you 50 real research attempts and callers need no
+  arithmetic. (Briefly after bootstrapping first landed, the baseline *did*
+  count and `run_loop.py` compensated with a `+1`; both are gone.)
 - If nothing ever beats the baseline, `registry.best()` **is** the baseline —
   and because bootstrapping runs it for real rather than trusting a recorded
   score, a complete artifact (`result.json`, `checkpoint.npz`,
@@ -153,6 +154,27 @@ Two consequences worth knowing:
 `bootstrap_baseline()` is idempotent and crash-resume safe, keyed off the run
 log on disk. It is the second change outside the Coding agent's lane (after
 `executor.py`) and is isolated in its own commit for review.
+
+### How the baseline interacts with each stopping rule
+
+`should_stop()` has three checks, the baseline record is visible to all three,
+and each wants something different from it. The asymmetry is deliberate —
+"making it consistent" in either direction is a plausible and wrong edit, so
+it is pinned by tests in `tests/test_convergence.py`.
+
+| check | baseline counted? | why |
+|---|---|---|
+| `max_iterations` | **no** | counts *research attempts*; the baseline is the incumbent they're measured against, not an attempt |
+| stalled-progress window | **yes** | counts *scored results*; the baseline is the score everything must beat, so it's the window's first data point |
+| `max_wall_s` | **yes** | records are timestamped at *completion*, so the iteration-0 record marks when research **began** — its own runtime is already outside the window |
+
+That last one is the easy one to get backwards. Excluding the baseline would
+restart the clock at iteration 1's *completion* and silently drop iteration 1's
+duration from the 6h budget — less accurate and more permissive than counting
+it. `BOOTSTRAP_ITERATION` lives in `agent/config.py` (not `orchestrator.py`)
+because `convergence.py` needs it too and `orchestrator.py` already imports
+`should_stop` from `convergence.py`; `config.py` is imported by both and
+imports neither.
 
 ## 4. What metric verification does *not* catch
 

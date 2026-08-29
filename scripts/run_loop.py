@@ -74,14 +74,11 @@ def load_dotenv(path: Path) -> None:
 
 def build_config(root: Path, args) -> Config:
     logs = root / "logs"
-    # --max-iterations counts *research* iterations. The baseline is a real
-    # concluded iteration and convergence.should_stop counts every non-FAILED
-    # record, so bootstrapping needs one extra slot -- otherwise
-    # --max-iterations 1 would be entirely consumed by the baseline and no
-    # hypothesis would ever run.
-    max_iterations = args.max_iterations + (0 if args.skip_baseline else 1)
+    # No baseline compensation here: convergence.should_stop() excludes the
+    # bootstrap iteration from its max_iterations count, so this is passed
+    # straight through and means exactly what it says. It used to need a +1.
     return Config(
-        convergence=ConvergenceConfig(max_iterations=max_iterations, max_wall_s=args.max_wall_s),
+        convergence=ConvergenceConfig(max_iterations=args.max_iterations, max_wall_s=args.max_wall_s),
         retry=RetryConfig(),
         executor=ExecutorConfig(per_run_timeout_s=args.timeout_s),
         seeding=SeedingConfig(max_seeds=args.seeds, min_seeds=1),
@@ -109,7 +106,8 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--loss", default="bpr")
     ap.add_argument("--max-iterations", type=int, default=1,
-                    help="number of research iterations (the baseline gets its own slot)")
+                    help="number of research iterations. The bootstrap baseline is not "
+                         "one of them and does not consume a slot.")
     ap.add_argument("--skip-baseline", action="store_true",
                     help="do not run solution/ as iteration 0. The registry then starts "
                          "empty, so the first result becomes the incumbent whatever it scores.")
