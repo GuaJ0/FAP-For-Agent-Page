@@ -112,6 +112,29 @@ def build_config(root: Path, args) -> Config:
 
 
 def main() -> int:
+    """Entry point. Restores os.environ on the way out.
+
+    _main() exports KUAIRAND_PATH so the executor's training subprocesses
+    inherit it, and load_dotenv() injects .env values. Both are process-global.
+    Those subprocesses are spawned *inside* _main(), so they still see
+    everything they need -- the restore happens only after it returns.
+
+    For the CLI that is a no-op: the process exits immediately afterwards. It
+    matters for a caller that runs main() in-process, which the tests do:
+    without this, one run's data dir stays exported and later, unrelated work
+    resolves KUAIRAND_PATH to a directory that run had created and finished
+    with. The failure surfaces far from its cause, looking like a broken
+    solution rather than a leaked global.
+    """
+    saved_env = dict(os.environ)
+    try:
+        return _main()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hypothesis", default=DEFAULT_HYPOTHESIS)
     ap.add_argument("--offline", action="store_true",
