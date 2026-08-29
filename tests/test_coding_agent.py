@@ -512,6 +512,116 @@ def test_smoke_run_catches_a_crash(tmp_path):
     assert "boom" in manifest["cycles"][-1]["detail"]
 
 
+def test_a_crash_after_printing_test_metrics_does_not_leak_them(tmp_path):
+    """The leak this guards: a candidate that prints its TEST_METRICS line and
+    then exits non-zero WITHOUT raising.
+
+    sys.exit(1) leaves stderr empty, so the crash path's
+    `proc.stderr or proc.stdout` falls through to stdout -- whose last lines
+    still carry the hidden-test metrics. That text becomes
+    AttemptOutcome.detail, which is fed into a repair prompt and sent to a
+    real, billable LLM call.
+
+    test_smoke_run_catches_a_crash does NOT cover this: it raises at the top of
+    main(), before any TEST_METRICS print, and a raised exception fills stderr
+    with a traceback, so the stdout fallback is never reached.
+    """
+    # Crash after main() has run, so the TEST_METRICS line is already on
+    # stdout. sys.exit(1) with an int writes nothing to stderr.
+    crashing = LIAR.replace(
+        'if __name__ == "__main__":\n    sys.exit(main())',
+        'if __name__ == "__main__":\n    main()\n    sys.exit(1)',
+    )
+    assert crashing != LIAR, "the fixture's entrypoint changed; this mutation no longer applies"
+
+    secret = 0.987654          # a value that appears ONLY on the TEST_METRICS line
+    client = ScriptedClient([_fenced(crashing), _fenced(LIAR)])
+    agent = LLMCodingAgent(
+        work_dir=tmp_path / "s", data_dir=str(tmp_path), llm=client,
+        usage_log_path=tmp_path / "u.jsonl", run_smoke_test=True, smoke_timeout_s=120.0,
+        base_config={"mode": "inflate",
+                     "claimed": {"primary": secret, "gauc": secret, "ndcg5": secret}},
+        max_repair_attempts=1,
+    )
+
+    diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
+
+    manifest = json.loads((Path(diff.solution_dir) / "attempt.json").read_text())
+    detail = manifest["cycles"][0]["detail"]
+
+    # It still diagnoses the crash...
+    assert manifest["cycles"][0]["stage"] == "smoke"
+    # ...without carrying the hidden-test metrics.
+    assert "TEST_METRICS" not in detail
+    assert str(secret) not in detail
+
+    # The real exposure: the repair prompt that would go to a billable call.
+    assert len(client.calls) == 2, "no repair prompt was generated -- test is vacuous"
+    _, repair_user, purpose = client.calls[1]
+    assert purpose == "repair"
+
+    # No test-split VALUE anywhere in the prompt. Checking the value rather
+    # than the sentinel is the meaningful assertion for the prompt as a whole:
+    # the prompt legitimately embeds the candidate's own source, which defines
+    # TEST_METRICS_SENTINEL as a string literal. That is the model's own code
+    # coming back to it, not a leak.
+    assert str(secret) not in repair_user
+
+    # And the failure-diagnosis section specifically -- the part built from
+    # subprocess output -- carries no sentinel at all.
+    how_it_failed = repair_user.split("## How it failed", 1)[1].split("## Your task", 1)[0]
+    assert "TEST_METRICS" not in how_it_failed
+    assert str(secret) not in how_it_failed
+
+
+def test_positive_control_that_scenario_really_does_print_test_metrics(tmp_path):
+    """Proves the test above isn't passing because nothing was ever printed:
+    run the same candidate directly and confirm it puts TEST_METRICS on stdout,
+    exits non-zero, and leaves stderr empty -- the exact conditions that make
+    the stdout fallback fire."""
+    import shutil
+    import subprocess
+    import sys as _sys
+
+    crashing = LIAR.replace(
+        'if __name__ == "__main__":\n    sys.exit(main())',
+        'if __name__ == "__main__":\n    main()\n    sys.exit(1)',
+    )
+    sol = tmp_path / "sol"
+    sol.mkdir()
+    (sol / "train.py").write_text(crashing)
+    shutil.copy(REPO_ROOT / "harness" / "evaluate.py", sol / "evaluate.py")
+    cfg = sol / "c.json"
+    cfg.write_text(json.dumps({"mode": "inflate",
+                               "claimed": {"primary": 0.987654, "gauc": 0.9, "ndcg5": 0.9}}))
+
+    proc = subprocess.run(
+        [_sys.executable, str(sol / "train.py"), "--config", str(cfg),
+         "--seed", "0", "--out", str(sol / "out" / "result.json")],
+        cwd=sol, capture_output=True, text=True,
+    )
+
+    assert proc.returncode != 0
+    assert proc.stderr == "", f"stderr should be empty, got: {proc.stderr[:200]}"
+    assert "TEST_METRICS:" in proc.stdout
+    assert "0.987654" in proc.stdout
+    # So `proc.stderr or proc.stdout` genuinely falls through to stdout here.
+    assert (proc.stderr or proc.stdout) is proc.stdout
+
+
+def test_scrub_helper_removes_only_the_sentinel_line():
+    from agent.coding.agent import _scrub_test_metrics
+
+    text = "epoch 1 | loss 0.5\nTEST_METRICS: {\"primary\": 0.98}\nTraceback: boom"
+
+    scrubbed = _scrub_test_metrics(text)
+
+    assert "TEST_METRICS" not in scrubbed
+    assert "0.98" not in scrubbed
+    assert "epoch 1 | loss 0.5" in scrubbed
+    assert "Traceback: boom" in scrubbed
+
+
 def test_smoke_run_catches_a_missing_test_metrics_line(tmp_path):
     # Still mentions TEST_METRICS (so it clears the static check) but sends it
     # to stderr, where the executor's stdout scan will never find it.
