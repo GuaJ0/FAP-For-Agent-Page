@@ -17,6 +17,8 @@ simply has no iteration 0 and behaves exactly as it always did.
 """
 from __future__ import annotations
 
+import json
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -26,7 +28,11 @@ from typing import Optional
 
 from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent
 from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
-from agent.convergence import should_stop
+# _parse_ts is imported rather than re-implemented on purpose: summary.json's
+# wall_s and convergence.should_stop's wall-clock budget must be the SAME
+# number. A local copy could drift and quietly report a different elapsed
+# time than the rule that actually stops the run.
+from agent.convergence import _parse_ts, should_stop
 from agent.executor import Executor
 from agent.records import (
     Decision,
@@ -263,6 +269,10 @@ class Orchestrator:
         self.run_log.append(record)
         self._register_checkpoint(BOOTSTRAP_ITERATION, diff, seeds, agg)
         self._save_state()
+        # Iteration 0 is a concluded iteration like any other, and bootstrapping
+        # runs real seeds -- a kill during the first research iteration should
+        # still find a correct summary on disk.
+        self._write_summary()
         return record
 
     def _baseline_record(self, idea: Idea, diff: Diff, seeds, agg, detail: str) -> RunRecord:
@@ -326,6 +336,7 @@ class Orchestrator:
 
         self.state.iteration = iteration
         self._save_state()
+        self._write_summary()
 
     def _handle_failed_run(
         self,
@@ -562,6 +573,75 @@ class Orchestrator:
         if projected_full > max(remaining, 0.0):
             return seeding.min_seeds
         return seeding.max_seeds
+
+    def _write_summary(self) -> None:
+        """Refresh logs/summary.json: cost, progress and elapsed time so far.
+
+        Written after every record is appended rather than at the end of the
+        run, because there is no "end of run" to hook when a process is
+        SIGKILLed -- nothing after the kill point executes. Writing eagerly
+        means the file is already correct on disk *before* any kill could
+        happen, so it is never more than one iteration stale, and a run that is
+        hard-killed still has an accurate account of exactly where it was.
+
+        wall_s comes from the persisted RunRecord timestamps, never from
+        time.time(): an in-process timer only measures the current process's
+        uptime and silently resets to near-zero on a crash-resume. This mirrors
+        convergence.should_stop, and deliberately shares its _parse_ts so the
+        two can never disagree.
+
+        Cheap by construction -- it only re-reads what has already been
+        computed and persisted (the run log, the registry, each agent's own
+        usage log). No LLM calls, no recomputation.
+        """
+        try:
+            self._write_summary_unguarded()
+        except Exception as e:  # noqa: BLE001
+            # Never fatal. The RunRecord is already durably appended by the
+            # time this runs, so a summary problem must not take down a
+            # multi-hour autonomous run. Reported, not swallowed silently.
+            print(f"[orchestrator] could not write summary.json: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    def _write_summary_unguarded(self) -> None:
+        history = self.run_log.read_all()
+        if not history:
+            return
+
+        # Not every agent tracks usage: OfflineResearchAgent and
+        # FakeEvaluatorAgent have no .usage at all, so null rather than zeros --
+        # "not measured" and "measured as nothing" are different claims.
+        #
+        # The duck-test is on a callable totals(), not merely on the attribute
+        # existing. `usage` is a plausible attribute name for other things (a
+        # CodingAgent holding an AgentUsage value, for instance), and a summary
+        # writer must not be able to abort a live iteration over one.
+        usage: dict[str, Optional[dict]] = {}
+        for name, agent in (
+            ("coding", self.coding),
+            ("research", self.research),
+            ("evaluator", self.evaluator),
+        ):
+            totals = getattr(getattr(agent, "usage", None), "totals", None)
+            usage[name] = totals() if callable(totals) else None
+
+        best = self.registry.best()
+        payload = {
+            # Same definition convergence.should_stop counts by.
+            "iterations_concluded": sum(1 for r in history if r.status != Status.FAILED),
+            "wall_s": (
+                _parse_ts(history[-1].timestamp) - _parse_ts(history[0].timestamp)
+            ).total_seconds(),
+            "best_iteration": best.iteration if best else None,
+            "best_val_primary": best.val_primary if best else None,
+            "usage": usage,
+        }
+
+        path = self.cfg.paths.logs_dir / "summary.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, path)  # atomic on POSIX: a crash mid-write can't leave a partial file
 
     def _save_state(self) -> None:
         self.state_store.save(self.state)
