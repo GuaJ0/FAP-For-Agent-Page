@@ -86,13 +86,41 @@ class CodingAgent(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What an EvaluatorAgent hands back for one judged iteration.
+
+    Not a bare Decision, on purpose: an Evaluator that reasons about a result
+    (rather than just comparing two floats) has something to say about *why*,
+    and the harness's own audit flagged that this commentary had nowhere to
+    go -- Research could not see it because nothing carried it. `commentary`
+    is written into the RunRecord's events (agent_action="evaluator"), so any
+    ResearchAgent reading `history` on its next propose() call sees it, with
+    no RunRecord schema change needed.
+
+    `usage` follows the same shape as Diff.usage (AgentUsage) for the same
+    reason: an LLM-backed Evaluator spends real tokens judging a result, and
+    that cost belongs in the same per-iteration ResourceUsage the CodingAgent's
+    usage already folds into -- not a second, uncounted channel.
+    """
+    decision: Decision
+    commentary: str = ""
+    usage: Optional[AgentUsage] = None
+
+
 class EvaluatorAgent(Protocol):
-    def judge(self, record: RunRecord, history: list[RunRecord]) -> Decision:
+    def judge(self, record: RunRecord, history: list[RunRecord]) -> Verdict:
         """Decide what to do with a successfully-run iteration: keep it
         (ACCEPT), discard it (REVERT), or give up on this line entirely
         (ABANDON). Only called for iterations that actually produced
         validation metrics -- executor-level failures are handled by the
-        orchestrator's retry policy, not this method."""
+        orchestrator's retry policy, not this method.
+
+        ABANDON here counts toward the same tier-2 consecutive-abandonment
+        streak that tier-1 attempt-cap exhaustion does (Orchestrator ties
+        _close_idea's `abandoned` flag to this decision) -- a hypothesis a
+        real Evaluator judges as a dead end is exactly as costly to the run's
+        escalation budget as one that never got past 3 fix attempts."""
         ...
 
 
@@ -145,14 +173,16 @@ class FakeCodingAgent:
 
 class FakeEvaluatorAgent:
     """Deterministic rule: accept if this iteration beats the best validation
-    primary seen so far by more than a margin, else revert."""
+    primary seen so far by more than a margin, else revert. Never abandons --
+    a bare margin comparison has no basis to judge a whole hypothesis a dead
+    end, so it leaves that call to a real Evaluator (see agent/evaluator/)."""
 
     def __init__(self, margin: float = 0.0):
         self._margin = margin
 
-    def judge(self, record: RunRecord, history: list[RunRecord]) -> Decision:
+    def judge(self, record: RunRecord, history: list[RunRecord]) -> Verdict:
         if record.aggregate is None:
             raise ValueError("judge() called on a record with no aggregate metrics")
         if record.delta_vs_current_best is not None and record.delta_vs_current_best > self._margin:
-            return Decision.ACCEPT
-        return Decision.REVERT
+            return Verdict(Decision.ACCEPT)
+        return Verdict(Decision.REVERT)
