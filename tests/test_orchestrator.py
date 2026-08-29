@@ -165,3 +165,55 @@ def test_adaptive_seeding_drops_to_min_seeds_when_budget_projected_to_blow(tmp_p
     orc.state.run_start_time = time.time() - 8.0  # 2s of the 10s budget left
     orc.state.seed_costs = [5.0, 5.0]
     assert orc._adaptive_n_seeds() == 1
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-2: the registry pointer must actually track validation-best, not just
+# "the last accepted iteration" -- these two coincide in every other test in
+# this file, since none of them run more than one accepted iteration. std=0
+# in fake_train.py's config makes `primary` land on `mean` exactly (no
+# seed-to-seed noise to account for), so each iteration's score is pinned by
+# construction rather than approximately achieved.
+# ---------------------------------------------------------------------------
+
+def test_registry_advances_to_each_new_best_across_accepted_iterations(tmp_path):
+    cfg = make_test_config(tmp_path)
+    means = [0.50, 0.55, 0.60, 0.65]
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": m} for m in means]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=tuple(f"idea {i}" for i in range(4)))
+
+    observed = []
+    for _ in range(4):
+        orc._step(orc.run_log.read_all())
+        best = orc.registry.best()
+        observed.append((best.iteration, best.val_primary))
+
+    history = orc.run_log.read_all()
+    assert [r.decision for r in history] == [Decision.ACCEPT] * 4, \
+        "test is only meaningful if every iteration was actually accepted"
+
+    # The pointer must advance on every single step, landing on that step's
+    # own iteration -- not lag behind, and not jump straight to the final one.
+    assert observed == [(1, 0.50), (2, 0.55), (3, 0.60), (4, 0.65)], observed
+
+
+def test_registry_stays_pinned_to_the_earlier_best_after_a_regression(tmp_path):
+    cfg = make_test_config(tmp_path)
+    means = [0.50, 0.60, 0.55]  # improve, improve, then regress below 0.60
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": m} for m in means]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=tuple(f"idea {i}" for i in range(3)))
+
+    observed = []
+    for _ in range(3):
+        orc._step(orc.run_log.read_all())
+        best = orc.registry.best()
+        observed.append((best.iteration, best.val_primary))
+
+    history = orc.run_log.read_all()
+    assert [r.decision for r in history] == [Decision.ACCEPT, Decision.ACCEPT, Decision.REVERT], \
+        "test is only meaningful if the third iteration was actually reverted, not accepted"
+
+    # Iteration 3 (0.55) must NOT move the pointer: it stays on iteration 2
+    # (0.60) through all three steps, even though a third, worse-scoring
+    # iteration exists in the run log right alongside it.
+    assert observed == [(1, 0.50), (2, 0.60), (2, 0.60)], observed
