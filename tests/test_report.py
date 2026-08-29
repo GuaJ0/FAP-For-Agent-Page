@@ -15,10 +15,10 @@ from agent.records import (
     RunRecord,
     Status,
 )
-from runlog.report import summarize
+from runlog.report import count_manual_interventions, summarize
 
 
-def _record(iteration, primary=None, patch_path=None, status=None):
+def _record(iteration, primary=None, patch_path=None, status=None, manual_intervention=False):
     agg = None
     if primary is not None:
         agg = AggregateMetrics(primary, 0.0, primary, primary, 1)
@@ -29,6 +29,7 @@ def _record(iteration, primary=None, patch_path=None, status=None):
         status=status or (Status.SUCCESS if agg else Status.FAILED),
         seeds=[], aggregate=agg, delta_vs_current_best=None, decision=None,
         events=[], resources=ResourceUsage(wall_s=1.0), patch_path=patch_path,
+        manual_intervention=manual_intervention,
     )
 
 
@@ -97,3 +98,55 @@ def test_the_rest_of_the_summary_is_unchanged(tmp_path):
     assert "  success: 2" in out
     assert "  failed: 1" in out
     assert "best validation primary: 0.6500 (iteration 2: idea 2)" in out
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-3(b): the manual-intervention count is the SUM of auto-detected
+# tier-2 halt/resumes (RunRecord.manual_intervention) and hand-logged entries
+# in logs/interventions.md -- the orchestrator cannot see interventions that
+# happen outside the loop (SSH in, restart, patch a file), so those need a
+# human-maintained record, and the report must count both, not just one.
+# ---------------------------------------------------------------------------
+
+def test_intervention_count_is_zero_with_no_flags_and_no_log_file(tmp_path):
+    out = _summary(tmp_path, [_record(1, primary=0.6)])
+    assert "manual interventions: 0 (0 auto-detected halt/resume, 0 logged in interventions.md)" in out
+
+
+def test_intervention_count_includes_auto_detected_flags(tmp_path):
+    out = _summary(tmp_path, [
+        _record(1, primary=0.6),
+        _record(2, primary=0.6, manual_intervention=True),
+    ])
+    assert "manual interventions: 1 (1 auto-detected halt/resume, 0 logged in interventions.md)" in out
+
+
+def test_intervention_count_includes_hand_logged_entries(tmp_path):
+    (tmp_path / "interventions.md").write_text(
+        "# Manual interventions log\n\n"
+        "## Entries\n\n"
+        "- 2026-01-01T00:00:00Z — restarted the process after an OOM kill\n"
+        "- 2026-01-02T00:00:00Z — patched a stray import in a generated file\n"
+    )
+    out = _summary(tmp_path, [_record(1, primary=0.6)])
+    assert "manual interventions: 2 (0 auto-detected halt/resume, 2 logged in interventions.md)" in out
+
+
+def test_intervention_count_sums_both_sources(tmp_path):
+    (tmp_path / "interventions.md").write_text("## Entries\n\n- 2026-01-01T00:00:00Z — did a thing\n")
+    out = _summary(tmp_path, [
+        _record(1, primary=0.6, manual_intervention=True),
+        _record(2, primary=0.6, manual_intervention=True),
+    ])
+    assert "manual interventions: 3 (2 auto-detected halt/resume, 1 logged in interventions.md)" in out
+
+
+def test_count_manual_interventions_ignores_a_log_file_with_no_entries_section(tmp_path):
+    (tmp_path / "interventions.md").write_text("just some unrelated text, no ## Entries header\n")
+    result = count_manual_interventions([_record(1, primary=0.6)], tmp_path / "interventions.md")
+    assert result == {"auto_detected": 0, "logged": 0, "total": 0}
+
+
+def test_count_manual_interventions_handles_a_missing_log_file(tmp_path):
+    result = count_manual_interventions([_record(1, primary=0.6)], tmp_path / "does_not_exist.md")
+    assert result == {"auto_detected": 0, "logged": 0, "total": 0}

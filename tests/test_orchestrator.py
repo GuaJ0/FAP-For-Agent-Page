@@ -217,3 +217,38 @@ def test_registry_stays_pinned_to_the_earlier_best_after_a_regression(tmp_path):
     # (0.60) through all three steps, even though a third, worse-scoring
     # iteration exists in the run log right alongside it.
     assert observed == [(1, 0.50), (2, 0.60), (2, 0.60)], observed
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-3(a): a tier-2 halt/resume must leave a trace in runs.jsonl. Before
+# this, resume_after_human() cleared the halt silently -- nothing distinguished
+# "this iteration ran because a human intervened" from any other iteration.
+# ---------------------------------------------------------------------------
+
+def test_manual_intervention_flag_is_set_on_the_record_right_after_a_resume(tmp_path):
+    cfg = make_test_config(tmp_path)
+    # 6 crashes = 2 ideas x 3 attempts each -> tier-2 halts after the 2nd
+    # abandonment. Then 2 more normal outcomes for the post-resume ideas.
+    outcomes = (
+        [{"mode": "crash", "sleep_s": 0.0}] * 6
+        + [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.55}] * 2
+    )
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=("A", "B", "C", "D"))
+
+    for _ in range(6):
+        orc._step(orc.run_log.read_all())
+    assert orc.state.halted is True, "test setup didn't actually reach tier-2"
+
+    orc.resume_after_human()
+    assert orc.state.manual_intervention_pending is True
+
+    orc._step(orc.run_log.read_all())   # the record produced right after resume
+    orc._step(orc.run_log.read_all())   # the one after that
+
+    history = orc.run_log.read_all()
+    assert history[-2].manual_intervention is True, \
+        "the first record after resume_after_human() must be flagged"
+    assert history[-1].manual_intervention is False, \
+        "the flag must be one-shot -- the record after that must NOT be flagged"
+    # And nothing before the halt was retroactively flagged.
+    assert all(r.manual_intervention is False for r in history[:6])
