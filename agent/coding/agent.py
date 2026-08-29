@@ -56,6 +56,7 @@ from typing import Any, Optional
 
 from agent.agents import AgentUsage, Diff, Idea
 from agent.coding import prompts
+from agent.config import TEST_METRICS_SENTINEL
 from agent.coding.llm import LLMClient, LLMResponse, UsageLog, default_client
 from agent.verification import Status as VerifyStatus, verify_result
 
@@ -122,6 +123,28 @@ def extract_code(text: str) -> str:
         return stripped + "\n"      # unfenced but plausibly a whole file
     raise CodeExtractionError(
         "no ```python code block in the response; first 300 chars: " + stripped[:300]
+    )
+
+
+def _scrub_test_metrics(text: str) -> str:
+    """Drop any TEST_METRICS: line from captured subprocess output.
+
+    Hidden-test-split metrics reach stdout so executor.py can quarantine them.
+    Anything this module builds out of that output becomes
+    AttemptOutcome.detail, which goes into a repair prompt and from there into
+    a real, billable LLM call -- so it has to be scrubbed BEFORE it is
+    truncated into a tail, not after. Truncating first can keep the sentinel
+    line and drop everything else.
+
+    Mirrors executor.py's _strip_test_metrics_lines, which does this for its
+    own traceback tails. Duplicated rather than imported: that helper is
+    private to the executor and the coding agent should not reach into another
+    module's internals. The sentinel itself comes from agent.config, so there
+    is still exactly one definition of what the line looks like.
+    """
+    return "\n".join(
+        line for line in text.splitlines()
+        if not line.strip().startswith(TEST_METRICS_SENTINEL)
     )
 
 
@@ -457,8 +480,22 @@ class LLMCodingAgent:
             )
 
         if proc.returncode != 0:
-            tail = "\n".join((proc.stderr or proc.stdout).splitlines()[-40:])
-            return AttemptOutcome(False, "smoke", f"the smoke run crashed:\n{tail}", source=source)
+            # Scrub before truncating. A candidate can print its TEST_METRICS
+            # line and then exit non-zero WITHOUT raising -- sys.exit(1) leaves
+            # stderr empty -- so `proc.stderr or proc.stdout` falls through to
+            # stdout, and the last lines of stdout still carry the hidden-test
+            # metrics. That detail becomes a repair prompt and goes out to a
+            # live LLM call, which is exactly what the quarantine exists to
+            # prevent.
+            tail = "\n".join(
+                _scrub_test_metrics(proc.stderr or proc.stdout).splitlines()[-40:]
+            )
+            return AttemptOutcome(
+                False, "smoke",
+                f"the smoke run crashed:\n{tail}" if tail.strip() else
+                "the smoke run exited non-zero with no diagnostic output on stdout or stderr",
+                source=source,
+            )
 
         if not out_path.exists():
             return AttemptOutcome(
