@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from agent.coding.llm import ScriptedClient
+from agent.config import ConvergenceConfig
 from agent.records import AggregateMetrics, Decision, Event, ResourceUsage, RunRecord, Status
 from agent.research.agent import (
     LLMResearchAgent,
@@ -120,6 +121,27 @@ def test_valid_proposal_returns_existing_idea_contract(tmp_path):
     assert idea.hypothesis.startswith("[RESEARCH_PROPOSAL v1]")
     assert "relative to accepted parent iteration 3" in idea.hypothesis
     assert client.calls[0][2] == "propose"
+
+
+def test_custom_convergence_config_is_used_in_llm_research_context(tmp_path):
+    history = [_record(3, 0.62, Decision.ACCEPT)]
+    convergence = ConvergenceConfig(
+        epsilon=0.007,
+        max_iterations=7,
+        max_wall_s=123.0,
+    )
+    agent, client = _agent(
+        tmp_path,
+        [json.dumps(_proposal(parent=3))],
+        convergence=convergence,
+    )
+
+    agent.propose(history)
+
+    prompt = client.calls[0][1]
+    assert '"minimum_meaningful_delta": 0.007' in prompt
+    assert '"remaining_iterations": 6' in prompt
+    assert '"remaining_wall_s": 123.0' in prompt
 
 
 def test_llm_research_agent_satisfies_existing_protocol_signature():

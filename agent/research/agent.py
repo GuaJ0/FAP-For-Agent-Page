@@ -16,7 +16,12 @@ from typing import Any, Optional, Sequence
 
 from agent.agents import Idea
 from agent.coding.llm import LLMClient, LLMResponse
-from agent.config import FORBIDDEN_PAYLOAD_KEYS, TEST_METRICS_SENTINEL
+from agent.config import (
+    DEFAULT_CONFIG,
+    FORBIDDEN_PAYLOAD_KEYS,
+    TEST_METRICS_SENTINEL,
+    ConvergenceConfig,
+)
 from agent.records import Decision, RunRecord, Status
 from agent.research.citations import (
     CitationSource,
@@ -191,6 +196,7 @@ class LLMResearchAgent:
     )
     max_repair_attempts: int = 1
     citation_limit: int = 20
+    convergence: ConvergenceConfig = DEFAULT_CONFIG.convergence
 
     last_usage: dict[str, Any] = field(default_factory=dict, init=False)
 
@@ -204,7 +210,7 @@ class LLMResearchAgent:
 
     def propose(self, history: list[RunRecord]) -> Idea:
         """Return one validated, evidence-backed proposal as the existing Idea."""
-        context = build_research_context(history)
+        context = build_research_context(history, self.convergence)
         _assert_validation_only_context(context)
 
         query = self._citation_query(context)
