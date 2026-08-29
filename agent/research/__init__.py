@@ -25,6 +25,13 @@ from agent.research.context import (
     ResearchContext,
     build_research_context,
 )
+from agent.research.offline import (
+    DEFAULT_BACKLOG,
+    BacklogEntry,
+    OfflineBacklogExhausted,
+    OfflineResearchAgent,
+    OfflineResearchError,
+)
 from agent.research.schemas import (
     EvaluationPlan,
     EvidenceReference,
@@ -41,6 +48,7 @@ __all__ = [
     "CitationSource",
     "CitationValidationError",
     "CompositeCitationSource",
+    "DEFAULT_BACKLOG",
     "DuplicateHypothesisError",
     "EvaluationPlan",
     "EvidenceReference",
@@ -50,6 +58,10 @@ __all__ = [
     "IterationSummary",
     "JsonCitationCatalog",
     "LLMResearchAgent",
+    "BacklogEntry",
+    "OfflineBacklogExhausted",
+    "OfflineResearchAgent",
+    "OfflineResearchError",
     "ProposalValidationError",
     "Rationale",
     "ResearchAgentError",
