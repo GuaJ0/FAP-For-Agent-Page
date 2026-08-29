@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent
-from agent.config import Config, DEFAULT_CONFIG
+from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
 from agent.convergence import should_stop
 from agent.executor import Executor
 from agent.records import (
@@ -41,11 +41,15 @@ from agent.registry import CheckpointRegistry
 from agent.state import OrchestratorState, StateStore
 
 
-# Reserved for the seeded baseline (see Orchestrator.bootstrap_baseline).
+# Re-exported from agent.config, which is where it now lives so convergence.py
+# can import it too without a cycle (orchestrator imports should_stop FROM
+# convergence). Kept importable from here because that is where callers and
+# tests already reach for it.
+#
 # _step() numbers research iterations from state.iteration + 1, and
 # state.iteration starts at 0, so the first research iteration is 1 and can
 # never collide with this.
-BOOTSTRAP_ITERATION = 0
+__all__ = ["BOOTSTRAP_ITERATION", "BootstrapError", "Orchestrator", "OrchestratorHalted"]
 
 
 class OrchestratorHalted(RuntimeError):
