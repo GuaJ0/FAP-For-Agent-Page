@@ -38,7 +38,7 @@ def _baseline_solution(tmp_path, primary=0.6015, name="baseline"):
     cfg = sol / "config.json"
     cfg.write_text(json.dumps({"mode": "normal", "sleep_s": 0.0, "mean": primary, "std": 0.0}))
     # The config is a sibling of train.py, as the real solution/ layout is.
-    return Diff(diff_path=str(cfg), solution_dir=str(sol))
+    return Diff(config_path=str(cfg), solution_dir=str(sol))
 
 
 def _orc(tmp_path, cfg, outcomes=(), **kw):
@@ -207,9 +207,16 @@ def test_baseline_counts_as_the_first_scored_iteration_for_convergence(tmp_path)
     assert "no improvement" in reason
 
 
-def test_baseline_counts_toward_max_iterations(tmp_path):
-    """Documented trade: the baseline is a concluded non-FAILED record, so
-    should_stop counts it like any other."""
+def test_baseline_does_not_count_toward_max_iterations(tmp_path):
+    """max_iterations counts research attempts, and the baseline is not one --
+    it is the incumbent they are measured against.
+
+    This assertion is the reverse of what it was when bootstrap_baseline()
+    first landed. Back then the baseline consumed a slot, so a run configured
+    for N research iterations really got N-1 and callers had to pass N+1 to
+    compensate. convergence.should_stop() now excludes BOOTSTRAP_ITERATION
+    from that count, so max_iterations means what it says.
+    """
     from agent.config import ConvergenceConfig
 
     cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=2))
@@ -218,8 +225,8 @@ def test_baseline_counts_toward_max_iterations(tmp_path):
     orc.bootstrap_baseline(BASELINE_IDEA, _baseline_solution(tmp_path))
     orc.run()
 
-    # Baseline + one research iteration hits the cap of 2.
-    assert [r.iteration for r in orc.run_log.read_all()] == [0, 1]
+    # Baseline + a full 2 research iterations. Previously this stopped at [0, 1].
+    assert [r.iteration for r in orc.run_log.read_all()] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +285,7 @@ def test_a_failing_baseline_is_logged_then_raised(tmp_path):
     sol.mkdir()
     shutil.copy(FIXTURE, sol / "train.py")
     (sol / "config.json").write_text(json.dumps({"mode": "crash", "sleep_s": 0.0}))
-    diff = Diff(diff_path=str(sol / "config.json"), solution_dir=str(sol))
+    diff = Diff(config_path=str(sol / "config.json"), solution_dir=str(sol))
 
     with pytest.raises(BootstrapError, match="baseline itself failed"):
         orc.bootstrap_baseline(BASELINE_IDEA, diff)
@@ -301,7 +308,7 @@ def test_bootstrap_can_be_retried_after_a_failure(tmp_path):
     shutil.copy(FIXTURE, sol / "train.py")
     cfg_path = sol / "config.json"
     cfg_path.write_text(json.dumps({"mode": "crash", "sleep_s": 0.0}))
-    diff = Diff(diff_path=str(cfg_path), solution_dir=str(sol))
+    diff = Diff(config_path=str(cfg_path), solution_dir=str(sol))
 
     with pytest.raises(BootstrapError):
         orc.bootstrap_baseline(BASELINE_IDEA, diff)

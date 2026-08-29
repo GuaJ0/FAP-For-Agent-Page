@@ -20,9 +20,56 @@ class Idea:
 
 
 @dataclass(frozen=True)
+class AgentUsage:
+    """What one implement() call cost. Optional -- a CodingAgent that doesn't
+    track usage simply leaves Diff.usage as None.
+
+    `cost_usd` is carried here but deliberately does NOT get a field on
+    ResourceUsage. Token counts are ground truth from the API; a dollar figure
+    is derived from a mutable list-price table, so persisting one into an
+    append-only log freezes a number that silently goes stale as prices change.
+    Tokens are what's stored; cost stays derivable (agent/coding/llm.py's
+    pricing table) and is logged alongside the model name in
+    logs/coding_agent_usage.jsonl. The orchestrator also writes it into a
+    per-iteration Event so it's visible in runs.jsonl without a schema change.
+    """
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
 class Diff:
-    diff_path: str      # where the change is recorded (patch file, commit ref, ...)
-    solution_dir: str    # directory containing train.py + config.yaml, ready for the executor
+    """What a CodingAgent hands back: a runnable solution, plus provenance.
+
+    NAMING -- this class used to have a single `diff_path` field, documented as
+    "where the change is recorded (patch file, commit ref, ...)" but in fact
+    consumed by orchestrator.py as the config path handed to the executor. The
+    documented meaning and the executable meaning had drifted apart, and the
+    executable one was load-bearing.
+
+    Split into two explicitly named fields rather than repurposing the old
+    name. `diff_path` deliberately no longer exists here: RunRecord.diff_path
+    (agent/records.py) still means "the config the executor ran", and having
+    the same name mean a patch file one layer up and a config path one layer
+    down would be a worse trap than the original ambiguity. With the name gone
+    from this class there is exactly one `diff_path` in the codebase and it has
+    one meaning.
+
+    Renaming RunRecord's own field is a separate, larger decision -- it changes
+    what an already-written line of runs.jsonl means -- and is deliberately not
+    taken here.
+    """
+    config_path: str     # the config file the executor passes to train.py
+    solution_dir: str    # directory containing train.py + config, ready for the executor
+    # Optional: a real unified diff against the source this was built from.
+    # None when the agent doesn't produce one (FakeCodingAgent, the seeded
+    # baseline) -- nothing in the harness requires it, it's for humans.
+    patch_path: Optional[str] = None
+    # Optional: what producing this cost. orchestrator.py folds it into
+    # RunRecord.resources; None means "not tracked" and yields today's
+    # wall_s-only ResourceUsage.
+    usage: Optional[AgentUsage] = None
 
 
 class ResearchAgent(Protocol):
@@ -91,7 +138,9 @@ class FakeCodingAgent:
         config_path = sol_dir / "config.json"
         config_path.write_text(json.dumps(outcome))
 
-        return Diff(diff_path=str(config_path), solution_dir=str(sol_dir))
+        # No patch_path: this fixture copies a fixed file rather than editing
+        # anything, so there is no diff to point at.
+        return Diff(config_path=str(config_path), solution_dir=str(sol_dir))
 
 
 class FakeEvaluatorAgent:
