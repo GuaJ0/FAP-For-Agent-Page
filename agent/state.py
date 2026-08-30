@@ -24,6 +24,10 @@ class OrchestratorState:
     idea_start_time: Optional[float] = None     # epoch seconds; set when the idea was first proposed
     last_failure_feedback: Optional[str] = None
     consecutive_abandonments: int = 0
+    # Consecutive ResearchAgent.propose() failures -- distinct from
+    # consecutive_abandonments, which counts failed IDEAS. This counts failing
+    # to get an idea at all, and resets on the next successful propose().
+    consecutive_research_failures: int = 0
     halted: bool = False
     halt_reason: Optional[str] = None
     run_start_time: Optional[float] = None       # epoch seconds; set once, for adaptive-seeding projections

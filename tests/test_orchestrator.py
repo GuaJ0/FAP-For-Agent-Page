@@ -581,3 +581,92 @@ def test_summary_write_is_atomic_leaving_no_tmp_file(tmp_path):
 
     assert (cfg.paths.logs_dir / "summary.json").exists()
     assert not list(cfg.paths.logs_dir.glob("summary*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# A ResearchAgent.propose() failure must never crash the whole run -- exposed
+# by a real live run where the Research agent's depth-phase validation raised
+# ResearchOutputError with nothing catching it, killing the entire process
+# after only the baseline had run. CodingAgent.implement() and
+# EvaluatorAgent.judge() were both built to never raise; propose() had no such
+# contract and _step() had nothing guarding the call.
+# ---------------------------------------------------------------------------
+
+class _FlakyResearchAgent:
+    """Raises on propose() for the first `fail_times` calls, then succeeds."""
+
+    def __init__(self, fail_times, hypothesis="a real idea"):
+        self._remaining = fail_times
+        self._hypothesis = hypothesis
+
+    def propose(self, history):
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise RuntimeError("simulated Research proposal failure")
+        from agent.agents import Idea
+        parent = history[-1].iteration if history else None
+        return Idea(hypothesis=self._hypothesis, parent_iteration=parent)
+
+
+def test_a_research_failure_is_recorded_and_the_run_continues(tmp_path):
+    cfg = make_test_config(tmp_path)
+    research = _FlakyResearchAgent(fail_times=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    orc._step(orc.run_log.read_all())   # the failed propose() attempt
+    history = orc.run_log.read_all()
+    assert len(history) == 1
+    assert history[0].status == Status.FAILED
+    assert history[0].aggregate is None
+    assert "RuntimeError" in history[0].events[0].detail
+    assert orc.state.halted is False
+    assert orc.state.consecutive_research_failures == 1
+
+    orc._step(orc.run_log.read_all())   # this time propose() succeeds
+    history = orc.run_log.read_all()
+    assert len(history) == 2
+    assert history[-1].status == Status.SUCCESS
+    assert orc.state.consecutive_research_failures == 0, "a successful propose() must reset the counter"
+
+
+def test_repeated_research_failures_halt_for_a_human(tmp_path):
+    cfg = make_test_config(tmp_path)   # default max_consecutive_research_failures=3
+    research = _FlakyResearchAgent(fail_times=10)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    for _ in range(2):
+        orc._step(orc.run_log.read_all())
+    assert orc.state.halted is False
+
+    orc._step(orc.run_log.read_all())   # the 3rd consecutive failure
+    assert orc.state.halted is True
+    assert "3 consecutive Research proposal failures" in orc.state.halt_reason
+
+    history = orc.run_log.read_all()
+    assert len(history) == 3
+    assert [r.status for r in history] == [Status.FAILED, Status.FAILED, Status.ABANDONED]
+
+    with pytest.raises(OrchestratorHalted):
+        orc.run()
+
+
+def test_research_failure_records_do_not_consume_a_max_iterations_slot(tmp_path):
+    """2 failures stay below the default max_consecutive_research_failures=3,
+    so both records are FAILED (not ABANDONED) -- and FAILED records, like a
+    failed training attempt, must not count against max_iterations."""
+    from agent.config import ConvergenceConfig
+    from agent.convergence import should_stop
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=1))
+    research = _FlakyResearchAgent(fail_times=2)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    for _ in range(2):
+        orc._step(orc.run_log.read_all())
+
+    history = orc.run_log.read_all()
+    assert [r.status for r in history] == [Status.FAILED, Status.FAILED]
+
+    stop, reason = should_stop(history, cfg.convergence)
+    assert stop is False, "FAILED research-proposal records must not trip max_iterations=1"
