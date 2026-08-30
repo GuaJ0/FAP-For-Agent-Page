@@ -124,15 +124,23 @@ def test_a_finding_survives_a_new_ledger_over_the_same_file(tmp_path):
 
 
 def test_one_entry_per_direction_updates_rather_than_appends(tmp_path):
+    """Retesting a direction deepens its single entry instead of appending.
+
+    The headline delta is the family's BEST attempt, not whichever attempt ran
+    last. Once an entry rolls several attempts up (see the family tests below),
+    "the delta" has to mean something stable about the direction; last-write
+    would make it depend on scheduling order, so a direction would look worse
+    purely for having been retried in an unlucky order.
+    """
     path = tmp_path / "findings.jsonl"
     ledger = FindingsLedger(path)
-    ledger.record(_finding(delta=-0.001, iteration=1))
-    ledger.record(_finding(delta=-0.004, iteration=7))    # same direction, retested
+    ledger.record(_finding(delta=-0.004, iteration=1))
+    ledger.record(_finding(delta=-0.001, iteration=7))    # same direction, retested
 
     stored = ledger.load()
     assert len(stored) == 1
-    assert stored[0].delta_vs_incumbent == pytest.approx(-0.004)
-    assert stored[0].iteration == 7
+    assert stored[0].delta_vs_incumbent == pytest.approx(-0.001)   # best, not last
+    assert stored[0].iteration == 7                                # most recent
 
 
 def test_distinct_directions_coexist(tmp_path):
@@ -254,3 +262,152 @@ def test_the_shipped_default_path_is_outside_logs():
     """It must survive a reset, and a reset archives logs/ wholesale."""
     assert "logs" not in DEFAULT_FINDINGS_PATH.parts
     assert DEFAULT_FINDINGS_PATH.name == "findings.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Direction families and confidence: how much of a direction was actually
+# tested. The gap this closes: three DIN variants used to land as three
+# unrelated one-shot Don'ts, so "tested at three config points and failed all
+# three" was not expressible and read identically to a single weak attempt.
+# ---------------------------------------------------------------------------
+
+from agent.research.findings import (  # noqa: E402
+    CONFIDENCE_INCONCLUSIVE,
+    CONFIDENCE_TESTED,
+    CONFIDENCE_WELL_TESTED,
+    DIRECTION_FAMILIES,
+    resolve_family,
+)
+
+
+def _variant_record(hid, delta, iteration, hyperparams="history_length: [20,50]"):
+    """A judged record carrying a HYPERPARAMETERS block, as a real handoff does."""
+    record = _record(iteration=iteration, hid=hid, delta=delta)
+    record.hypothesis = record.hypothesis + f"\n\nHYPERPARAMETERS:\n- {hyperparams}\n"
+    return record
+
+
+def test_variants_of_one_direction_roll_up_into_a_single_family_entry(tmp_path):
+    ledger = FindingsLedger(tmp_path / "f.jsonl")
+    for hid, delta, it, hp in (
+        ("OFFLINE-DIN-SHORT-HISTORY", -0.021, 1, "history_length: [20,50]"),
+        ("OFFLINE-DIN-LONG-HISTORY", -0.014, 2, "history_length: [100,200]"),
+        ("OFFLINE-DIN-MEAN-POOL", -0.033, 3, "history_length: [50]"),
+    ):
+        ledger.record(build_finding(_variant_record(hid, delta, it, hp),
+                                    direction=hid, title="candidate-conditioned history"))
+
+    stored = ledger.load()
+    assert len(stored) == 1                        # one direction, not three
+    entry = stored[0]
+    assert entry.direction == "DIN-SEQUENCE"
+    assert entry.attempts == 3
+    assert entry.confidence == CONFIDENCE_WELL_TESTED
+    assert set(entry.variants) == {
+        "OFFLINE-DIN-SHORT-HISTORY", "OFFLINE-DIN-LONG-HISTORY", "OFFLINE-DIN-MEAN-POOL",
+    }
+    # The spread of every attempt is preserved, and the headline is the best.
+    assert sorted(entry.deltas) == pytest.approx([-0.033, -0.021, -0.014])
+    assert entry.delta_vs_incumbent == pytest.approx(-0.014)
+    # Coverage names the range actually spanned, so "we tried 20 to 200" is legible.
+    assert "100,200" in entry.coverage and "20,50" in entry.coverage
+
+
+def test_a_single_attempt_is_inconclusive_rather_than_a_flat_dont(tmp_path):
+    """The honesty requirement: one attempt rules out one implementation, not
+    the mechanism. It is still recorded, but not as a settled dead end."""
+    ledger = FindingsLedger(tmp_path / "f.jsonl")
+    ledger.record(build_finding(_variant_record("OFFLINE-DEEPFM", -0.02, 1),
+                                direction="OFFLINE-DEEPFM", title="DeepFM tower"))
+
+    entry = ledger.load()[0]
+    assert entry.verdict == VERDICT_DONT
+    assert entry.attempts == 1
+    assert entry.confidence == CONFIDENCE_INCONCLUSIVE
+    assert not entry.is_conclusive
+
+
+def test_two_attempts_reach_tested_but_not_well_tested(tmp_path):
+    ledger = FindingsLedger(tmp_path / "f.jsonl")
+    for hid, delta in (("OFFLINE-HYBRID-BPR", -0.01), ("OFFLINE-GAUC-WEIGHTED-BPR", -0.02)):
+        ledger.record(build_finding(_variant_record(hid, delta, 1),
+                                    direction=hid, title="ranking loss"))
+
+    entry = ledger.load()[0]
+    assert entry.direction == "RANKING-LOSS"
+    assert (entry.attempts, entry.confidence) == (2, CONFIDENCE_TESTED)
+    assert entry.is_conclusive
+
+
+def test_rerunning_the_same_variant_does_not_inflate_confidence(tmp_path):
+    """Otherwise a resumed run could manufacture 'well_tested' out of one
+    measurement repeated three times."""
+    ledger = FindingsLedger(tmp_path / "f.jsonl")
+    for iteration in (1, 2, 3):
+        ledger.record(build_finding(
+            _variant_record("OFFLINE-DEEPFM", -0.02, iteration),
+            direction="OFFLINE-DEEPFM", title="DeepFM tower"))
+
+    entry = ledger.load()[0]
+    assert entry.attempts == 1
+    assert entry.confidence == CONFIDENCE_INCONCLUSIVE
+
+
+def test_one_accepted_variant_makes_the_whole_family_a_do(tmp_path):
+    """A direction that demonstrably worked once is a "do", even if other
+    implementations of it lost -- the mechanism is not the thing that failed."""
+    ledger = FindingsLedger(tmp_path / "f.jsonl")
+    ledger.record(build_finding(_variant_record("OFFLINE-WATCHTIME-AUXILIARY", -0.01, 1),
+                                direction="OFFLINE-WATCHTIME-AUXILIARY", title="watch time"))
+    ledger.record(build_finding(
+        _record(iteration=2, hid="OFFLINE-WATCHTIME-RATIO", decision=Decision.ACCEPT, delta=0.006),
+        direction="OFFLINE-WATCHTIME-RATIO", title="watch ratio"))
+
+    entry = ledger.load()[0]
+    assert entry.direction == "WATCHTIME"
+    assert entry.verdict == VERDICT_DO
+    assert entry.delta_vs_incumbent == pytest.approx(0.006)
+    assert entry.attempts == 2
+
+
+def test_an_undeclared_direction_forms_its_own_single_member_family():
+    """A live-Research proposal nobody declared must still be recordable."""
+    assert resolve_family("OFFLINE-SOMETHING-NEW") == "SOMETHING-NEW"
+    assert resolve_family("LLM-PROPOSAL-7") == "LLM-PROPOSAL-7"
+
+
+def test_pre_rollup_entries_still_load_as_single_attempt_findings(tmp_path):
+    """findings.jsonl lines written before these fields existed must load
+    unchanged -- as the one-attempt, inconclusive findings they always were."""
+    path = tmp_path / "f.jsonl"
+    path.write_text(json.dumps({
+        "direction": "RP-OLD", "title": "an old entry", "verdict": VERDICT_DONT,
+        "decision": "revert", "delta_vs_incumbent": -0.003,
+        "validation_primary": 0.59, "why": "lost", "iteration": 4,
+    }) + "\n")
+
+    entry = FindingsLedger(path).load()[0]
+    assert entry.attempts == 1
+    assert entry.variants == ()
+    assert entry.confidence == CONFIDENCE_INCONCLUSIVE
+
+
+def test_conclusive_donts_are_ordered_ahead_of_inconclusive_ones():
+    """If the prompt is truncated, the firm constraints are the ones to keep."""
+    weak = Finding(direction="WEAK", title="t", verdict=VERDICT_DONT, decision="revert",
+                   delta_vs_incumbent=-0.09, validation_primary=0.5, why="w", iteration=1,
+                   attempts=1, confidence=CONFIDENCE_INCONCLUSIVE)
+    firm = Finding(direction="FIRM", title="t", verdict=VERDICT_DONT, decision="revert",
+                   delta_vs_incumbent=-0.001, validation_primary=0.6, why="w", iteration=2,
+                   attempts=3, confidence=CONFIDENCE_WELL_TESTED)
+
+    rendered = findings_for_prompt([weak, firm])
+
+    assert [f["direction"] for f in rendered] == ["FIRM", "WEAK"]
+    assert rendered[0]["confidence"] == CONFIDENCE_WELL_TESTED
+
+
+def test_every_declared_family_member_resolves_back_to_its_family():
+    for family, members in DIRECTION_FAMILIES.items():
+        for member in members:
+            assert resolve_family(f"OFFLINE-{member}") == family

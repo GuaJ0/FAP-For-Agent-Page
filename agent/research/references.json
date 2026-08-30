@@ -68,11 +68,30 @@
       "year": 2016,
       "venue": "RecSys",
       "url": "https://doi.org/10.1145/2959100.2959190",
-      "tags": ["recommendation", "ranking", "watch-time"],
+      "tags": ["recommendation", "ranking", "watch-time", "temporal-drift"],
       "claims": [
         {
           "claim_id": "ranking-objective-and-watch-time",
           "text": "The ranking stage can optimize an expected-watch-time objective rather than relying only on click probability."
+        },
+        {
+          "claim_id": "example-age-freshness",
+          "text": "Training over a fixed window of logged data biases a model toward the past; an explicit example-age feature lets the model represent how item popularity varies with time rather than averaging over the window."
+        }
+      ]
+    },
+    {
+      "citation_id": "schnabel2016propensity",
+      "title": "Recommendations as Treatments: Debiasing Learning and Evaluation",
+      "authors": ["Tobias Schnabel", "Adith Swaminathan", "Ashudeep Singh", "Navin Chandak", "Thorsten Joachims"],
+      "year": 2016,
+      "venue": "ICML",
+      "url": "https://arxiv.org/abs/1602.05352",
+      "tags": ["unbiased-evaluation", "propensity", "exposure-bias"],
+      "claims": [
+        {
+          "claim_id": "biased-logging-biases-evaluation",
+          "text": "Feedback logged under a non-uniform exposure policy yields systematically biased estimates of recommendation quality; unbiased estimates require accounting for the exposure mechanism, and data collected under randomized exposure provides such an unbiased sample."
         }
       ]
     }

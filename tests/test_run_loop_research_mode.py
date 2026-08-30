@@ -206,3 +206,72 @@ def test_run_loop_does_not_wire_fake_research_agent():
 
     assert "FakeResearchAgent" not in source
     assert "from agent.research import LLMResearchAgent, OfflineResearchAgent" in source
+
+
+# ---------------------------------------------------------------------------
+# Exploration-pass overrides. The graded run's RetryConfig and the committed
+# findings ledger are the things these must not disturb: an exploration pass
+# needs a looser budget and a scratch ledger, and both used to be
+# unreachable -- RetryConfig was only ever constructed with defaults, and the
+# ledger path was hardcoded.
+# ---------------------------------------------------------------------------
+
+def test_retry_budget_defaults_match_the_graded_run_exactly(monkeypatch, tmp_path):
+    """Omitting the flags must reproduce agent/config.RetryConfig, so adding
+    them cannot have quietly changed what the graded run does."""
+    from agent.config import RetryConfig
+
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path)
+
+    retry = captured["orchestrator"].kwargs["cfg"].retry
+    assert retry.max_fix_attempts == RetryConfig.max_fix_attempts
+    assert retry.idea_time_backstop_s == RetryConfig.idea_time_backstop_s
+
+
+def test_retry_budget_can_be_loosened_without_touching_the_defaults(monkeypatch, tmp_path):
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path,
+              "--max-fix-attempts", "5", "--idea-backstop-s", "5400")
+
+    cfg = captured["orchestrator"].kwargs["cfg"]
+    assert cfg.retry.max_fix_attempts == 5
+    assert cfg.retry.idea_time_backstop_s == 5400.0
+    # tier-2 is deliberately NOT exposed: two consecutive abandonments still
+    # halts for a human, in an exploration pass as anywhere else.
+    assert cfg.retry.max_consecutive_abandonments == 2
+
+
+def test_the_ledger_defaults_to_the_committed_one(monkeypatch, tmp_path):
+    from agent.research.findings import DEFAULT_FINDINGS_PATH
+
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path)
+
+    assert captured["orchestrator"].kwargs["findings"].path == DEFAULT_FINDINGS_PATH
+
+
+def test_an_exploration_pass_can_redirect_the_ledger_to_a_scratch_file(monkeypatch, tmp_path):
+    """The isolation that keeps unreviewed exploration findings out of the
+    memory the graded run reads."""
+    from agent.research.findings import DEFAULT_FINDINGS_PATH
+
+    scratch = tmp_path / "scratch" / "findings.jsonl"
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path, "--findings-path", str(scratch))
+
+    ledger_path = captured["orchestrator"].kwargs["findings"].path
+    assert ledger_path == scratch
+    assert ledger_path != DEFAULT_FINDINGS_PATH
+
+
+def test_root_isolates_every_run_artifact_from_the_graded_run(monkeypatch, tmp_path):
+    """--root is what keeps the campaign's iterations, state and artifacts out
+    of the graded run's budget and convergence window."""
+    captured = _install_pipeline_fakes(monkeypatch)
+    _, root = _run_main(monkeypatch, tmp_path)
+
+    paths = captured["orchestrator"].kwargs["cfg"].paths
+    for path in (paths.logs_dir, paths.runs_jsonl, paths.orchestrator_state,
+                 paths.registry_json, paths.artifacts_dir, paths.quarantine_dir):
+        assert root in path.parents or path == root, path

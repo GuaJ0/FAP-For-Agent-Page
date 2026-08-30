@@ -38,6 +38,30 @@ Belt and braces on top of that:
     _assert_validation_only_context() in agent/research/agent.py re-checks them
     at prompt-construction time.
 
+DIRECTION FAMILIES AND CONFIDENCE
+---------------------------------
+A structurally complex direction cannot be settled by one attempt. "DIN-style
+sequences don't help" is a claim about the mechanism; a single Coding Agent
+generation at one window length is evidence about one implementation of it. A
+ledger that records both the same way manufactures false Don'ts, and a false
+Don't is worse than no entry at all -- it actively steers Research away from
+something nobody has actually tested.
+
+So entries roll up by FAMILY, not by individual proposal id. Every attempt at
+a family merges into that family's single entry, accumulating:
+
+  - attempts: how many distinct real attempts were measured;
+  - variants: which proposal ids / sweep points those were;
+  - deltas: each attempt's measured delta, so the spread is visible;
+  - coverage: the hyperparameter range those attempts actually spanned;
+  - confidence: derived from attempts, and the field that stops a one-shot
+    result from reading as a settled Don't.
+
+A `dont` at confidence "inconclusive" means "one attempt, it lost, nobody has
+ruled the mechanism out". A `dont` at "well_tested" means the pipeline spent
+three real generations across a stated range and every one lost. Research is
+told the difference in prompts.py rather than being left to infer it.
+
 STORAGE
 -------
 agent/research/findings.jsonl, committed to git. It has to outlive a reset, and
@@ -50,7 +74,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -66,6 +90,60 @@ DEFAULT_MAX_FINDINGS = 40
 
 VERDICT_DO = "do"
 VERDICT_DONT = "dont"
+
+# Confidence tiers, derived from attempt count alone -- deliberately not from
+# the size of the deltas. How firmly a direction was measured is a question
+# about how much of it we tried, not about how badly the tries lost.
+CONFIDENCE_INCONCLUSIVE = "inconclusive"   # 1 attempt: not enough to rule anything out
+CONFIDENCE_TESTED = "tested"               # 2 attempts
+CONFIDENCE_WELL_TESTED = "well_tested"     # 3+ attempts across a stated range
+
+_WELL_TESTED_ATTEMPTS = 3
+
+
+def confidence_for(attempts: int) -> str:
+    if attempts >= _WELL_TESTED_ATTEMPTS:
+        return CONFIDENCE_WELL_TESTED
+    if attempts >= 2:
+        return CONFIDENCE_TESTED
+    return CONFIDENCE_INCONCLUSIVE
+
+
+# Which backlog directions belong to the same research family.
+#
+# Declared here rather than imported from agent/research/offline.py because
+# that module imports this one (via agent.py) -- and because a family is a
+# claim about the RESEARCH direction, which outlives whichever backlog entries
+# currently implement it. A live-Research proposal with an id nobody declared
+# still gets an entry; it simply forms its own single-member family.
+#
+# tests/test_research_offline.py asserts every DEFAULT_BACKLOG key resolves to
+# a family declared here, so a new backlog entry cannot silently go ungrouped.
+DIRECTION_FAMILIES: dict[str, tuple[str, ...]] = {
+    "RANKING-LOSS": ("HYBRID-BPR", "GAUC-WEIGHTED-BPR"),
+    "DIN-SEQUENCE": ("DIN-SHORT-HISTORY", "DIN-LONG-HISTORY", "DIN-MEAN-POOL"),
+    "MULTITASK": ("MULTITASK-ENGAGEMENT", "MULTITASK-ALL-ENGAGEMENT", "MULTITASK-CLICK-HEAVY"),
+    "WATCHTIME": ("WATCHTIME-AUXILIARY", "WATCHTIME-CENSORED", "WATCHTIME-RATIO"),
+    "ARCHITECTURE": ("DEEPFM",),
+    "TIME-DRIFT": ("TIME-DRIFT",),
+    "UNBIASED-VALIDATION": ("LOG-RANDOM-DIAGNOSTIC",),
+}
+
+_FAMILY_BY_MEMBER: dict[str, str] = {
+    member: family for family, members in DIRECTION_FAMILIES.items() for member in members
+}
+
+
+def resolve_family(direction: str) -> str:
+    """The family a proposal id belongs to, or the id itself if it declares none.
+
+    Tolerates the ``OFFLINE-`` prefix OfflineResearchAgent stamps onto every
+    hypothesis_id, so the ledger groups by the backlog key rather than by the
+    agent that happened to produce it.
+    """
+    key = (direction or "").strip()
+    bare = key[len("OFFLINE-"):] if key.upper().startswith("OFFLINE-") else key
+    return _FAMILY_BY_MEMBER.get(bare.upper(), bare or key)
 
 _TITLE_LIMIT = 120
 _WHY_LIMIT = 280
@@ -88,26 +166,59 @@ class Finding:
     happened, by how much, and why -- not a second copy of the run history.
     """
 
-    direction: str                  # ResearchProposal.hypothesis_id -- stable across runs
+    direction: str                  # the FAMILY key -- the merge key, stable across runs
     title: str                      # short human-readable description of the direction
     verdict: str                    # VERDICT_DO | VERDICT_DONT
-    decision: str                   # the Evaluator's own verdict
-    delta_vs_incumbent: Optional[float]
-    validation_primary: Optional[float]
+    decision: str                   # the Evaluator's own verdict on the decisive attempt
+    delta_vs_incumbent: Optional[float]   # the BEST delta any attempt achieved
+    validation_primary: Optional[float]   # validation primary of that best attempt
     why: str                        # Evaluator commentary, truncated
     iteration: int
 
+    # --- how much was actually tested ---------------------------------------
+    # Defaulted so every field is optional on read: findings.jsonl lines
+    # written before these existed load unchanged, as a single-attempt entry,
+    # which is exactly what they were.
+    attempts: int = 1
+    variants: tuple[str, ...] = ()      # proposal ids / sweep points behind those attempts
+    deltas: tuple[float, ...] = ()      # one per attempt, so the spread is visible
+    coverage: str = ""                  # hyperparameter range the attempts spanned
+    confidence: str = CONFIDENCE_INCONCLUSIVE
+
     @property
     def evidence_strength(self) -> float:
-        """How firmly this direction was measured. Used only for eviction."""
-        return abs(self.delta_vs_incumbent) if self.delta_vs_incumbent is not None else 0.0
+        """How firmly this direction was measured. Used only for eviction.
+
+        Attempt count leads, magnitude breaks ties: at the cap we would rather
+        evict one big loss nobody replicated than three consistent attempts
+        that together actually close a direction.
+        """
+        magnitude = abs(self.delta_vs_incumbent) if self.delta_vs_incumbent is not None else 0.0
+        return float(self.attempts) + min(magnitude, 0.999)
+
+    @property
+    def is_conclusive(self) -> bool:
+        """False for a one-attempt result, whatever its verdict."""
+        return self.confidence != CONFIDENCE_INCONCLUSIVE
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "Finding":
-        return cls(**{k: d.get(k) for k in cls.__dataclass_fields__})
+        """Rebuild from one JSONL line.
+
+        Fields absent from the line fall back to the dataclass default rather
+        than to None, so a pre-rollup entry reads as the single-attempt,
+        inconclusive finding it always was instead of arriving with attempts
+        set to None and blowing up the first comparison that touches it.
+        """
+        fields = cls.__dataclass_fields__
+        kwargs = {k: d[k] for k in fields if k in d}
+        for key in ("variants", "deltas"):
+            if key in kwargs and kwargs[key] is not None:
+                kwargs[key] = tuple(kwargs[key])
+        return cls(**kwargs)
 
 
 def _assert_validation_only(payload: Any) -> None:
@@ -134,11 +245,31 @@ def _evaluator_commentary(record: RunRecord) -> str:
     return ""
 
 
+_HYPERPARAM_LIMIT = 200
+
+
+def _hyperparameters_section(hypothesis: str) -> str:
+    """The HYPERPARAMETERS block of a structured handoff, as one line.
+
+    This is what `coverage` is built from: the settings the attempt actually
+    declared. Absent for a legacy or free-text hypothesis, which correctly
+    yields empty coverage rather than an invented range.
+    """
+    match = re.search(
+        r"(?ms)^HYPERPARAMETERS:\s*\n(.*?)(?=\n[A-Z][A-Z ]+:\s*\n|\Z)", hypothesis or "",
+    )
+    if not match:
+        return ""
+    items = [line.strip(" -") for line in match.group(1).strip().splitlines() if line.strip(" -")]
+    return _truncate("; ".join(items), _HYPERPARAM_LIMIT)
+
+
 def build_finding(
     record: RunRecord,
     *,
     direction: str,
     title: str,
+    family: Optional[str] = None,
 ) -> Optional[Finding]:
     """A Finding for one Evaluator-judged record, or None if it isn't one.
 
@@ -152,15 +283,84 @@ def build_finding(
         return None
 
     verdict = VERDICT_DO if record.decision == Decision.ACCEPT else VERDICT_DONT
+    delta = record.delta_vs_current_best
     return Finding(
-        direction=direction,
+        # The merge key is the family, so three DIN variants accumulate into
+        # one DIN-SEQUENCE entry instead of three unrelated one-shot Don'ts.
+        direction=family or resolve_family(direction),
         title=_truncate(title, _TITLE_LIMIT),
         verdict=verdict,
         decision=record.decision.value,
-        delta_vs_incumbent=record.delta_vs_current_best,
+        delta_vs_incumbent=delta,
         validation_primary=record.aggregate.primary_mean if record.aggregate else None,
         why=_truncate(_evaluator_commentary(record), _WHY_LIMIT),
         iteration=record.iteration,
+        # One attempt as constructed. FindingsLedger.record() merges this into
+        # whatever the family already holds and recomputes the rollup.
+        attempts=1,
+        variants=(direction,),
+        deltas=() if delta is None else (delta,),
+        coverage=_hyperparameters_section(record.hypothesis),
+        confidence=CONFIDENCE_INCONCLUSIVE,
+    )
+
+
+def _merge_coverage(prior: str, new: str) -> str:
+    """Union of two coverage strings, order-preserving and deduplicated."""
+    seen: list[str] = []
+    for part in [p.strip() for p in (prior or "").split(";")] + \
+                [p.strip() for p in (new or "").split(";")]:
+        if part and part not in seen:
+            seen.append(part)
+    return _truncate("; ".join(seen), _HYPERPARAM_LIMIT)
+
+
+def _merge(prior: Optional[Finding], new: Finding) -> Finding:
+    """Fold one fresh attempt into a family's existing entry.
+
+    Re-running the SAME variant does not inflate the attempt count -- variants
+    are deduplicated by name, so a resumed or repeated run cannot manufacture
+    confidence the pipeline never earned. A config sweep gets around this
+    honestly by labelling each point as its own variant (see agent/sweep.py),
+    because a different config point genuinely is a different measurement.
+
+    The rolled-up verdict is the best outcome any attempt achieved: one ACCEPT
+    among three attempts makes the family a "do", because the direction demonstrably
+    can work even if two implementations of it did not.
+    """
+    if prior is None:
+        return replace(new, confidence=confidence_for(new.attempts))
+
+    variants = list(prior.variants) or [prior.direction]
+    is_new_variant = not set(new.variants) <= set(variants)
+    for name in new.variants:
+        if name not in variants:
+            variants.append(name)
+
+    attempts = prior.attempts + (new.attempts if is_new_variant else 0)
+    deltas = tuple(prior.deltas) + (tuple(new.deltas) if is_new_variant else ())
+
+    # "Best" means highest delta -- the least-bad attempt if all of them lost.
+    prior_best = prior.delta_vs_incumbent
+    new_best = new.delta_vs_incumbent
+    new_wins = prior_best is None or (new_best is not None and new_best > prior_best)
+    winner = new if new_wins else prior
+
+    return Finding(
+        direction=prior.direction,
+        title=winner.title or prior.title,
+        # An ACCEPT anywhere in the family makes the family a "do".
+        verdict=VERDICT_DO if VERDICT_DO in (prior.verdict, new.verdict) else VERDICT_DONT,
+        decision=winner.decision,
+        delta_vs_incumbent=winner.delta_vs_incumbent,
+        validation_primary=winner.validation_primary,
+        why=winner.why or prior.why,
+        iteration=max(prior.iteration, new.iteration),
+        attempts=attempts,
+        variants=tuple(variants),
+        deltas=deltas,
+        coverage=_merge_coverage(prior.coverage, new.coverage),
+        confidence=confidence_for(attempts),
     )
 
 
@@ -203,10 +403,17 @@ class FindingsLedger:
         return tuple(out)
 
     def record(self, finding: Optional[Finding]) -> Optional[Finding]:
-        """Insert or update one direction, then re-cap. Returns what was stored.
+        """Merge one attempt into its family's entry, then re-cap.
 
-        One entry per direction: re-testing a direction updates its entry rather
-        than appending, so a much-retried dead end cannot crowd out the list.
+        Returns the entry as stored -- the merged rollup, not the single
+        attempt that was passed in, so a caller can see the accumulated
+        attempts/confidence rather than what it already knew.
+
+        One entry per FAMILY: a second attempt at the same direction deepens
+        that entry instead of appending a competing one, which is both what
+        keeps a much-retried dead end from crowding out the list and what makes
+        "tested at three config points" expressible at all.
+
         Never raises -- a ledger problem must not take down a live run.
         """
         if finding is None:
@@ -217,13 +424,15 @@ class FindingsLedger:
             return None
 
         try:
-            kept = [f for f in self.load() if f.direction != finding.direction]
-            kept.append(finding)
-            kept = self._cap(kept)
-            self._write(kept)
+            existing = self.load()
+            prior = next((f for f in existing if f.direction == finding.direction), None)
+            merged = _merge(prior, finding)
+            kept = [f for f in existing if f.direction != finding.direction]
+            kept.append(merged)
+            self._write(self._cap(kept))
         except OSError:
             return None
-        return finding
+        return merged
 
     def _cap(self, findings: list[Finding]) -> list[Finding]:
         if len(findings) <= self.max_findings:
@@ -250,13 +459,21 @@ class FindingsLedger:
 
 
 def findings_for_prompt(findings: Iterable[Finding]) -> tuple[dict[str, Any], ...]:
-    """Render findings for ResearchContext, don'ts first.
+    """Render findings for ResearchContext, don'ts first, best-evidenced first.
 
     Don'ts lead because they are the constraint: the prompt rule they serve is
-    about not repeating a measured dead end.
+    about not repeating a measured dead end. Within the don'ts, conclusive ones
+    lead over inconclusive ones -- a direction closed by three attempts is a
+    firmer constraint than one that lost once, and if the prompt gets truncated
+    the firm constraints are the ones worth keeping.
     """
     ordered = sorted(
         findings,
-        key=lambda f: (f.verdict != VERDICT_DONT, -f.evidence_strength, f.direction),
+        key=lambda f: (
+            f.verdict != VERDICT_DONT,
+            not f.is_conclusive,
+            -f.evidence_strength,
+            f.direction,
+        ),
     )
     return tuple(f.to_json() for f in ordered)

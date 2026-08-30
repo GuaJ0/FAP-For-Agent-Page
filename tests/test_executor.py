@@ -186,3 +186,168 @@ def test_cpu_s_does_not_count_pure_sleep_as_cpu_time(tmp_path):
 
     assert result.failure_kind is None
     assert result.cpu_s < 0.1, f"a 0.3s sleep should not register as CPU time, got {result.cpu_s}"
+
+
+# ---------------------------------------------------------------------------
+# Config-only sweeps (agent/sweep.py): drive run_seeds() directly against ONE
+# fixed implementation with only the config swapped. No research.propose(),
+# no coding.implement() -- see agent/sweep.py's docstring for why this is a
+# separate mode rather than a flag on Orchestrator._step().
+# ---------------------------------------------------------------------------
+
+def _sweep(tmp_path, evaluator=None, seeds=(0,)):
+    from agent.agents import FakeEvaluatorAgent
+    from agent.records import RunLog
+    from agent.sweep import ConfigSweep
+
+    ex, cfg = _executor(tmp_path)
+    return ConfigSweep(
+        executor=ex,
+        evaluator=evaluator or FakeEvaluatorAgent(),
+        run_log=RunLog(cfg.paths.runs_jsonl),
+        cfg=cfg,
+        seeds=seeds,
+    ), cfg
+
+
+def test_config_sweep_reruns_one_implementation_at_several_config_points(tmp_path):
+    """The implementation is fixed; only the config changes. Every point must
+    produce a real, Evaluator-judged RunRecord in the run log."""
+    from agent.sweep import ConfigPoint
+
+    sol_dir, base_config = _solution(tmp_path, mode="normal", mean=0.60)
+    sweep, cfg = _sweep(tmp_path)
+
+    results = sweep.run(
+        solution_dir=sol_dir,
+        base_config=base_config,
+        points=[ConfigPoint("mean-0.55", {"mean": 0.55}),
+                ConfigPoint("mean-0.70", {"mean": 0.70})],
+        hypothesis="config sensitivity of the fixed implementation",
+        incumbent_primary=0.60,
+    )
+
+    assert [r.point.label for r in results] == ["mean-0.55", "mean-0.70"]
+    assert all(r.record.aggregate is not None for r in results)
+    assert all(r.record.decision is not None for r in results)   # really judged
+    # The delta is measured against the incumbent passed in, not against 0.
+    assert results[0].record.delta_vs_current_best < 0
+    assert results[1].record.delta_vs_current_best > 0
+    # And every point is durably in the run log, like any other iteration.
+    assert len(list(read_lines(cfg.paths.runs_jsonl))) == 2
+
+
+def test_config_sweep_leaves_the_swept_implementation_untouched(tmp_path):
+    """The point of a config-only sweep is that the code is the control. If the
+    driver wrote configs into the solution dir it would be mutating the thing
+    it is holding fixed."""
+    from agent.sweep import ConfigPoint
+
+    sol_dir, base_config = _solution(tmp_path, mode="normal")
+    before = {p.name: p.read_bytes() for p in sorted(sol_dir.iterdir()) if p.is_file()}
+    sweep, _ = _sweep(tmp_path)
+
+    sweep.run(
+        solution_dir=sol_dir, base_config=base_config,
+        points=[ConfigPoint("mean-0.5", {"mean": 0.5})],
+        hypothesis="h",
+    )
+
+    after = {p.name: p.read_bytes() for p in sorted(sol_dir.iterdir()) if p.is_file()}
+    assert after == before
+
+
+def test_config_sweep_merges_overrides_over_the_base_config(tmp_path):
+    """Keys the point does not mention must survive from the base config --
+    otherwise a 'config-only' sweep silently changes more than one thing."""
+    from agent.sweep import ConfigPoint, load_flat_config
+
+    sol_dir, base_config = _solution(tmp_path, mode="normal", mean=0.6, std=0.01)
+    sweep, _ = _sweep(tmp_path)
+
+    results = sweep.run(
+        solution_dir=sol_dir, base_config=base_config,
+        points=[ConfigPoint("mean-0.42", {"mean": 0.42})],
+        hypothesis="h",
+    )
+
+    written = load_flat_config(results[0].config_path)
+    assert written["mean"] == 0.42          # overridden
+    assert written["std"] == 0.01           # inherited
+    assert written["mode"] == "normal"      # inherited
+
+
+def test_config_sweep_logs_a_failed_point_without_judging_it(tmp_path):
+    """A point whose every seed crashed has no aggregate, so there is nothing
+    for the Evaluator to judge -- same rule the main loop applies."""
+    from agent.sweep import ConfigPoint
+
+    sol_dir, base_config = _solution(tmp_path, mode="normal")
+    sweep, cfg = _sweep(tmp_path)
+
+    results = sweep.run(
+        solution_dir=sol_dir, base_config=base_config,
+        points=[ConfigPoint("crash", {"mode": "crash"})],
+        hypothesis="h",
+    )
+
+    record = results[0].record
+    assert record.aggregate is None
+    assert record.decision is None                      # not judged
+    assert record.status.value == "failed"
+    assert len(list(read_lines(cfg.paths.runs_jsonl))) == 1   # but still logged
+
+
+def test_config_sweep_never_registers_a_checkpoint(tmp_path):
+    """A sweep is a measurement, not a promotion path: it must not be able to
+    move the incumbent, even when a point beats it."""
+    from agent.registry import CheckpointRegistry
+    from agent.sweep import ConfigPoint
+
+    sol_dir, base_config = _solution(tmp_path, mode="normal")
+    sweep, cfg = _sweep(tmp_path)
+
+    sweep.run(
+        solution_dir=sol_dir, base_config=base_config,
+        points=[ConfigPoint("great", {"mean": 0.99})],
+        hypothesis="h",
+        incumbent_primary=0.10,
+    )
+
+    assert CheckpointRegistry(cfg.paths.registry_json).best() is None
+
+
+def test_config_sweep_rejects_a_solution_dir_with_no_train_py(tmp_path):
+    from agent.sweep import ConfigPoint, ConfigSweepError
+
+    sol_dir, base_config = _solution(tmp_path, mode="normal")
+    (sol_dir / "train.py").unlink()
+    sweep, _ = _sweep(tmp_path)
+
+    with pytest.raises(ConfigSweepError):
+        sweep.run(solution_dir=sol_dir, base_config=base_config,
+                  points=[ConfigPoint("p", {})], hypothesis="h")
+
+
+def test_sweep_cli_parses_single_key_and_multi_key_points():
+    """--sweep k=a,b,c is one point per value; --point label:k=v,k=v is one
+    explicitly labelled point. Values keep their JSON type, so a config gets
+    the number 0.05 rather than the string "0.05"."""
+    from scripts.config_sweep import parse_points
+
+    points = parse_points(["lambda_bpr=0.05,0.1,0.2"], ['wide:k=32,loss="bpr"'])
+
+    assert [p.label for p in points] == [
+        "lambda_bpr=0.05", "lambda_bpr=0.1", "lambda_bpr=0.2", "wide",
+    ]
+    assert points[0].overrides == {"lambda_bpr": 0.05}      # float, not "0.05"
+    assert points[3].overrides == {"k": 32, "loss": "bpr"}
+
+
+def test_sweep_cli_rejects_malformed_point_specs():
+    from agent.sweep import ConfigSweepError
+    from scripts.config_sweep import parse_points
+
+    for sweeps, points in ((["nokey"], []), ([], ["nolabel"]), ([], ["label:novalue"])):
+        with pytest.raises(ConfigSweepError):
+            parse_points(sweeps, points)

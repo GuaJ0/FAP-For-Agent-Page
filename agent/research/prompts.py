@@ -26,6 +26,14 @@ SCIENTIFIC RULES
     earlier runs: entries with verdict "dont" are those measured dead ends,
     each with the observed delta and the Evaluator's reason. Treat them as
     binding even when this run's own iteration history is empty.
+  - Weigh a "dont" by its `confidence` field, which says how much of the
+    direction was actually measured. "well_tested" means three or more real
+    attempts across the stated `coverage` range all failed: treat it as
+    closed. "tested" means two. "inconclusive" means a SINGLE attempt lost,
+    which rules out that one implementation, not the mechanism -- such a
+    direction may be reproposed, but the proposal must say what it is doing
+    differently from the variant named in `variants`. `attempts` and `deltas`
+    show how many measurements stand behind the entry and how they spread.
   - `prior_findings` entries with verdict "do" are directions that previously
     beat their incumbent. Prefer building on one of those over an untested
     direction, unless the context shows it has since been superseded.

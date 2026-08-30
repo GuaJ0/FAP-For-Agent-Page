@@ -54,6 +54,7 @@ from agent.executor import Executor  # noqa: E402
 from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
 from agent.research import LLMResearchAgent, OfflineResearchAgent  # noqa: E402
+from agent.research.offline import OfflineBacklogExhausted  # noqa: E402
 from agent.research.findings import DEFAULT_FINDINGS_PATH, FindingsLedger  # noqa: E402
 from agent.registry import CheckpointRegistry  # noqa: E402
 from agent.state import StateStore  # noqa: E402
@@ -97,7 +98,17 @@ def build_config(root: Path, args) -> Config:
     # straight through and means exactly what it says. It used to need a +1.
     return Config(
         convergence=ConvergenceConfig(max_iterations=args.max_iterations, max_wall_s=args.max_wall_s),
-        retry=RetryConfig(),
+        # Overridable so an exploration pass can buy more repair attempts and a
+        # longer per-idea backstop than the graded run, without editing the
+        # defaults in agent/config.py that the graded run relies on.
+        # getattr, not args.x: build_config is shared with scripts/config_sweep.py,
+        # which runs no retry loop and so defines neither flag. A caller that
+        # does not care about the repair policy gets exactly RetryConfig's
+        # defaults rather than having to declare arguments it never uses.
+        retry=RetryConfig(
+            max_fix_attempts=getattr(args, "max_fix_attempts", RetryConfig.max_fix_attempts),
+            idea_time_backstop_s=getattr(args, "idea_backstop_s", RetryConfig.idea_time_backstop_s),
+        ),
         executor=ExecutorConfig(per_run_timeout_s=args.timeout_s),
         seeding=SeedingConfig(max_seeds=args.seeds, min_seeds=1),
         paths=Paths(
@@ -160,6 +171,17 @@ def _main() -> int:
                          "empty, so the first result becomes the incumbent whatever it scores.")
     ap.add_argument("--max-wall-s", type=float, default=6 * 3600.0)
     ap.add_argument("--timeout-s", type=float, default=900.0)
+    # RetryConfig overrides. Defaults mirror agent/config.RetryConfig exactly, so
+    # omitting both flags reproduces the graded run's policy byte for byte.
+    ap.add_argument("--max-fix-attempts", type=int, default=RetryConfig.max_fix_attempts,
+                    help="tier-1 repair attempts on one idea before abandoning it. Raise for an "
+                         "exploration pass so a complex idea is not abandoned over a fixable bug.")
+    ap.add_argument("--idea-backstop-s", type=float, default=RetryConfig.idea_time_backstop_s,
+                    help="abandon an idea past this wall time regardless of attempt count.")
+    ap.add_argument("--findings-path", default=None,
+                    help="cross-run Do/Don't ledger to write. Defaults to the committed "
+                         "agent/research/findings.jsonl. Point this at a scratch file to keep an "
+                         "exploration pass out of the ledger the graded run reads.")
     args = ap.parse_args()
 
     if args.offline and args.live_research:
@@ -216,9 +238,12 @@ def _main() -> int:
     evaluator = FakeEvaluatorAgent() if args.offline else LLMEvaluatorAgent(
         llm=client, usage_log_path=cfg.paths.logs_dir / "evaluator_usage.jsonl",
     )
-    # Cross-run Do/Don't ledger. Deliberately NOT under --root: a reset here
-    # archives logs/ wholesale, and this has to outlive that.
-    findings = FindingsLedger(DEFAULT_FINDINGS_PATH)
+    # Cross-run Do/Don't ledger. Deliberately NOT under --root by default: a
+    # reset here archives logs/ wholesale, and this has to outlive that. An
+    # exploration pass overrides it so its findings can be reviewed before they
+    # reach the ledger the graded run actually reads.
+    findings = FindingsLedger(Path(args.findings_path) if args.findings_path else DEFAULT_FINDINGS_PATH)
+    print(f"[findings] ledger: {findings.path}")
 
     orc = Orchestrator(
         research=research,
@@ -256,7 +281,15 @@ def _main() -> int:
         print(f"[baseline] iteration 0: valid primary={agg.primary_mean:.4f} "
               f"(std {agg.primary_std:.4f}) over {agg.n_seeds} seed(s) -- this is the bar")
 
-    history = orc.run()
+    try:
+        history = orc.run()
+    except OfflineBacklogExhausted as e:
+        # The deterministic backlog running out is the natural end of an
+        # exploration pass, not a failure: every idea it holds has been tried.
+        # Records already written are durable, so re-read rather than lose them.
+        print(f"\n[research] offline backlog exhausted -- stopping cleanly: {e}")
+        history = orc.run_log.read_all()
+
     print(f"\n=== finished in {time.time() - t0:.0f}s, {len(history)} record(s) ===")
     for r in history:
         print(f"\niteration {r.iteration}  status={r.status.value}  "

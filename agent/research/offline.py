@@ -388,6 +388,473 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         risks=("Extra capacity may overfit the available training rows.", "Dependency and runtime cost may exceed payoff."),
     ),
+    # ------------------------------------------------------------------
+    # VARIANTS OF THE STRUCTURALLY COMPLEX DIRECTIONS (ranks 7-13).
+    #
+    # A single Coding Agent generation at one setting cannot settle a complex
+    # mechanism: if it loses, the ledger cannot tell "the mechanism is wrong"
+    # from "the one implementation we happened to get was weak". These entries
+    # give each complex direction 2-3 deliberately different attempts, the way
+    # HYBRID-BPR and GAUC-WEIGHTED-BPR already do for the ranking-loss
+    # direction, so findings.py can record a confidence tier that reflects how
+    # much of the direction was actually measured.
+    #
+    # Ranks start at 7 so entries 1-6 keep the exact ordering the graded run
+    # already depends on -- these are additions, not a reprioritisation.
+    #
+    # They share a findings family with their sibling (see DIRECTION_FAMILIES
+    # in agent/research/findings.py), so their results roll up into one entry
+    # per direction rather than several unrelated one-shot verdicts.
+    # ------------------------------------------------------------------
+    BacklogEntry(
+        rank=7,
+        key="DIN-LONG-HISTORY",
+        expected_wall_s=2400.0,
+        minimum_remaining_iterations=2,
+        title="Candidate-conditioned long behavior history",
+        hypothesis=(
+            "Extend the candidate-conditioned behavior summary to a long history window so that "
+            "stable long-run preference, not only the most recent handful of impressions, is "
+            "available to the scorer."
+        ),
+        mechanism=(
+            "A short window can only express transient intent. If recent-history conditioning fails at "
+            "20-50 impressions the cause may be window length rather than the mechanism, since KuaiRand "
+            "users have hundreds to thousands of training interactions that a short window discards."
+        ),
+        citation_id="zhou2018din",
+        claim_id="candidate-conditioned-interest",
+        evidence_application=(
+            "DIN's candidate-adaptive interest representation is applied over a substantially longer "
+            "window, testing history length as the variable while the conditioning mechanism is fixed."
+        ),
+        target_components=("training-data history construction", "candidate-conditioned interaction features"),
+        steps=(
+            "Reuse the candidate-conditioned history construction, changing only the window length and interest width.",
+            "Build each user's chronological history from training rows only, excluding the current impression.",
+            "Select on validation primary and report cost against the short-window variant.",
+        ),
+        hyperparameters={"history_length": [100, 200], "interest_dimension": [32]},
+        must_hold_constant=("label", "validation split", "base ID features", "selection metric", "conditioning mechanism"),
+        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        hardware="CPU-capable; GPU optional for faster sequence batching",
+        runtime_impact="Approximately 3x-4x incumbent time; the longest sequence variant",
+        complexity="high",
+        feasibility_notes=(
+            "Deliberately the most expensive sequence variant. Run it only when the short-window "
+            "attempt has already produced a real measurement to compare against."
+        ),
+        secondary_effects={
+            "GAUC": "Expected to increase over the short window if stable preference dominates transient intent.",
+            "nDCG@5": "Expected to increase if longer context sharpens the top of each list.",
+        },
+        ablation="Compare against the short-window variant with the conditioning mechanism held identical.",
+        failure_interpretation=(
+            "If the long window also loses, window length is not what limited the short-window attempt, "
+            "which materially strengthens a negative verdict on candidate-conditioned history."
+        ),
+        risks=(
+            "Longer histories increase preprocessing cost and the chance of an incorrect temporal join.",
+            "Very long windows may dilute the recent signal they are meant to extend.",
+        ),
+    ),
+    BacklogEntry(
+        rank=8,
+        key="DIN-MEAN-POOL",
+        expected_wall_s=1500.0,
+        minimum_remaining_iterations=1,
+        title="Unconditioned mean-pooled behavior history",
+        hypothesis=(
+            "Summarize each user's recent training interactions by unconditioned mean pooling, so that "
+            "the value of having history at all is separated from the value of conditioning it on the candidate."
+        ),
+        mechanism=(
+            "Candidate conditioning and history availability are two different claims bundled into one "
+            "experiment. Mean pooling supplies the same history with the attention mechanism removed, "
+            "which is the control that makes either result attributable."
+        ),
+        citation_id="zhou2018din",
+        claim_id="candidate-conditioned-interest",
+        evidence_application=(
+            "DIN's contribution is specifically the candidate-adaptive weighting over history; this entry "
+            "is its control, isolating that contribution from the presence of history features."
+        ),
+        target_components=("training-data history construction", "pooled history features"),
+        steps=(
+            "Build the same chronological training-only history as the conditioned variants.",
+            "Mean-pool the recent item embeddings with no candidate-dependent weighting.",
+            "Concatenate the pooled summary with incumbent features and select on validation primary.",
+        ),
+        hyperparameters={"history_length": [50], "pooling": ["mean"], "interest_dimension": [16]},
+        must_hold_constant=("label", "validation split", "base ID features", "selection metric", "history window"),
+        dependencies=(),
+        hardware="Existing CPU environment",
+        runtime_impact="Approximately 1.5x-2x incumbent time; the cheapest sequence variant",
+        complexity="medium",
+        feasibility_notes=(
+            "Cheapest of the three sequence attempts and the one worth keeping if budget tightens, "
+            "because it is the control the other two are interpreted against."
+        ),
+        secondary_effects={
+            "GAUC": "Expected to increase modestly if history matters at all, regardless of conditioning.",
+            "nDCG@5": "Expected to move less than the conditioned variants if conditioning is what pays.",
+        },
+        ablation="Compare directly against the candidate-conditioned variant at the same history length.",
+        failure_interpretation=(
+            "If mean pooling helps and conditioning does not, the payoff is history availability, not "
+            "attention. If neither helps, behavior history is weak under the official split."
+        ),
+        risks=(
+            "Mean pooling may wash out the recent signal that makes history useful.",
+            "A weak control invites over-reading a small difference between the two variants.",
+        ),
+    ),
+    BacklogEntry(
+        rank=9,
+        key="MULTITASK-ALL-ENGAGEMENT",
+        expected_wall_s=2400.0,
+        minimum_remaining_iterations=2,
+        title="Broad multi-task engagement supervision at low weight",
+        hypothesis=(
+            "Predict the full set of observed engagement labels as auxiliary tasks at a low shared weight, "
+            "so that sparse but diverse supervision regularizes the primary long_view representation."
+        ),
+        mechanism=(
+            "A two-task setup may simply have too little auxiliary signal to regularize anything. Widening "
+            "the task set while lowering the per-task weight tests breadth of supervision rather than its strength."
+        ),
+        citation_id="ma2018esmm",
+        claim_id="shared-representation-transfer",
+        evidence_application=(
+            "ESMM's feature-representation transfer across related user-response objectives is applied at "
+            "greater task breadth; the auxiliary heads remain regularizers, not conversion-rate estimators."
+        ),
+        target_components=("data loader for auxiliary training labels", "shared representation", "task heads"),
+        steps=(
+            "Load all five observed engagement labels for training rows without changing official split boundaries.",
+            "Share the incumbent representation and add one lightweight head per auxiliary task.",
+            "Use a single low weight shared across auxiliary heads and select checkpoints only on long_view validation primary.",
+        ),
+        hyperparameters={
+            "auxiliary_tasks": [["is_click", "is_like", "is_follow", "is_comment", "is_forward"]],
+            "lambda_aux": [0.02],
+        },
+        must_hold_constant=("primary label", "official split", "base features", "primary checkpoint metric"),
+        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        hardware="CPU-capable; GPU optional",
+        runtime_impact="Approximately 2x-3x incumbent time; five heads over a shared trunk",
+        complexity="high",
+        feasibility_notes=(
+            "The rarest labels (is_follow, is_comment, is_forward) are extremely sparse; the low shared "
+            "weight is what keeps their gradient noise from dominating."
+        ),
+        secondary_effects={
+            "GAUC": "May increase if diverse engagement sharpens the shared user-item representation.",
+            "nDCG@5": "May increase if the regularization reduces overfitting on the head of each list.",
+        },
+        ablation="Compare against the two-task variant and against lambda_aux=0 at identical architecture.",
+        failure_interpretation=(
+            "If broad low-weight supervision also loses, the limitation is the transfer itself rather than "
+            "how many auxiliary labels were supplied."
+        ),
+        risks=(
+            "Very sparse labels can contribute mostly gradient noise.",
+            "Five heads increase the chance of negative transfer onto the primary task.",
+        ),
+    ),
+    BacklogEntry(
+        rank=10,
+        key="MULTITASK-CLICK-HEAVY",
+        expected_wall_s=1800.0,
+        minimum_remaining_iterations=1,
+        title="Single dense auxiliary task at high weight",
+        hypothesis=(
+            "Predict is_click alone as an auxiliary task at a substantially higher weight, testing whether "
+            "one dense, closely-related label transfers more than several sparse ones."
+        ),
+        mechanism=(
+            "is_click is by far the densest engagement label and the most semantically adjacent to long_view. "
+            "If auxiliary supervision helps at all, the strongest effect should appear here, and a low weight "
+            "may simply have been too small to produce a measurable one."
+        ),
+        citation_id="ma2018esmm",
+        claim_id="shared-representation-transfer",
+        evidence_application=(
+            "ESMM's transfer argument is strongest between closely related, densely observed responses; this "
+            "entry tests that regime directly rather than diluting it across sparse labels."
+        ),
+        target_components=("data loader for auxiliary training labels", "shared representation", "task heads"),
+        steps=(
+            "Load only is_click for training rows without changing official split boundaries.",
+            "Share the incumbent representation and add one auxiliary head.",
+            "Sweep the auxiliary weight upward while selecting checkpoints only on long_view validation primary.",
+        ),
+        hyperparameters={"auxiliary_tasks": [["is_click"]], "lambda_aux": [0.3, 0.5]},
+        must_hold_constant=("primary label", "official split", "base features", "primary checkpoint metric"),
+        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        hardware="CPU-capable; GPU optional",
+        runtime_impact="Approximately 1.5x-2x incumbent time; one head over a shared trunk",
+        complexity="medium",
+        feasibility_notes=(
+            "The cheapest multi-task attempt and the one that spans the widest weight range, which is why "
+            "it is the variant to keep if only one multi-task round is affordable."
+        ),
+        secondary_effects={
+            "GAUC": "May increase if click behavior shares ordering structure with long_view.",
+            "nDCG@5": "May decrease if a high weight pulls the representation toward click rather than long view.",
+        },
+        ablation="Compare lambda_aux in {0, 0.3, 0.5} at identical architecture and seeds.",
+        failure_interpretation=(
+            "If the densest, most related label at high weight does not transfer, auxiliary engagement "
+            "supervision is unlikely to help long_view ranking at any task set or weight."
+        ),
+        risks=(
+            "A high auxiliary weight can dominate the primary objective.",
+            "Optimizing toward click may actively mis-order long_view positives.",
+        ),
+    ),
+    BacklogEntry(
+        rank=11,
+        key="WATCHTIME-CENSORED",
+        expected_wall_s=2100.0,
+        minimum_remaining_iterations=2,
+        title="Censored one-sided watch-time objective",
+        hypothesis=(
+            "Treat watch time as right-censored when a video is watched to completion and fit a one-sided "
+            "auxiliary loss, so completed views are not penalized for a watch time they could not exceed."
+        ),
+        mechanism=(
+            "Watch time is truncated by video duration: a fully-watched short video records a small watch time "
+            "that squared error reads as weak engagement. A one-sided loss penalizes under-prediction only on "
+            "censored examples, which is the modelling correction plain regression omits."
+        ),
+        citation_id="covington2016youtube",
+        claim_id="ranking-objective-and-watch-time",
+        evidence_application=(
+            "The YouTube ranking work motivates expected watch time as an engagement signal; this entry adds "
+            "the censoring correction that a plain regression target ignores."
+        ),
+        target_components=("training data targets", "censoring indicator", "auxiliary one-sided loss"),
+        steps=(
+            "Derive a watch-time target and a censoring indicator (play_time_ms at or above duration_ms) from training rows only.",
+            "Apply squared error on uncensored rows and a one-sided penalty on censored rows for under-prediction only.",
+            "Tune a single auxiliary weight and retain validation-primary checkpoint selection.",
+        ),
+        hyperparameters={"censoring_threshold_ratio": [0.95], "lambda_watch": [0.05, 0.1]},
+        must_hold_constant=("primary label", "official split", "base features", "primary selection metric"),
+        dependencies=("Open-source autograd library if the incumbent implementation requires it",),
+        hardware="CPU-capable; GPU optional",
+        runtime_impact="Approximately 1.5x-2x incumbent time",
+        complexity="high",
+        feasibility_notes=(
+            "The censoring indicator must be derived from duration, not assumed; an incorrect threshold "
+            "silently turns this back into plain regression."
+        ),
+        secondary_effects={
+            "GAUC": "May increase if correcting censoring stops short completed videos from being read as weak engagement.",
+            "nDCG@5": "May increase if completed short videos are promoted toward the top five.",
+        },
+        ablation="Compare the one-sided censored loss against plain squared error on the same target and weight.",
+        failure_interpretation=(
+            "If the censored loss does not beat plain regression, censoring is not what limited the watch-time "
+            "signal, and the remaining explanation is the target itself rather than its loss."
+        ),
+        risks=(
+            "The censoring threshold is a modelling choice that can be set wrong.",
+            "A one-sided loss is easy to implement with the inequality reversed, which would silently invert the correction.",
+        ),
+    ),
+    BacklogEntry(
+        rank=12,
+        key="WATCHTIME-RATIO",
+        expected_wall_s=1500.0,
+        minimum_remaining_iterations=1,
+        title="Duration-normalized watch-ratio auxiliary objective",
+        hypothesis=(
+            "Use completion ratio -- play time divided by video duration -- as the auxiliary target, so "
+            "engagement intensity is comparable across videos of very different lengths."
+        ),
+        mechanism=(
+            "Raw watch time confounds engagement with duration: a long video accumulates more watch time at "
+            "equal interest. Normalizing by duration removes that confound and sidesteps censoring entirely, "
+            "since the ratio is naturally bounded at completion."
+        ),
+        citation_id="covington2016youtube",
+        claim_id="ranking-objective-and-watch-time",
+        evidence_application=(
+            "The same watch-time engagement signal is used, with duration normalization substituted for raw "
+            "magnitude; this isolates the target's scale rather than its presence."
+        ),
+        target_components=("training data targets", "auxiliary regression head", "joint objective"),
+        steps=(
+            "Derive a clipped completion ratio from play_time_ms and duration_ms on training rows only.",
+            "Add a lightweight auxiliary head sharing the incumbent representation.",
+            "Tune a single auxiliary weight and retain validation-primary checkpoint selection.",
+        ),
+        hyperparameters={"watch_time_transform": ["completion_ratio_clipped"], "lambda_watch": [0.05, 0.2]},
+        must_hold_constant=("primary label", "official split", "base features", "primary selection metric"),
+        dependencies=("Open-source autograd library if the incumbent implementation requires it",),
+        hardware="CPU-capable; GPU optional",
+        runtime_impact="Approximately 1.3x-1.8x incumbent time; the cheapest watch-time variant",
+        complexity="medium",
+        feasibility_notes=(
+            "Structurally the simplest of the three watch-time attempts: a bounded target needing no "
+            "censoring machinery, which makes it the one to keep under a tight budget."
+        ),
+        secondary_effects={
+            "GAUC": "May increase if duration-normalized engagement separates candidates within a user.",
+            "nDCG@5": "May increase if short fully-watched videos are ranked more highly.",
+        },
+        ablation="Compare completion ratio against the raw log1p-capped target at matched auxiliary weight.",
+        failure_interpretation=(
+            "If normalization does not beat the raw target, duration confounding is not what limited the "
+            "watch-time signal."
+        ),
+        risks=(
+            "Rows with missing or zero duration must be excluded rather than silently producing infinite ratios.",
+            "Clipping at completion discards rewatch behavior.",
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # THE TWO DIRECTIONS FROM solution/ideas.md THAT THE BACKLOG NEVER COVERED
+    # (ideas.md "Unexplored directions" items 6 and 7). Ranked last only
+    # because ranks 1-12 were already assigned; both are cheap relative to the
+    # sequence and multi-task work above.
+    #
+    # DOMAIN JUDGMENT CALLS ARE FLAGGED IN docs/exploration-campaign.md -- the
+    # time windows, the decay half-lives, the censoring threshold and the
+    # diagnostic-only framing below are proposals for review, not settled
+    # science.
+    # ------------------------------------------------------------------
+    BacklogEntry(
+        rank=13,
+        key="TIME-DRIFT",
+        expected_wall_s=1200.0,
+        minimum_remaining_iterations=1,
+        title="Recency-weighted training with time-of-day interaction features",
+        hypothesis=(
+            "Down-weight older training impressions by recency and add a time-of-day by duration-bucket "
+            "interaction, so the model reflects the period the validation split is drawn from rather than "
+            "averaging uniformly over the whole training window."
+        ),
+        mechanism=(
+            "Training treats every logged impression as equally representative, but the split is chronological "
+            "and user interests and item popularity both move over the window. Recency weighting corrects the "
+            "distribution the model is fit to, while a time-of-day cross supplies within-user temporal signal. "
+            "The cross matters specifically because a term constant across one user's impressions cannot "
+            "reorder them: crossing time against an item-side bucket is what makes the feature able to rank."
+        ),
+        citation_id="covington2016youtube",
+        claim_id="example-age-freshness",
+        evidence_application=(
+            "The example-age treatment motivates representing when an impression occurred rather than "
+            "averaging over the training window; here it is applied as sample weighting plus an explicit "
+            "time-of-day interaction."
+        ),
+        target_components=("training sample weights", "time-derived interaction features"),
+        steps=(
+            "Derive each training row's age from its date relative to the latest training date.",
+            "Weight the training loss by exp(-age_days / half_life), with the no-weighting setting kept as the control.",
+            "Add an hour-of-day bucket crossed with dur_bucket as an interaction feature, never as a user-side term alone.",
+            "Select on validation primary with all other settings held at incumbent values.",
+        ),
+        hyperparameters={
+            "recency_half_life_days": [7, 21, None],
+            "hour_buckets": [8],
+            "time_cross": ["hour_bucket_x_dur_bucket"],
+        },
+        must_hold_constant=("label", "official split", "model capacity", "optimizer", "selection metric"),
+        dependencies=(),
+        hardware="Existing CPU environment",
+        runtime_impact="Near-neutral: one extra feature field and a per-row weight",
+        complexity="low",
+        feasibility_notes=(
+            "Among the cheapest untried directions -- no new dependency and no architecture change. "
+            "half_life=None is the control that separates the weighting from the added feature."
+        ),
+        secondary_effects={
+            "GAUC": "May increase if recent behavior is more representative of the validation period.",
+            "nDCG@5": "May increase if time-of-day interacts with which durations users complete.",
+        },
+        ablation=(
+            "Three cells: weighting only, time cross only, and both, each against the unchanged incumbent "
+            "on the same seeds."
+        ),
+        failure_interpretation=(
+            "If neither recency weighting nor the time cross helps, the training window is temporally "
+            "homogeneous enough that drift is not a limiting factor under the official split."
+        ),
+        risks=(
+            "Aggressive down-weighting discards training signal and can raise variance on a 1.14M-row set.",
+            "A time feature used only as a user-side term contributes exactly zero to within-user ranking.",
+            "Date handling must not let a validation-period row influence training weights.",
+        ),
+    ),
+    BacklogEntry(
+        rank=14,
+        key="LOG-RANDOM-DIAGNOSTIC",
+        expected_wall_s=900.0,
+        minimum_remaining_iterations=1,
+        title="Unbiased overfitting diagnostic on the randomized-exposure log",
+        hypothesis=(
+            "Report ranking quality on the randomized-exposure log alongside the ordinary validation metric, "
+            "to establish whether incumbent gains reflect genuine ranking quality or fitting to the biased "
+            "exposure policy that produced the training log."
+        ),
+        mechanism=(
+            "Training and validation impressions are both drawn from the deployed recommender's exposure "
+            "policy, so both share its bias; a model can improve on them by learning that policy rather than "
+            "user preference. Impressions logged under randomized exposure do not share that bias, which makes "
+            "them a check the ordinary split structurally cannot provide."
+        ),
+        citation_id="schnabel2016propensity",
+        claim_id="biased-logging-biases-evaluation",
+        evidence_application=(
+            "The result that non-uniform exposure biases evaluation, and that randomized-exposure data gives "
+            "an unbiased sample, is applied as a read-only diagnostic rather than as a change of objective."
+        ),
+        target_components=("evaluation reporting", "randomized-exposure diagnostic split"),
+        steps=(
+            "Load the randomized-exposure log strictly as an additional evaluation set, never as training data.",
+            "Score the unchanged incumbent model on it and report GAUC and nDCG@5 as commentary.",
+            "Leave the training objective, the checkpoint selection metric and the reported validation primary untouched.",
+        ),
+        hyperparameters={"diagnostic_split": ["log_random_4_22_to_5_08_pure"], "report_only": [True]},
+        must_hold_constant=(
+            "training data", "training objective", "model capacity",
+            "official split", "validation primary as the sole selection metric",
+        ),
+        dependencies=(),
+        hardware="Existing CPU environment",
+        runtime_impact="Additive scoring pass only; no change to training time",
+        complexity="low",
+        feasibility_notes=(
+            "DATA BOUNDARY: the dataset profile's allowed_data_boundary lists public_metadata, train and "
+            "validation, and does not list the randomized-exposure log. Confirm this file is in bounds "
+            "before running this entry. Read-only use for diagnosis is the narrowest possible framing, "
+            "but it is still a file the declared boundary does not name."
+        ),
+        secondary_effects={
+            "GAUC": "Unchanged by construction -- the model and its selection are not modified.",
+            "nDCG@5": "Unchanged by construction.",
+        },
+        ablation=(
+            "Compare the unbiased diagnostic against the ordinary validation metric across the accepted "
+            "iterations to date; a widening gap indicates fitting to exposure bias."
+        ),
+        failure_interpretation=(
+            "This entry cannot fail on validation primary because it changes no model. A close agreement "
+            "between the two metrics means exposure bias is not distorting the incumbent's gains; a large "
+            "gap means later ranking gains should be treated with suspicion."
+        ),
+        risks=(
+            "MEASURES NOTHING ON THE PRIMARY METRIC BY DESIGN: expect a delta of approximately zero, which "
+            "an Evaluator will read as REVERT. That verdict is about the absence of a modelling change, not "
+            "about the direction being a dead end -- see the README note before letting it reach the ledger.",
+            "The randomized log covers a fixed date range and may not be comparable to the validation period.",
+            "Its user and video coverage differs from the training log, so absolute numbers are not directly comparable.",
+        ),
+    ),
 )
 
 
