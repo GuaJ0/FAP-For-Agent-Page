@@ -245,7 +245,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"history_length": [20, 50], "interest_dimension": [16]},
         must_hold_constant=("label", "validation split", "base ID features", "selection metric"),
-        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional for faster sequence batching",
         runtime_impact="Approximately 2x-3x incumbent time, including history preprocessing",
         complexity="high",
@@ -292,7 +297,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"auxiliary_tasks": [["is_click", "is_like"]], "lambda_aux": [0.05, 0.1]},
         must_hold_constant=("primary label", "official split", "base features", "primary checkpoint metric"),
-        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional",
         runtime_impact="Approximately 1.5x-2.5x incumbent time depending on the shared model",
         complexity="high",
@@ -336,7 +346,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"watch_time_transform": ["log1p_capped"], "lambda_watch": [0.05, 0.1]},
         must_hold_constant=("primary label", "official split", "base features", "primary selection metric"),
-        dependencies=("Open-source autograd library if the incumbent implementation requires it",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional",
         runtime_impact="Approximately 1.3x-2x incumbent time",
         complexity="medium",
@@ -380,7 +395,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"hidden_layers": [[64, 32]], "dropout": [0.1], "embedding_dim": [16]},
         must_hold_constant=("feature set", "embedding dimension", "objective", "checkpoint selection"),
-        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable but GPU preferred",
         runtime_impact="Approximately 2x-4x incumbent time",
         complexity="high",
@@ -443,7 +463,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"history_length": [100, 200], "interest_dimension": [32]},
         must_hold_constant=("label", "validation split", "base ID features", "selection metric", "conditioning mechanism"),
-        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional for faster sequence batching",
         runtime_impact="Approximately 3x-4x incumbent time; the longest sequence variant",
         complexity="high",
@@ -547,7 +572,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
             "lambda_aux": [0.02],
         },
         must_hold_constant=("primary label", "official split", "base features", "primary checkpoint metric"),
-        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional",
         runtime_impact="Approximately 2x-3x incumbent time; five heads over a shared trunk",
         complexity="high",
@@ -598,7 +628,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"auxiliary_tasks": [["is_click"]], "lambda_aux": [0.3, 0.5]},
         must_hold_constant=("primary label", "official split", "base features", "primary checkpoint metric"),
-        dependencies=("PyTorch or another open-source autograd library if justified by the Coding owner",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional",
         runtime_impact="Approximately 1.5x-2x incumbent time; one head over a shared trunk",
         complexity="medium",
@@ -649,7 +684,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"censoring_threshold_ratio": [0.95], "lambda_watch": [0.05, 0.1]},
         must_hold_constant=("primary label", "official split", "base features", "primary selection metric"),
-        dependencies=("Open-source autograd library if the incumbent implementation requires it",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional",
         runtime_impact="Approximately 1.5x-2x incumbent time",
         complexity="high",
@@ -700,7 +740,12 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         ),
         hyperparameters={"watch_time_transform": ["completion_ratio_clipped"], "lambda_watch": [0.05, 0.2]},
         must_hold_constant=("primary label", "official split", "base features", "primary selection metric"),
-        dependencies=("Open-source autograd library if the incumbent implementation requires it",),
+        dependencies=(
+            "PyTorch, for the gradients this needs. External open-source libraries are permitted "
+            "(docs/coding-agent.md) and torch is installed and pinned in requirements.txt, so it may "
+            "be imported directly. Pin it to one thread with torch.set_num_threads(1) to stay inside "
+            "the single-core budget.",
+        ),
         hardware="CPU-capable; GPU optional",
         runtime_impact="Approximately 1.3x-1.8x incumbent time; the cheapest watch-time variant",
         complexity="medium",
@@ -761,12 +806,23 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         target_components=("training sample weights", "time-derived interaction features"),
         steps=(
             "Derive each training row's age from its date relative to the latest training date.",
-            "Weight the training loss by exp(-age_days / half_life), with the no-weighting setting kept as the control.",
+            "Weight the training loss by 0.5 ** (age_days / recency_half_life_days) -- a true half-life, "
+            "so a row exactly one half-life old counts half as much; null keeps the no-weighting control.",
             "Add an hour-of-day bucket crossed with dur_bucket as an interaction feature, never as a user-side term alone.",
             "Select on validation primary with all other settings held at incumbent values.",
         ),
         hyperparameters={
-            "recency_half_life_days": [7, 21, None],
+            # Fitted to the MEASURED training window, not a guess: the official
+            # train split (harness/data.py) declares 20220408-20220421 but the
+            # data holds no 04-08 rows, so it spans 13 days (1,141,112 rows).
+            # 3 days is roughly a quarter of that and retains ~19% of total
+            # sample weight -- a genuinely aggressive end. 14 days is one window
+            # length and retains ~67%. The previous [7, 21] pair was chosen
+            # before the window was known and bracketed it poorly: at a 21-day
+            # half-life the oldest row still keeps 67% of its weight, which is
+            # so close to the uniform control that the cell measured almost
+            # nothing.
+            "recency_half_life_days": [3, 14, None],
             "hour_buckets": [8],
             "time_cross": ["hour_bucket_x_dur_bucket"],
         },
@@ -792,7 +848,9 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
             "homogeneous enough that drift is not a limiting factor under the official split."
         ),
         risks=(
-            "Aggressive down-weighting discards training signal and can raise variance on a 1.14M-row set.",
+            "The training window is heavily front-loaded -- 63.6% of its rows fall in its first four days, "
+            "which are also its OLDEST -- so recency weighting down-weights most of the data: a 3-day "
+            "half-life retains only about 19% of total sample weight and can raise variance materially.",
             "A time feature used only as a user-side term contributes exactly zero to within-user ranking.",
             "Date handling must not let a validation-period row influence training weights.",
         ),
@@ -823,23 +881,36 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
         target_components=("evaluation reporting", "randomized-exposure diagnostic split"),
         steps=(
             "Load the randomized-exposure log strictly as an additional evaluation set, never as training data.",
-            "Score the unchanged incumbent model on it and report GAUC and nDCG@5 as commentary.",
+            "Keep ONLY rows dated 20220422-20220428. The file spans 20220422-20220508, and 20220429 onward "
+            "is the official held-out date range; those rows must never be read.",
+            "Score the unchanged incumbent model on the retained rows and report GAUC and nDCG@5 as commentary.",
             "Leave the training objective, the checkpoint selection metric and the reported validation primary untouched.",
         ),
-        hyperparameters={"diagnostic_split": ["log_random_4_22_to_5_08_pure"], "report_only": [True]},
+        hyperparameters={
+            "diagnostic_split": ["log_random_4_22_to_5_08_pure"],
+            # The file is 1,186,059 rows spanning 20220422-20220508, but 897,721
+            # of them (75.5%) fall in the official test date range. Only the
+            # 288,338 rows inside the validation window are in bounds -- see the
+            # date_range below and the second implementation step.
+            "date_range": [[20220422, 20220428]],
+            "report_only": [True],
+        },
         must_hold_constant=(
             "training data", "training objective", "model capacity",
             "official split", "validation primary as the sole selection metric",
+            "the 20220422-20220428 date filter on the randomized-exposure log",
         ),
         dependencies=(),
         hardware="Existing CPU environment",
         runtime_impact="Additive scoring pass only; no change to training time",
         complexity="low",
         feasibility_notes=(
-            "DATA BOUNDARY: the dataset profile's allowed_data_boundary lists public_metadata, train and "
-            "validation, and does not list the randomized-exposure log. Confirm this file is in bounds "
-            "before running this entry. Read-only use for diagnosis is the narrowest possible framing, "
-            "but it is still a file the declared boundary does not name."
+            "DATA BOUNDARY: reviewed and accepted. The profile's allowed_data_boundary names only "
+            "public_metadata, train and validation, and the randomized-exposure log is not one of those "
+            "categories -- but read-only diagnostic use of it is the dataset's own documented purpose for "
+            "the file (solution/ideas.md, unexplored direction 7), and the entry is restricted to the "
+            "20220422-20220428 validation window so it never reads a test-period row. See the assumptions "
+            "list in agent/research/profiles/kuairand_pure.json and docs/exploration-campaign.md item 2."
         ),
         secondary_effects={
             "GAUC": "Unchanged by construction -- the model and its selection are not modified.",
@@ -858,7 +929,9 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
             "MEASURES NOTHING ON THE PRIMARY METRIC BY DESIGN: expect a delta of approximately zero, which "
             "an Evaluator will read as REVERT. That verdict is about the absence of a modelling change, not "
             "about the direction being a dead end -- see the README note before letting it reach the ledger.",
-            "The randomized log covers a fixed date range and may not be comparable to the validation period.",
+            "The randomized log spans 20220422-20220508 and 75.5% of it lies in the official held-out "
+            "date range; reading those rows would cross the split boundary, which is why the entry is "
+            "restricted to 20220422-20220428, the official validation window.",
             "Its user and video coverage differs from the training log, so absolute numbers are not directly comparable.",
         ),
     ),

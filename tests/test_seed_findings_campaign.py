@@ -137,3 +137,95 @@ def test_promote_runs_nothing(monkeypatch, tmp_path):
 
     assert _run(monkeypatch, "--promote", "--findings-path", str(scratch),
                 "--promote-into", str(tmp_path / "t.jsonl")) == 0
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic-only entries must never reach the committed ledger.
+#
+# LOG-RANDOM-DIAGNOSTIC changes no model: it scores the unchanged incumbent on
+# the randomized-exposure log and reports the number. Its delta on validation
+# primary is therefore zero by construction, which an Evaluator reads as
+# REVERT. Promoting that would plant a "Don't" against a direction nobody has
+# actually measured -- the precise false-Don't this campaign exists to prevent.
+# Excluded automatically at promote time rather than by remembering to delete
+# a line from the scratch ledger first.
+# ---------------------------------------------------------------------------
+
+def _dont(direction, variant, delta=-0.0004, iteration=1):
+    return Finding(
+        direction=direction, title=f"{direction} title", verdict=VERDICT_DONT,
+        decision="revert", delta_vs_incumbent=delta, validation_primary=0.6011,
+        why="no measurable change against the incumbent", iteration=iteration,
+        attempts=1, variants=(variant,), deltas=(delta,), coverage="report_only: [true]",
+    )
+
+
+def test_a_report_only_family_is_excluded_while_real_findings_promote(monkeypatch, tmp_path, capsys):
+    scratch, target = tmp_path / "scratch.jsonl", tmp_path / "target.jsonl"
+    source = FindingsLedger(scratch)
+    source.record(_dont("UNBIASED-VALIDATION", "OFFLINE-LOG-RANDOM-DIAGNOSTIC"))
+    source.record(_dont("DIN-SEQUENCE", "OFFLINE-DIN-SHORT-HISTORY", delta=-0.021, iteration=2))
+    assert len(source.load()) == 2, "both must be in the scratch ledger to start"
+
+    assert _run(monkeypatch, "--promote",
+                "--findings-path", str(scratch), "--promote-into", str(target)) == 0
+
+    promoted = {f.direction for f in FindingsLedger(target).load()}
+    assert promoted == {"DIN-SEQUENCE"}          # the real measurement came through
+    assert "UNBIASED-VALIDATION" not in promoted  # the diagnostic did not
+
+    out = capsys.readouterr().out
+    assert "SKIPPED" in out and "UNBIASED-VALIDATION" in out
+    assert "changes no model" in out              # and it says why
+
+
+def test_the_scratch_ledger_still_keeps_the_diagnostic_finding(monkeypatch, tmp_path):
+    """Excluded from promotion, not destroyed: the campaign's own record of
+    what the diagnostic reported stays auditable in the scratch ledger."""
+    scratch, target = tmp_path / "scratch.jsonl", tmp_path / "target.jsonl"
+    FindingsLedger(scratch).record(_dont("UNBIASED-VALIDATION", "OFFLINE-LOG-RANDOM-DIAGNOSTIC"))
+
+    _run(monkeypatch, "--promote", "--findings-path", str(scratch), "--promote-into", str(target))
+
+    assert [f.direction for f in FindingsLedger(scratch).load()] == ["UNBIASED-VALIDATION"]
+
+
+def test_report_only_families_are_detected_from_the_backlog_not_hardcoded():
+    """A future diagnostic entry must be excluded without anyone editing a list."""
+    import dataclasses
+
+    from agent.research.offline import DEFAULT_BACKLOG
+    from scripts import seed_findings as sf
+
+    assert sf._report_only_families() == {"UNBIASED-VALIDATION"}
+
+    diagnostic = dataclasses.replace(
+        next(e for e in DEFAULT_BACKLOG if e.key == "TIME-DRIFT"),
+        key="SOME-FUTURE-DIAGNOSTIC",
+        hyperparameters={"report_only": [True]},
+    )
+    with_new = DEFAULT_BACKLOG + (diagnostic,)
+    import unittest.mock as mock
+    with mock.patch.object(sf, "DEFAULT_BACKLOG", with_new):
+        assert "SOME-FUTURE-DIAGNOSTIC" in sf._report_only_families()
+
+
+def test_a_family_mixing_a_diagnostic_with_real_variants_still_promotes():
+    """`all`, not `any`: such a family has genuinely measured something, so its
+    verdict is real and must not be silently dropped."""
+    import dataclasses
+    import unittest.mock as mock
+
+    from agent.research.offline import DEFAULT_BACKLOG
+    from scripts import seed_findings as sf
+
+    # Give UNBIASED-VALIDATION a second member that does change the model.
+    real_variant = dataclasses.replace(
+        next(e for e in DEFAULT_BACKLOG if e.key == "LOG-RANDOM-DIAGNOSTIC"),
+        key="LOG-RANDOM-IPS-REWEIGHT",
+        hyperparameters={"lambda_ips": [0.1]},
+    )
+    with mock.patch.object(sf, "DEFAULT_BACKLOG", DEFAULT_BACKLOG + (real_variant,)), \
+         mock.patch.dict("agent.research.findings._FAMILY_BY_MEMBER",
+                         {"LOG-RANDOM-IPS-REWEIGHT": "UNBIASED-VALIDATION"}):
+        assert "UNBIASED-VALIDATION" not in sf._report_only_families()

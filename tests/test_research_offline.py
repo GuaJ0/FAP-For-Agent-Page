@@ -370,3 +370,81 @@ def test_every_backlog_entry_builds_and_validates_against_the_catalog():
     context = build_research_context([_baseline(iteration=0, primary=0.60)], agent.convergence)
     for entry in DEFAULT_BACKLOG:
         validate_proposal_citations(entry.build(context), agent.citation_source)
+
+
+def test_no_backlog_entry_trips_the_validation_only_guard():
+    """Every entry's handoff text ends up inside a ResearchContext, which is
+    scanned fail-closed before any prompt is built. An entry that merely
+    DESCRIBES a split boundary ("... lies in the held-out date range") reads as
+    leakage to a substring scanner and takes the whole run down at propose()
+    time -- so the wording is part of the contract, not just prose."""
+    from agent.research.agent import _assert_validation_only_context
+
+    agent = OfflineResearchAgent(convergence=ConvergenceConfig(max_iterations=50))
+    context = build_research_context([], agent.convergence)
+    for entry in DEFAULT_BACKLOG:
+        history = [_concluded_from_idea(
+            1, Idea(entry.build(context).to_handoff_text(), None))]
+        # Must not raise for any entry.
+        _assert_validation_only_context(
+            build_research_context(history, agent.convergence))
+
+
+def test_the_randomized_exposure_diagnostic_never_reads_a_held_out_row():
+    """log_random spans 20220422-20220508, but harness/data.py puts 20220429
+    onward in the held-out split. 75.5% of that file is therefore out of
+    bounds, and the entry must pin the date filter rather than leave scoping to
+    whatever the Coding Agent infers from the filename."""
+    entry = _entry("LOG-RANDOM-DIAGNOSTIC")
+
+    assert entry.hyperparameters["date_range"] == [[20220422, 20220428]]
+    # The filter has to be stated where an implementer will actually read it.
+    assert any("20220422-20220428" in step for step in entry.steps)
+    assert any("date filter" in item for item in entry.must_hold_constant)
+
+
+def test_time_drift_half_lives_bracket_the_real_training_window():
+    """The official train split is 20220408-20220421 and the data holds no
+    04-08 rows, so the window is 13 days. The grid has to straddle that: one
+    value well inside it and one at least its length, plus the null control.
+    A half-life far above the window is nearly indistinguishable from no
+    weighting at all and measures almost nothing."""
+    window_days = 13
+    grid = _entry("TIME-DRIFT").hyperparameters["recency_half_life_days"]
+
+    assert None in grid, "the no-weighting control must survive"
+    values = sorted(v for v in grid if v is not None)
+    assert len(values) >= 2
+    assert values[0] <= window_days / 3, "no genuinely aggressive end"
+    assert values[-1] >= window_days * 0.9, "no mild end at or above the window"
+    # And the decay form must match the field's name, or the values mislead.
+    assert any("0.5 **" in step for step in _entry("TIME-DRIFT").steps)
+
+
+def test_entries_may_propose_an_external_library_but_must_not_assume_one():
+    """External libraries are permitted (docs/coding-agent.md) -- this used to
+    assert the opposite, under the numpy-only sandbox.
+
+    What still has to hold is the provisioning rule: a solution may rely on a
+    dependency only once it is actually installed. So an entry naming a library
+    has to be honest about whether it is available, or it hands the Coding Agent
+    an instruction the static check will reject and burns a repair cycle.
+    """
+    from agent.coding.agent import FORBIDDEN_IMPORTS, module_available
+
+    for entry in DEFAULT_BACKLOG:
+        for dep in entry.dependencies:
+            lowered = dep.lower()
+            for lib in FORBIDDEN_IMPORTS:
+                assert lib not in lowered, (
+                    f"{entry.key} names {lib!r}, which is a sandbox rule and refused "
+                    f"however the environment is provisioned: {dep!r}"
+                )
+            # If it names a library that is absent, it must say so rather than
+            # instructing the Coding Agent to import it.
+            for lib in ("torch", "jax", "tensorflow"):
+                if lib in lowered and not module_available(lib):
+                    assert any(w in lowered for w in ("not installed", "no autograd", "once installed")), (
+                        f"{entry.key} names {lib!r}, which is not installed, without "
+                        f"saying so: {dep!r}"
+                    )

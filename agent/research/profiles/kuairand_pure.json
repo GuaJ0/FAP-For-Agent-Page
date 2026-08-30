@@ -61,7 +61,8 @@
     "All method selection and outcome reasoning uses public metadata plus training and validation information only.",
     "The primary objective is ranking each user's logged impressions rather than global probability calibration alone.",
     "Method feasibility must be judged against the remaining iteration and wall-clock budget.",
-    "Available signals are capabilities, not permission to assume that the incumbent currently uses them."
+    "Available signals are capabilities, not permission to assume that the incumbent currently uses them.",
+    "REVIEWED BOUNDARY DECISION (exploration campaign, docs/exploration-campaign.md item 2): read-only diagnostic use of the randomized-exposure log log_random_4_22_to_5_08_pure.csv is treated as in-bounds, even though allowed_data_boundary names only the three categories above and this file is none of them. Rationale: the use is strictly read-only and scores an already-trained model, it never becomes training data or a selection metric, and it is the dataset's own documented purpose for that file (solution/ideas.md unexplored direction 7, unbiased validation). Scope limit that makes it safe: the file spans 20220422-20220508 and 75.5% of its 1,186,059 rows fall in the official held-out date range, so the diagnostic reads ONLY the 288,338 rows dated 20220422-20220428 -- the official validation window -- and never a test-period row."
   ],
   "public_sources": [
     "https://arxiv.org/abs/2208.08696",

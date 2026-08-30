@@ -105,6 +105,33 @@ def _describe_campaign() -> str:
     return "\n".join(lines)
 
 
+def _report_only_families() -> set[str]:
+    """Families whose every backlog entry is a read-only diagnostic.
+
+    A diagnostic entry changes no model, so its delta on validation primary is
+    zero by construction and the Evaluator reads that as REVERT. That verdict
+    is about the entry having tested nothing, not about the direction failing --
+    promoting it would plant a "Don't" in the graded run's memory against a
+    direction nobody has actually measured, which is the exact false-Don't
+    failure this whole campaign exists to avoid.
+
+    Detected by inspecting DEFAULT_BACKLOG rather than naming a family, so a
+    future report-only entry is excluded the same way without anyone
+    remembering to update a list here. `all` and not `any`: a family that mixes
+    a diagnostic with real modelling variants has genuinely measured something,
+    and its verdict must still be promoted.
+    """
+    from agent.research.findings import resolve_family
+
+    members: dict[str, list] = {}
+    for entry in DEFAULT_BACKLOG:
+        members.setdefault(resolve_family(entry.key), []).append(entry)
+    return {
+        family for family, entries in members.items()
+        if entries and all(e.hyperparameters.get("report_only") == [True] for e in entries)
+    }
+
+
 def _promote(scratch: Path, target: Path) -> int:
     """Merge a reviewed scratch ledger into the committed one.
 
@@ -122,9 +149,19 @@ def _promote(scratch: Path, target: Path) -> int:
         print(f"error: {scratch} holds no findings to promote.", file=sys.stderr)
         return 2
 
+    from agent.research.findings import resolve_family
+
     ledger = FindingsLedger(target)
+    report_only = _report_only_families()
     print(f"promoting {len(source)} finding(s)\n  from {scratch}\n  into {target}\n")
     for finding in source:
+        if resolve_family(finding.direction) in report_only:
+            # Automatic, not a manual pre-promote edit: relying on someone
+            # remembering to delete a line is exactly how a false Don't reaches
+            # the graded run.
+            print(f"  SKIPPED  {finding.direction:<22} (diagnostic-only entry: it changes no "
+                  f"model, so its verdict measures nothing and is not a real Don't)")
+            continue
         merged = ledger.record(finding)
         if merged is None:
             print(f"  SKIPPED  {finding.direction} (failed the validation-only scan)")

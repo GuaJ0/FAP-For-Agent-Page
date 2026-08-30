@@ -43,6 +43,7 @@ _current_best_source() below depends on it.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import difflib
 import json
 import re
@@ -68,29 +69,71 @@ CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
 
 # Modules a solution may import. Everything else is rejected before it costs a
 # training run -- the environment has numpy and the stdlib, nothing more.
-ALLOWED_IMPORTS = frozenset({
-    "argparse", "collections", "copy", "csv", "dataclasses", "enum", "functools",
-    "heapq", "itertools", "json", "math", "os", "pathlib", "random", "re",
-    "statistics", "sys", "time", "typing", "warnings",
-    "numpy", "yaml",
-    "evaluate", "data",   # the vendored harness, sitting next to train.py
-})
+# IMPORT POLICY
+# -------------
+# External open-source libraries and frameworks are PERMITTED -- see
+# docs/coding-agent.md, which is the authoritative statement of this. What used
+# to sit here was a hardcoded numpy-only allowlist plus a hand-maintained
+# "unavailable" dict, and both had drifted from reality: the dict claimed
+# pandas, sklearn and scipy were "not installed" when all three are, while the
+# allowlist rejected them anyway.
+#
+# So availability is now MEASURED rather than declared. Two rules:
+#
+#   1. FORBIDDEN_IMPORTS -- refused however the environment is provisioned,
+#      because they are sandbox rules rather than packaging facts.
+#   2. everything else -- allowed if and only if it can actually be imported
+#      here. That is exactly docs/coding-agent.md's rule that a dependency must
+#      be installed before a solution may rely on it, and it needs no edit when
+#      one is later provisioned: pip install torch, and torch becomes legal.
+#
+# Measuring in THIS process is valid because executor.py launches solutions with
+# sys.executable -- the same interpreter -- so what imports here imports there.
 
-# Named separately from "not in ALLOWED_IMPORTS" so the failure message can say
-# *why* -- "torch isn't installed in this environment" is a far more actionable
-# repair prompt than "unexpected import".
-KNOWN_UNAVAILABLE = {
-    "torch": "PyTorch is not installed; the environment is numpy-only",
-    "pandas": "pandas is not installed; use csv/numpy via the vendored data.py",
-    "sklearn": "scikit-learn is not installed; implement the metric-free parts yourself",
-    "scipy": "scipy is not installed; numpy only",
-    "lightgbm": "lightgbm is not installed; numpy only",
-    "xgboost": "xgboost is not installed; numpy only",
+# Sit next to the generated train.py, so they are importable in the executor's
+# cwd=<solution_dir> subprocess but not from this process. Availability cannot
+# be measured for them; they are always legal.
+VENDORED_IMPORTS = frozenset({"evaluate", "data"})
+
+# Sandbox rules. These stay refused no matter what is installed -- every one is
+# in the stdlib and would therefore pass an availability test.
+FORBIDDEN_IMPORTS = {
+    "subprocess": "spawning subprocesses is not permitted",
+    "socket": "there is no network access in the sandbox",
     "requests": "there is no network access in the sandbox",
     "urllib": "there is no network access in the sandbox",
-    "socket": "there is no network access in the sandbox",
-    "subprocess": "spawning subprocesses is not permitted",
 }
+
+
+def module_available(root: str) -> bool:
+    """Whether `root` can actually be imported in the interpreter that will run
+    the solution.
+
+    find_spec, not import: it resolves the module without executing it, so
+    probing a heavy framework costs nothing and cannot run its side effects.
+    Any failure is treated as unavailable -- a module whose parent package
+    explodes on lookup is not one a generated solution should depend on.
+    """
+    if root in VENDORED_IMPORTS:
+        return True
+    try:
+        return importlib.util.find_spec(root) is not None
+    except (ImportError, AttributeError, ValueError, ModuleNotFoundError):
+        return False
+
+
+def available_third_party() -> list[str]:
+    """Installed, non-stdlib libraries a solution may use, for the prompt.
+
+    Naming what IS available matters as much as rejecting what is not: without
+    it the model has to guess, and guesses cost a whole generate/check cycle.
+    """
+    candidates = (
+        "numpy", "scipy", "pandas", "sklearn", "torch", "jax", "tensorflow",
+        "lightgbm", "xgboost", "numba",
+    )
+    return [name for name in candidates if module_available(name)]
+
 
 FORBIDDEN_RESULT_KEYS = ("test_primary", "test_gauc", "test_ndcg5", "test_metrics", "hidden_test")
 
@@ -172,12 +215,18 @@ def static_check(source: str) -> list[str]:
         return [f"train.py does not parse: line {e.lineno}: {e.msg}"]
 
     for root in sorted(_imported_roots(tree)):
-        if root in KNOWN_UNAVAILABLE:
-            problems.append(f"imports {root!r}: {KNOWN_UNAVAILABLE[root]}")
-        elif root not in ALLOWED_IMPORTS:
+        if root in FORBIDDEN_IMPORTS:
+            problems.append(f"imports {root!r}: {FORBIDDEN_IMPORTS[root]}")
+        elif not module_available(root):
+            # Caught here rather than at runtime on purpose: an ImportError
+            # inside the executor costs a full multi-seed training run and
+            # surfaces as a CRASH traceback, where this costs nothing and says
+            # what to do instead.
             problems.append(
-                f"imports {root!r}, which is not available. Allowed: numpy, the stdlib, "
-                f"and the vendored `evaluate`/`data` modules."
+                f"imports {root!r}, which is not installed in this environment. "
+                f"External libraries are permitted, but only once provisioned. "
+                f"Installed and available: {', '.join(available_third_party())}, "
+                f"plus the stdlib and the vendored `evaluate`/`data` modules."
             )
 
     for flag in ("--config", "--seed", "--out"):
@@ -279,7 +328,9 @@ class LLMCodingAgent:
         self._scaffold(sol_dir)
 
         baseline, provenance = self._current_best_source()
-        system = prompts.SYSTEM_PROMPT
+        # Rendered per call against what is actually importable, so the model is
+        # told the real environment rather than a constant that can drift from it.
+        system = prompts.system_prompt(available_third_party())
         calls: list[LLMResponse] = []
         history: list[AttemptOutcome] = []
         source: Optional[str] = None

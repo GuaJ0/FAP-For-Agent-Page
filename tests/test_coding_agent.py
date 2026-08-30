@@ -88,14 +88,66 @@ def test_static_check_rejects_a_syntax_error():
 
 
 @pytest.mark.parametrize("mod,hint", [
-    ("torch", "PyTorch is not installed"),
-    ("pandas", "pandas is not installed"),
-    ("sklearn", "scikit-learn is not installed"),
+    ("subprocess", "spawning subprocesses is not permitted"),
+    ("socket", "no network access"),
     ("requests", "no network access"),
+    ("urllib", "no network access"),
 ])
-def test_static_check_rejects_unavailable_imports_with_a_reason(mod, hint):
+def test_static_check_refuses_sandbox_violations_however_it_is_provisioned(mod, hint):
+    """These are sandbox rules, not packaging facts -- every one of them is in
+    the stdlib and would sail through an availability check."""
     problems = static_check(f"import {mod}\n")
     assert any(hint in p for p in problems), problems
+
+
+def test_an_installed_third_party_library_is_allowed():
+    """External libraries are permitted (docs/coding-agent.md). The old
+    allowlist rejected pandas, sklearn and scipy as "not installed" while all
+    three were installed the whole time."""
+    from agent.coding.agent import available_third_party
+
+    installed = [m for m in available_third_party() if m != "numpy"]
+    if not installed:
+        pytest.skip("no third-party library beyond numpy is installed here")
+
+    for mod in installed:
+        problems = static_check(f"import {mod}\n")
+        assert not any("not installed" in p for p in problems), (mod, problems)
+
+
+def test_an_uninstalled_library_is_rejected_early_with_an_actionable_reason():
+    """Permitted-but-absent must still fail HERE. Letting it reach the executor
+    turns a free static check into a CRASH after a full multi-seed run, and the
+    traceback reads like a modelling bug rather than a missing package."""
+    from agent.coding.agent import module_available
+
+    absent = next((m for m in ("torch", "jax", "tensorflow", "lightgbm")
+                   if not module_available(m)), None)
+    if absent is None:
+        pytest.skip("every candidate library is installed here")
+
+    problems = static_check(f"import {absent}\n")
+    assert any("not installed in this environment" in p for p in problems), problems
+    # and it must say what IS available, or the repair prompt is a guessing game
+    assert any("Installed and available" in p for p in problems), problems
+
+
+def test_availability_is_measured_not_declared(monkeypatch):
+    """The whole point of the refactor: provisioning a library must make it
+    legal without anyone editing an allowlist, and un-provisioning it must make
+    it illegal again. Both directions are simulated so the test says the same
+    thing whether or not torch happens to be installed on this machine."""
+    from agent.coding import agent as coding_agent
+
+    real = coding_agent.module_available
+
+    monkeypatch.setattr(coding_agent, "module_available",
+                        lambda root: False if root == "torch" else real(root))
+    assert any("not installed" in p for p in static_check("import torch\n"))
+
+    monkeypatch.setattr(coding_agent, "module_available",
+                        lambda root: True if root == "torch" else real(root))
+    assert not any("not installed" in p for p in static_check("import torch\n"))
 
 
 def test_static_check_rejects_a_reimplemented_metric():
@@ -224,20 +276,21 @@ def test_successive_calls_get_their_own_solution_dirs(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_a_static_violation_is_repaired_without_costing_an_executor_run(tmp_path):
-    agent = _agent(tmp_path, [_fenced("import torch\n" + BASELINE), _fenced(RANKING_TEMPLATE)])
+    agent = _agent(tmp_path, [_fenced("import subprocess\n" + BASELINE), _fenced(RANKING_TEMPLATE)])
 
     diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
 
     manifest = json.loads((Path(diff.solution_dir) / "attempt.json").read_text())
     assert [c["ok"] for c in manifest["cycles"]] == [False, True]
-    assert "PyTorch is not installed" in manifest["cycles"][0]["detail"]
+    assert "subprocess" in manifest["cycles"][0]["detail"]
+    assert "not permitted" in manifest["cycles"][0]["detail"]
     assert manifest["succeeded"] is True
 
 
 def test_the_repair_prompt_contains_the_diagnosis_and_the_broken_source(tmp_path):
     """A repair prompt without the previous source makes the model rewrite
     from scratch, which loses whatever it had already got right."""
-    client = ScriptedClient([_fenced("import torch\n" + BASELINE), _fenced(RANKING_TEMPLATE)])
+    client = ScriptedClient([_fenced("import subprocess\n" + BASELINE), _fenced(RANKING_TEMPLATE)])
     agent = LLMCodingAgent(
         work_dir=tmp_path / "s", data_dir=str(tmp_path), llm=client,
         usage_log_path=tmp_path / "u.jsonl", run_smoke_test=False,
@@ -247,8 +300,8 @@ def test_the_repair_prompt_contains_the_diagnosis_and_the_broken_source(tmp_path
 
     _, repair_user, purpose = client.calls[1]
     assert purpose == "repair"
-    assert "PyTorch is not installed" in repair_user
-    assert "import torch" in repair_user
+    assert "subprocess" in repair_user and "not permitted" in repair_user
+    assert "import subprocess" in repair_user
     assert "COMPLETE corrected" in repair_user
 
 
@@ -256,7 +309,7 @@ def test_repairs_are_capped_and_the_last_attempt_is_still_shipped(tmp_path):
     """When every repair fails the agent must still return a Diff. Raising
     would kill the orchestrator's whole run; returning lets the executor
     record one honest failed iteration and tier-1 retry take over."""
-    bad = _fenced("import torch\n" + BASELINE)
+    bad = _fenced("import subprocess\n" + BASELINE)
     agent = _agent(tmp_path, [bad, bad, bad], max_repair_attempts=2)
 
     diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
@@ -331,7 +384,7 @@ def test_a_retry_repairs_the_previously_shipped_source(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_usage_is_logged_per_call_with_tokens_and_cost(tmp_path):
-    agent = _agent(tmp_path, [_fenced("import torch\n" + BASELINE), _fenced(RANKING_TEMPLATE)])
+    agent = _agent(tmp_path, [_fenced("import subprocess\n" + BASELINE), _fenced(RANKING_TEMPLATE)])
 
     agent.implement(Idea("use a pairwise BPR loss", None), None)
 

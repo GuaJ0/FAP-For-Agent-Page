@@ -18,11 +18,11 @@ Two of the rules are non-obvious enough to be worth their prose:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_TEMPLATE = """\
 You are the Coding agent in an automated ML research loop working on the \
 KuaiRand-Pure within-user ranking task. You are given one hypothesis and you \
 return one complete `train.py` that tests it.
@@ -34,10 +34,19 @@ TASK
   term that is constant within a user cannot change the score.
 
 ENVIRONMENT (hard constraints -- violating these fails the run)
-  - Python 3.9+ with numpy. NOTHING ELSE. No torch, pandas, sklearn, scipy.
-  - No network access. No downloads. No subprocesses.
+  - Python 3.9+. External open-source libraries and frameworks are PERMITTED
+    when a hypothesis justifies one -- you are not restricted to numpy.
+  - You may import ONLY what is already installed: {available_libraries}.
+    Anything else is rejected before your code ever runs. You cannot install a
+    package, so do not import one that is missing however well it would fit --
+    write the numerics yourself instead, as the baseline does.
+  - No network access. No downloads. No subprocesses. These are sandbox rules
+    and hold regardless of what is installed.
   - Single CPU core. Your run is killed at the executor's timeout, so keep a
-    full training run to a few minutes.
+    full training run to a few minutes. A framework that thread-pools by
+    default must be pinned to one thread -- e.g. `torch.set_num_threads(1)` --
+    or it silently spends more CPU than the budget allows and its timings are
+    not comparable with the baseline's.
   - `evaluate.py` and `data.py` are already sitting next to your train.py.
     Import them as top-level modules: `from evaluate import evaluate` and
     `from data import load, encode, FIELDS`.
@@ -100,6 +109,22 @@ def _read(path: Path, limit: int = 24_000) -> str:
     return text
 
 
+
+def system_prompt(available_libraries: Sequence[str]) -> str:
+    """SYSTEM_PROMPT rendered against the libraries actually installed.
+
+    Built by substitution rather than str.format: the template contains literal
+    JSON braces (`{"primary": float, ...}`) that format() would try to read as
+    fields and reject.
+
+    The available list is passed in rather than probed here so this module stays
+    free of import-policy logic -- agent.py owns that, and agent.py imports this
+    module, so reaching back the other way would be a cycle.
+    """
+    listed = ", ".join(available_libraries) if available_libraries else "the stdlib only"
+    return SYSTEM_PROMPT_TEMPLATE.replace("{available_libraries}", listed)
+
+
 def build_generate_prompt(
     hypothesis: str,
     baseline_source: str,
@@ -153,9 +178,10 @@ def build_repair_prompt(
         "Diagnose the failure above and return the COMPLETE corrected `train.py` "
         "in one ```python block -- not a patch, not a diff, not just the changed "
         "function. Keep everything that was already working. Re-read the output "
-        "and environment rules in the system prompt before answering: a mismatch "
-        "between result.json and val_predictions.npz, an import outside numpy, or "
-        "a test-split number in result.json will each fail the run again."
+            "and environment rules in the system prompt before answering: a mismatch "
+        "between result.json and val_predictions.npz, an import of a library that "
+        "is not installed, or a test-split number in result.json will each fail "
+        "the run again."
     )
 
 

@@ -1,6 +1,13 @@
-# Harness + solutions: the starter kit is deliberately numpy-only, and every
-# generated train.py is held to that (see agent/coding/agent.py ALLOWED_IMPORTS).
+# Harness + solutions. External open-source libraries ARE permitted for
+# generated solutions (docs/coding-agent.md); agent/coding/agent.py decides what
+# is legal by measuring what is importable, so anything pinned here is usable by
+# a generated train.py and anything absent is refused with an actionable message.
 numpy>=1.24
+
+# Autograd, for solutions whose hypothesis needs gradients (DIN-style sequence
+# models, multi-task heads, DeepFM). Without it those have to be hand-derived,
+# which confounds "the mechanism failed" with "the backprop was hard to write".
+torch>=2.2
 
 # Coding agent's LLM calls. Not needed to run the tests -- the default suite
 # uses ScriptedClient and never imports this.

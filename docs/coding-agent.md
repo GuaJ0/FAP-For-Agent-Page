@@ -18,6 +18,80 @@ as-is — a generated `train.py`, a config, and copies of the vendored
 | `agent/coding/prompts.py` | System prompt (the contract) + generate/repair prompt builders |
 | `agent/coding/templates/train_ranking.py` | Hand-written BPR / listwise implementation used by the offline client |
 
+## Permitted libraries and frameworks
+
+**External open-source libraries and frameworks (PyTorch, JAX, scikit-learn, pandas, etc.) are
+permitted for the Coding agent to use.** This is not an official challenge restriction and never
+was; the NumPy-only sandbox reflected what the *baseline* (`solution/train.py`) happened to be
+written with. This matches `docs/research-agent.md`'s "Feasibility and dependencies" section,
+which already tells the Research agent that open-source ML libraries may be proposed when
+justified.
+
+**The code now matches this.** The standing contradiction — Research free to propose PyTorch while
+the Coding sandbox was guaranteed to reject it — is resolved.
+
+### Availability is measured, not declared
+
+`agent/coding/agent.py` used to carry two hand-maintained lists: an `ALLOWED_IMPORTS` allowlist
+(numpy + stdlib) and a `KNOWN_UNAVAILABLE` dict of rejection reasons. Both had drifted from
+reality — the dict asserted that pandas, scikit-learn and scipy were "not installed" when all
+three were installed the whole time. A hand-maintained claim about the environment is a claim that
+goes stale silently.
+
+They are replaced by two rules:
+
+| | what it is | how it is decided |
+|---|---|---|
+| `FORBIDDEN_IMPORTS` | sandbox rules — `subprocess`, `socket`, `requests`, `urllib` | refused **however the environment is provisioned**. Every one is in the stdlib and would pass an availability test, so this cannot be inferred |
+| everything else | any library | allowed **iff `importlib.util.find_spec` can resolve it** |
+
+This implements the provisioning rule directly: a dependency is legal exactly when it is installed.
+Provisioning one needs no code change — `pip install torch` makes torch legal on the next run, and
+removing it makes it illegal again. `find_spec` resolves without executing, so probing a heavy
+framework costs nothing.
+
+Measuring in the agent's own process is valid because `executor.py` launches solutions with
+`sys.executable` — the same interpreter — so what imports here imports there.
+
+### What the model is told
+
+`SYSTEM_PROMPT` is now `SYSTEM_PROMPT_TEMPLATE` plus `prompts.system_prompt(available_libraries)`,
+rendered per call against the measured environment, so the prompt names what is actually installed
+rather than a constant that can drift from it. Rendering is by substitution, not `str.format` —
+the template contains literal JSON braces that `format()` would try to read as fields.
+
+A permitted-but-absent import is still caught by the **static** check rather than at runtime. That
+distinction is worth keeping: the static check costs nothing and says what to use instead, whereas
+letting it reach the executor costs a full multi-seed run and surfaces as a `CRASH` traceback that
+reads like a modelling bug rather than a missing package.
+
+### Constraints that still apply, whatever the library
+
+No network access, no downloads, no subprocess spawning, a single CPU core budget, and the
+executor's per-run timeout — a heavier framework's import and setup cost must still fit inside it.
+`evaluate.py` remains the sole scoring authority: `evaluate()` must be imported, never
+reimplemented.
+
+### Current state of this machine
+
+Available to a generated solution: `numpy`, `scipy`, `pandas`, `scikit-learn`, `torch` (2.13).
+
+`torch` was provisioned specifically so solutions needing gradients — DIN-style sequence models,
+multi-task heads, DeepFM — do not have to hand-derive backprop, which would confound "the mechanism
+failed" with "the gradient was hard to write". It is pinned in `requirements.txt`, so it must be
+installed in the graded run's environment too or findings measured with it will not transfer.
+
+Provisioning it required **no change to the import policy** — `available_third_party()` and
+`static_check()` picked it up on the next call, and the rendered system prompt began advertising it
+automatically. That is the payoff of measuring availability rather than declaring it.
+
+**Threading caveat.** `torch.get_num_threads()` defaults to 4 here, against the documented
+single-CPU-core budget, so the system prompt now instructs solutions to call
+`torch.set_num_threads(1)`. Note this is guidance in the prompt, not an enforced limit — nothing in
+`static_check` or the executor currently rejects a solution that thread-pools anyway, and NumPy's
+BLAS can do the same thing. Worth hardening (e.g. exporting `OMP_NUM_THREADS=1` from the executor)
+if CPU-time comparability starts to matter.
+
 ## The inner loop, and why it isn't a duplicate of the orchestrator's
 
 The orchestrator already retries: up to `max_fix_attempts` (3) per idea, with
