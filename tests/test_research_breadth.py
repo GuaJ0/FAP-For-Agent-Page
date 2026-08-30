@@ -26,6 +26,7 @@ from agent.research.breadth import (
 )
 from agent.research.citations import CitationClaim, CitationRecord, JsonCitationCatalog
 from agent.research.context import build_research_context
+from agent.research.prompts import build_breadth_prompt, build_breadth_repair_prompt
 from agent.research.schemas import ResearchProposal
 
 
@@ -109,10 +110,13 @@ def _breadth(*candidates: dict) -> str:
 
 
 def _complete_breadth(primary: dict) -> str:
-    """Supply the three genuinely competing directions required by the contract."""
+    """Supply the configured five genuinely competing directions."""
     fillers = [
         _candidate("B-FILLER-FEATURES", StackStage.FEATURES),
         _candidate("B-FILLER-ARCH", StackStage.ARCHITECTURE),
+        _candidate("B-FILLER-OBJECTIVE", StackStage.OBJECTIVE_SAMPLING),
+        _candidate("B-FILLER-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        _candidate("B-FILLER-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
     ]
     used = {primary["stack_stage"]}
     selected = [primary]
@@ -120,8 +124,7 @@ def _complete_breadth(primary: dict) -> str:
         if filler["stack_stage"] not in used:
             selected.append(filler)
             used.add(filler["stack_stage"])
-    if len(selected) < 3:
-        selected.append(_candidate("B-FILLER-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE))
+    assert len(selected) == 5
     return _breadth(*selected)
 
 
@@ -247,6 +250,54 @@ def test_successful_propose_runs_breadth_then_depth_and_returns_idea(tmp_path):
     assert idea.hypothesis.startswith("[RESEARCH_PROPOSAL v1]")
     assert [call[2] for call in client.calls] == ["research_breadth", "research_depth"]
     assert "Selected breadth direction (binding)" in client.calls[1][1]
+
+
+def test_normal_breadth_prompt_requires_exact_configured_candidate_count():
+    history = [_baseline()]
+    prompt = build_breadth_prompt(
+        build_research_context(history),
+        JsonCitationCatalog().all(),
+        build_stack_coverage(history),
+        max_candidates=5,
+    )
+
+    assert "Generate exactly 5 candidates" in prompt
+    assert "between 3 and 5" not in prompt
+
+
+def test_exact_five_with_two_rejections_still_reaches_depth_without_repair(tmp_path):
+    objective = _candidate(
+        "B-VALID-OBJECTIVE",
+        StackStage.OBJECTIVE_SAMPLING,
+        evidence=[
+            {"citation_id": "rendle2009bpr", "claim_id": "pairwise-ranking-objective"},
+            {"citation_id": "covington2016youtube", "claim_id": "ranking-objective-and-watch-time"},
+        ],
+    )
+    batch = _breadth(
+        objective,
+        _candidate("B-VALID-FEATURE", StackStage.FEATURES),
+        _candidate("B-VALID-ARCH", StackStage.ARCHITECTURE),
+        _candidate(
+            "B-UNSAFE",
+            StackStage.OPTIMIZATION_REGULARIZATION,
+            mechanism="Tune the official metric implementation.",
+        ),
+        _candidate(
+            "B-CONFLICT",
+            StackStage.FEATURES,
+            primary_change="Add temporal activity features.",
+            mechanism="Replace the model with a DeepFM interaction architecture.",
+        ),
+    )
+    agent, client = _agent(tmp_path, [batch, json.dumps(_objective_proposal())])
+
+    idea = agent.propose([_baseline()])
+
+    assert idea.parent_iteration == 0
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_depth",
+    ]
 
 
 def test_breadth_candidate_count_is_hard_bounded(tmp_path):
@@ -442,13 +493,9 @@ def test_all_filtered_breadth_candidates_receive_one_repair_before_depth(tmp_pat
         ],
     )
     duplicate_batch = [
-        dict(duplicate, candidate_id=f"B-DUPLICATE-{index}") for index in range(3)
+        dict(duplicate, candidate_id=f"B-DUPLICATE-{index}") for index in range(5)
     ]
-    repaired_batch = _breadth(
-        repaired,
-        _candidate("B-REPAIRED-ARCH", StackStage.ARCHITECTURE),
-        _candidate("B-REPAIRED-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
-    )
+    repaired_batch = _complete_breadth(repaired)
     agent, client = _agent(tmp_path, [
         _breadth(*duplicate_batch),
         repaired_batch,
@@ -464,6 +511,172 @@ def test_all_filtered_breadth_candidates_receive_one_repair_before_depth(tmp_pat
         "research_depth",
     ]
     assert "post-filter survivors" in client.calls[1][1]
+
+
+def test_production_partial_failure_retains_survivors_and_repairs_incrementally(tmp_path):
+    objective = _candidate(
+        "B-KEEP-OBJECTIVE",
+        StackStage.OBJECTIVE_SAMPLING,
+        evidence=[
+            {"citation_id": "rendle2009bpr", "claim_id": "pairwise-ranking-objective"},
+            {"citation_id": "covington2016youtube", "claim_id": "ranking-objective-and-watch-time"},
+        ],
+    )
+    architecture = _candidate(
+        "B-KEEP-ARCH",
+        StackStage.ARCHITECTURE,
+        primary_change="Add a DeepFM interaction architecture.",
+        mechanism="Add a DeepFM interaction architecture.",
+        evidence=[{
+            "citation_id": "guo2017deepfm",
+            "claim_id": "joint-low-high-order-interactions",
+        }],
+    )
+    initial = _breadth(
+        objective,
+        architecture,
+        _candidate(
+            "B-SCORER-UNSAFE",
+            StackStage.OPTIMIZATION_REGULARIZATION,
+            mechanism="Tune the official metric implementation.",
+        ),
+        _candidate(
+            "B-MECHANISM-CONFLICT",
+            StackStage.FEATURES,
+            primary_change="Add temporal activity features.",
+            mechanism="Use a DeepFM interaction architecture instead.",
+        ),
+        dict(architecture, candidate_id="B-DUPLICATE-ARCH"),
+    )
+    replacements = _breadth(
+        _candidate("B-NEW-FEATURE", StackStage.FEATURES),
+        _candidate("B-NEW-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        _candidate("B-NEW-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
+    )
+    agent, client = _agent(tmp_path, [
+        initial,
+        replacements,
+        json.dumps(_objective_proposal()),
+    ])
+
+    idea = agent.propose([_baseline()])
+
+    assert idea.parent_iteration == 0
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_breadth_repair", "research_depth",
+    ]
+    repair_prompt = client.calls[1][1]
+    assert "B-KEEP-OBJECTIVE" in repair_prompt
+    assert "B-KEEP-ARCH" in repair_prompt
+    assert "B-SCORER-UNSAFE" in repair_prompt
+    assert "modifies or tunes the official scorer/metric implementation" in repair_prompt
+    assert "B-MECHANISM-CONFLICT" in repair_prompt
+    assert "mechanism conflicts with the declared primary_change" in repair_prompt
+    assert "B-DUPLICATE-ARCH" in repair_prompt
+    assert "duplicates breadth batch candidate" in repair_prompt
+    assert "exactly 3 replacement candidate(s)" in repair_prompt
+    assert "must be new" in repair_prompt
+
+
+def _breadth_with_one_schema_invalid_candidate() -> str:
+    objective = _candidate(
+        "B-KEEP-OBJECTIVE",
+        StackStage.OBJECTIVE_SAMPLING,
+        evidence=[
+            {"citation_id": "rendle2009bpr", "claim_id": "pairwise-ranking-objective"},
+            {"citation_id": "covington2016youtube", "claim_id": "ranking-objective-and-watch-time"},
+        ],
+    )
+    broken = _candidate("B-BROKEN", StackStage.INFERENCE_ENSEMBLE)
+    broken.pop("mechanism")
+    return _breadth(
+        objective,
+        _candidate("B-KEEP-FEATURE", StackStage.FEATURES),
+        _candidate("B-KEEP-ARCH", StackStage.ARCHITECTURE),
+        _candidate("B-KEEP-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        broken,
+    )
+
+
+def test_schema_invalid_candidate_retains_valid_siblings_and_repairs_only_missing(tmp_path):
+    replacement = _breadth(
+        _candidate("B-NEW-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE)
+    )
+    agent, client = _agent(tmp_path, [
+        _breadth_with_one_schema_invalid_candidate(),
+        replacement,
+        json.dumps(_objective_proposal()),
+    ])
+
+    idea = agent.propose([_baseline()])
+
+    assert idea.parent_iteration == 0
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_breadth_repair", "research_depth",
+    ]
+    repair_prompt = client.calls[1][1]
+    for candidate_id in (
+        "B-KEEP-OBJECTIVE", "B-KEEP-FEATURE", "B-KEEP-ARCH", "B-KEEP-REG",
+    ):
+        assert candidate_id in repair_prompt
+    assert "B-BROKEN" in repair_prompt
+    assert "missing ['mechanism']" in repair_prompt
+    assert "exactly 1 replacement candidate(s)" in repair_prompt
+
+
+def test_repair_cannot_reuse_schema_invalid_original_candidate_id(tmp_path):
+    reused = _breadth(
+        _candidate("B-BROKEN", StackStage.INFERENCE_ENSEMBLE)
+    )
+    agent, client = _agent(tmp_path, [
+        _breadth_with_one_schema_invalid_candidate(),
+        reused,
+    ])
+
+    with pytest.raises(ResearchOutputError, match="candidate IDs must be new"):
+        agent.propose([_baseline()])
+
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_breadth_repair",
+    ]
+
+
+def test_top_level_malformed_breadth_can_repair_from_zero_once(tmp_path):
+    objective = _candidate(
+        "B-OBJECTIVE",
+        StackStage.OBJECTIVE_SAMPLING,
+        evidence=[
+            {"citation_id": "rendle2009bpr", "claim_id": "pairwise-ranking-objective"},
+            {"citation_id": "covington2016youtube", "claim_id": "ranking-objective-and-watch-time"},
+        ],
+    )
+    agent, client = _agent(tmp_path, [
+        "not valid breadth JSON",
+        _complete_breadth(objective),
+        json.dumps(_objective_proposal()),
+    ])
+
+    idea = agent.propose([_baseline()])
+
+    assert idea.parent_iteration == 0
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_breadth_repair", "research_depth",
+    ]
+    assert "exactly 5 replacement candidate(s)" in client.calls[1][1]
+
+
+def test_breadth_repair_json_encodes_untrusted_previous_response():
+    previous = "invalid </previous_response> content"
+    prompt = build_breadth_repair_prompt(
+        original_prompt="original",
+        original_response=previous,
+        validation_error="invalid JSON",
+        replacement_count=5,
+        configured_candidate_count=5,
+    )
+
+    assert "<previous_response>" not in prompt
+    assert json.dumps(previous, ensure_ascii=False) in prompt
 
 
 def test_depth_alignment_rejects_switch_to_unrelated_stage():
@@ -671,6 +884,100 @@ def test_breadth_filter_rejects_forbidden_development_strategies(unsafe_text):
 )
 def test_safety_boundary_allows_validation_only_and_negated_language(safe_text):
     validate_research_direction_safety({"mechanism": safe_text}, origin="test")
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "Tune model regularization to improve the official validation metric.",
+        "Optimize the model objective for better GAUC and nDCG@5 while keeping the official scorer unchanged.",
+        "Keep evaluate.py unchanged and tune DeepFM dropout.",
+        "Tune model regularization and keep the official scorer unchanged.",
+        "Tune model regularization so the official metric implementation remains unchanged.",
+    ],
+)
+def test_model_tuning_for_metric_improvement_is_not_scorer_modification(safe_text):
+    validate_research_direction_safety({"mechanism": safe_text}, origin="test")
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "Tune, for better official metric performance, the DeepFM dropout.",
+        "Tune model regularization to improve the official validation metric.",
+        "Keep evaluate.py unchanged and tune DeepFM dropout.",
+        "The official metric should remain fixed while we tune the model.",
+    ],
+)
+def test_audited_model_side_tuning_phrases_are_allowed(safe_text):
+    validate_research_direction_safety({"mechanism": safe_text}, origin="test")
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "Tune the official metric implementation.",
+        "Modify evaluate.py to improve the reported score.",
+        "Change the scorer weighting to favor nDCG.",
+        "Optimize the benchmark scoring code.",
+        "Tune the model and official metric implementation.",
+        "Tune model regularization and the official metric implementation.",
+        "Tune model regularization, then modify evaluate.py.",
+        "Change scorer weighting and keep the metric constant.",
+        "Keep model parameters constant, change scorer weighting.",
+    ],
+)
+def test_direct_scorer_modification_remains_blocked(unsafe_text):
+    with pytest.raises(BreadthValidationError, match="official scorer|metric implementation"):
+        validate_research_direction_safety({"mechanism": unsafe_text}, origin="test")
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "Train the model and also adjust the scorer.",
+        "Calibrate the official scorer weighting.",
+        "Calibrate evaluate.py after validation.",
+        "Modify the evaluation implementation.",
+        "Alter the evaluation implementation.",
+        "Rewrite evaluation code for higher nDCG.",
+    ],
+)
+def test_audited_scorer_modification_phrases_are_blocked(unsafe_text):
+    with pytest.raises(BreadthValidationError, match="official scorer|metric implementation"):
+        validate_research_direction_safety({"mechanism": unsafe_text}, origin="test")
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "The scorer was adjusted after training.",
+        "Adjusting the scorer after training.",
+        "The official evaluator was calibrated.",
+        "Calibrating evaluate.py after validation.",
+        "The evaluation implementation was modified.",
+        "Modifying the evaluation implementation.",
+        "The evaluation implementation was altered.",
+        "Altering the evaluation implementation.",
+        "The evaluation code was rewritten for higher nDCG.",
+        "Rewriting evaluation code for higher nDCG.",
+        "Modify the official evaluator.",
+        "Adjust the official evaluator.",
+        "Patch the scoring implementation.",
+        "Optimize the benchmark scoring code.",
+    ],
+)
+def test_scorer_action_inflections_and_targets_are_blocked(unsafe_text):
+    with pytest.raises(BreadthValidationError, match="official scorer|metric implementation"):
+        validate_research_direction_safety({"mechanism": unsafe_text}, origin="test")
+
+
+def test_earlier_scorer_preservation_does_not_hide_later_modification():
+    with pytest.raises(BreadthValidationError, match="official scorer|metric implementation"):
+        validate_research_direction_safety(
+            {"mechanism": "Keep evaluate.py unchanged, then modify its scorer weights."},
+            origin="test",
+        )
 
 
 def test_safety_boundary_cannot_be_bypassed_by_splitting_phrase_across_fields():
@@ -943,9 +1250,15 @@ def test_unsafe_final_depth_can_be_repaired_once_through_same_boundary(tmp_path)
 
 def test_too_small_breadth_uses_one_bounded_repair(tmp_path):
     too_small = _breadth(_candidate("B-ONLY", StackStage.OBJECTIVE_SAMPLING))
+    replacements = _breadth(
+        _candidate("B-NEW-FEATURE", StackStage.FEATURES),
+        _candidate("B-NEW-ARCH", StackStage.ARCHITECTURE),
+        _candidate("B-NEW-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        _candidate("B-NEW-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
+    )
     agent, client = _agent(tmp_path, [
         too_small,
-        _strong_objective_breadth(),
+        replacements,
         json.dumps(_objective_proposal()),
     ])
     idea = agent.propose([_baseline()])
@@ -983,6 +1296,45 @@ def test_misaligned_depth_uses_one_bounded_repair(tmp_path):
     assert [call[2] for call in client.calls] == [
         "research_breadth", "research_depth", "research_depth_repair",
     ]
+
+
+def test_ambiguous_depth_repair_receives_binding_selected_mechanism_guidance(tmp_path):
+    vague = _objective_proposal()
+    vague.update({
+        "title": "Ranking refinement",
+        "hypothesis": "Refine the incumbent representation for stronger ordering.",
+    })
+    vague["implementation"]["target_components"] = ["ranking training path"]
+    vague["implementation"]["steps"] = [
+        "Improve the incumbent ranking behavior without changing evaluation."
+    ]
+    repaired = _objective_proposal()
+    repaired["hypothesis"] = (
+        "Add a weighted BPR pairwise objective term so within-user ordering improves."
+    )
+    repaired["implementation"]["steps"][0] = (
+        "Add a weighted BPR pairwise objective term while retaining pointwise supervision."
+    )
+    agent, client = _agent(tmp_path, [
+        _strong_objective_breadth(),
+        json.dumps(vague),
+        json.dumps(repaired),
+    ])
+
+    idea = agent.propose([_baseline()])
+
+    assert idea.parent_iteration == 0
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_depth", "research_depth_repair",
+    ]
+    repair_prompt = client.calls[2][1]
+    assert "unknown or ambiguous primary mechanism" in repair_prompt
+    assert "stack_stage=objective_sampling" in repair_prompt
+    assert "primary mechanism family=pairwise" in repair_prompt
+    assert "Add a weighted BPR pairwise objective." in repair_prompt
+    assert "hypothesis" in repair_prompt
+    assert "first intervention-bearing" in repair_prompt
+    assert "Do not introduce a competing primary family" in repair_prompt
 
 
 def test_coverage_ignores_bootstrap_and_transient_retry_but_counts_outcomes():
@@ -1102,10 +1454,18 @@ def _two_survivor_breadth() -> str:
     )
 
 
+def _three_fresh_replacements() -> str:
+    return _breadth(
+        _candidate("B-REPAIR-FEATURE", StackStage.FEATURES),
+        _candidate("B-REPAIR-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        _candidate("B-REPAIR-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
+    )
+
+
 def test_two_post_filter_survivors_trigger_one_breadth_repair(tmp_path):
     agent, client = _agent(tmp_path, [
         _two_survivor_breadth(),
-        _strong_objective_breadth(),
+        _three_fresh_replacements(),
         json.dumps(_objective_proposal()),
     ])
     idea = agent.propose([_baseline()])
@@ -1116,12 +1476,58 @@ def test_two_post_filter_survivors_trigger_one_breadth_repair(tmp_path):
 
 
 def test_two_post_filter_survivors_after_repair_raise_without_depth(tmp_path):
+    unsafe_replacements = _breadth(*[
+        _candidate(
+            f"B-REPAIR-UNSAFE-{index}",
+            StackStage.FEATURES,
+            mechanism=f"Modify evaluate.py for replacement {index}.",
+        )
+        for index in range(3)
+    ])
     agent, client = _agent(tmp_path, [
         _two_survivor_breadth(),
-        _two_survivor_breadth(),
+        unsafe_replacements,
     ])
-    with pytest.raises(ResearchOutputError, match="post-filter survivors; got 2"):
+    with pytest.raises(ResearchOutputError, match="post-filter survivors; got 2") as exc_info:
         agent.propose([_baseline()])
+    assert "B-REPAIR-UNSAFE-0" in str(exc_info.value)
+    assert "unsafe Research direction" in str(exc_info.value)
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_breadth_repair",
+    ]
+
+
+def test_breadth_repair_requires_new_candidate_ids(tmp_path):
+    reused_id_replacements = _breadth(
+        _candidate("B-UNSAFE-0", StackStage.FEATURES),
+        _candidate("B-NEW-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        _candidate("B-NEW-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
+    )
+    agent, client = _agent(tmp_path, [
+        _two_survivor_breadth(),
+        reused_id_replacements,
+    ])
+
+    with pytest.raises(ResearchOutputError, match="candidate IDs must be new"):
+        agent.propose([_baseline()])
+
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_breadth_repair",
+    ]
+
+
+def test_partial_breadth_malformed_repair_json_fails_clearly(tmp_path):
+    agent, client = _agent(tmp_path, [
+        _two_survivor_breadth(),
+        "```json\n{truncated",
+    ])
+
+    with pytest.raises(ResearchOutputError, match="not valid JSON"):
+        agent.propose([_baseline()])
+
+    repair_prompt = client.calls[1][1]
+    assert "exactly one JSON object" in repair_prompt
+    assert "no markdown fences" in repair_prompt
     assert [call[2] for call in client.calls] == [
         "research_breadth", "research_breadth_repair",
     ]
@@ -1137,7 +1543,7 @@ def test_breadth_and_depth_repairs_keep_maximum_call_count_at_four(tmp_path):
     ).to_dict()
     agent, client = _agent(tmp_path, [
         _two_survivor_breadth(),
-        _strong_objective_breadth(),
+        _three_fresh_replacements(),
         json.dumps(switched),
         json.dumps(_objective_proposal()),
     ])

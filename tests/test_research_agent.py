@@ -133,6 +133,34 @@ def _breadth():
                 "citation_id": "guo2017deepfm",
                 "claim_id": "joint-low-high-order-interactions",
             }],
+        }, {
+            "candidate_id": "B-REGULARIZATION",
+            "title": "Embedding dropout regularization",
+            "stack_stage": "optimization_regularization",
+            "primary_change": "Apply embedding dropout regularization.",
+            "mechanism": "Regularize embeddings with dropout while retaining the model architecture.",
+            "metric_rationale": "Regularization may improve validation generalization.",
+            "expected_upside": "medium",
+            "implementation_risk": "low",
+            "experiment_cost": "low",
+            "evidence": [{
+                "citation_id": "guo2017deepfm",
+                "claim_id": "joint-low-high-order-interactions",
+            }],
+        }, {
+            "candidate_id": "B-ENSEMBLE",
+            "title": "Checkpoint prediction averaging",
+            "stack_stage": "inference_ensemble",
+            "primary_change": "Use prediction averaging.",
+            "mechanism": "Average predictions from retained checkpoints without changing training.",
+            "metric_rationale": "Averaging may stabilize GAUC and nDCG@5.",
+            "expected_upside": "low",
+            "implementation_risk": "low",
+            "experiment_cost": "low",
+            "evidence": [{
+                "citation_id": "covington2016youtube",
+                "claim_id": "ranking-objective-and-watch-time",
+            }],
         }],
     }
 
@@ -247,8 +275,8 @@ def test_malformed_json_can_be_repaired_once(tmp_path):
     ]
     repair_prompt = client.calls[2][1]
     assert "proposal is not valid JSON" in repair_prompt
-    assert "<previous_response>" in repair_prompt
-    assert "{broken}" in repair_prompt
+    assert "<previous_response>" not in repair_prompt
+    assert json.dumps("```json\n{broken}\n```", ensure_ascii=False) in repair_prompt
 
 
 def test_failed_repair_raises_clear_research_error(tmp_path):

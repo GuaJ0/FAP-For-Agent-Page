@@ -60,9 +60,10 @@ The agent:
    `objective_sampling`, `optimization_regularization`, and
    `inference_ensemble`;
 3. retrieves a compact evidence packet from its configured `CitationSource`;
-4. makes one bounded breadth call for three to five shallow candidate
-   directions by default (the absolute accepted range is three to eight), each
-   with one bounded `primary_change` that identifies its intervention;
+4. makes one bounded breadth call for exactly the configured number of shallow
+   candidate directions (five by default; the absolute supported range remains
+   three to eight), each with one bounded `primary_change` that identifies its
+   intervention;
 5. deterministically hard-filters malformed, unsafe, benchmark-manipulating,
    unsupported, duplicate, ambiguous-stage, and mislabelled-stage candidates;
 6. requires at least three genuinely different candidates to survive those
@@ -92,10 +93,16 @@ it. Citation identity and claim provenance remain valid even when ranking
 relevance is zero; this relevance heuristic is not proof of semantic support.
 Only the one winning candidate reaches the Coding Agent.
 
-Malformed or too-small breadth, or a batch with fewer than three surviving
-candidates, gets at most one breadth repair. The depth proposal independently gets at most one
-schema/alignment/safety repair. Both original and repaired outputs pass the
-same safety boundary. Normal operation therefore uses two calls—one cheap
+Malformed or short breadth, or a batch with fewer than three surviving
+candidates, gets at most one breadth repair. Valid survivors are retained; the
+repair response supplies only fresh replacement IDs, and the combined pool is
+passed through the same safety, evidence, mechanism, history-duplicate, and
+intra-pool duplicate filters before the three-survivor invariant is checked
+again. The depth proposal independently gets at most one schema/alignment/safety
+repair. Its repair prompt repeats the binding selected stack stage, primary
+change, and deterministically inferred primary family so vague wording can be
+corrected without bypassing alignment. Both original and repaired outputs pass
+the same safety boundary. Normal operation therefore uses two calls—one cheap
 breadth call and one detailed depth call—and the configured default permits at
 most four total calls. A second failure in either phase raises
 `ResearchOutputError`; malformed output is never accepted silently. Usage rows
