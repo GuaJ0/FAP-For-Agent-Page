@@ -54,6 +54,7 @@ from agent.executor import Executor  # noqa: E402
 from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
 from agent.research import LLMResearchAgent, OfflineResearchAgent  # noqa: E402
+from agent.research.findings import DEFAULT_FINDINGS_PATH, FindingsLedger  # noqa: E402
 from agent.registry import CheckpointRegistry  # noqa: E402
 from agent.state import StateStore  # noqa: E402
 
@@ -215,6 +216,10 @@ def _main() -> int:
     evaluator = FakeEvaluatorAgent() if args.offline else LLMEvaluatorAgent(
         llm=client, usage_log_path=cfg.paths.logs_dir / "evaluator_usage.jsonl",
     )
+    # Cross-run Do/Don't ledger. Deliberately NOT under --root: a reset here
+    # archives logs/ wholesale, and this has to outlive that.
+    findings = FindingsLedger(DEFAULT_FINDINGS_PATH)
+
     orc = Orchestrator(
         research=research,
         coding=coding,
@@ -224,6 +229,7 @@ def _main() -> int:
         registry=CheckpointRegistry(cfg.paths.registry_json),
         state_store=StateStore(cfg.paths.orchestrator_state),
         cfg=cfg,
+        findings=findings,
     )
 
     t0 = time.time()

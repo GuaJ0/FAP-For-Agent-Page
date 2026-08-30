@@ -21,7 +21,14 @@ SCIENTIFIC RULES
     hard-code iteration 0 as the comparison unless iteration 0 is actually the
     supplied parent.
   - Do not repeat a measured dead end unless the proposal states the material
-    mechanism change that makes the new experiment different.
+    mechanism change that makes the new experiment different. `prior_findings`
+    in the context lists directions this pipeline has already measured across
+    earlier runs: entries with verdict "dont" are those measured dead ends,
+    each with the observed delta and the Evaluator's reason. Treat them as
+    binding even when this run's own iteration history is empty.
+  - `prior_findings` entries with verdict "do" are directions that previously
+    beat their incumbent. Prefer building on one of those over an untested
+    direction, unless the context shows it has since been superseded.
   - Change one attributable mechanism at a time and state what remains fixed.
   - Cite only citation_id/claim_id pairs in the supplied evidence packet.
 

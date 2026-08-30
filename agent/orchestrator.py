@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent
 from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
@@ -88,6 +88,10 @@ class Orchestrator:
     registry: CheckpointRegistry
     state_store: StateStore
     cfg: Config = DEFAULT_CONFIG
+    # Cross-run Do/Don't ledger (agent/research/findings.py). Optional: None
+    # means "don't record findings", which is what every existing caller and
+    # test gets. run_loop.py supplies the real one.
+    findings: Optional[Any] = None
 
     def __post_init__(self) -> None:
         self.state: OrchestratorState = self.state_store.load()
@@ -447,6 +451,7 @@ class Orchestrator:
         # attempt-cap exhaustion. FakeEvaluatorAgent never exercised this path
         # (it never returns ABANDON), which is why it went unnoticed until a
         # real Evaluator that can made it observable.
+        self._record_finding(record)
         self._close_idea(abandoned=(verdict.decision == Decision.ABANDON))
 
     def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
@@ -520,6 +525,36 @@ class Orchestrator:
             detail=f"tokens_in={u.tokens_in} tokens_out={u.tokens_out} cost_usd={u.cost_usd:.6f}",
             agent_action="coding",
         )]
+
+    def _record_finding(self, record: RunRecord) -> None:
+        """Log this Evaluator-judged outcome to the cross-run Do/Don't ledger.
+
+        Only judged outcomes reach here -- _handle_failed_run's technical
+        abandons deliberately do not. A crash means the Coding Agent could not
+        build the idea, which is no evidence about the idea itself.
+
+        Deterministic and LLM-free: every field is copied out of the RunRecord
+        and the Evaluator's own commentary Event. Never fatal -- the record is
+        already durably appended, so a ledger problem must not take down a run.
+        """
+        if self.findings is None:
+            return
+        try:
+            from agent.research.agent import _historical_hypothesis, _historical_hypothesis_id
+            from agent.research.findings import build_finding
+
+            direction = _historical_hypothesis_id(record)
+            if direction is None:
+                # No proposal id -- the seeded baseline, or a hand-supplied
+                # hypothesis. Nothing stable to deduplicate a direction on.
+                return
+            self.findings.record(
+                build_finding(record, direction=direction,
+                              title=_historical_hypothesis(record))
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[orchestrator] could not record research finding: "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     def _register_checkpoint(self, iteration: int, diff: Diff, seeds: list[SeedMetrics], agg) -> None:
         """Register the accepted iteration's checkpoint.

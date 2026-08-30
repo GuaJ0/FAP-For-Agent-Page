@@ -94,3 +94,41 @@ def test_forbidden_key_scan_catches_a_deliberately_injected_leak():
 
     with pytest.raises(QuarantineLeakError):
         assert_no_forbidden_keys({"seeds": [{"primary": 0.6, "test_primary": 0.7}]})
+
+
+def test_the_cross_run_findings_ledger_never_contains_test_metrics(tmp_path):
+    """agent/research/findings.jsonl is a new persistent path into a Research
+    prompt, and unlike runs.jsonl it deliberately outlives the run -- so a leak
+    here would be permanent and would be replayed into every future run.
+
+    Same structure as the test above: a positive control proves the quarantine
+    really did receive test metrics, so the absence in the ledger is because of
+    the boundary rather than because nothing was produced.
+    """
+    from agent.agents import FakeCodingAgent, FakeEvaluatorAgent, FakeResearchAgent
+    from agent.research.findings import FindingsLedger
+
+    handoff = (
+        "[RESEARCH_PROPOSAL v1]\nID: RP-LEAK\nTITLE: t\nPARENT ITERATION: 0\n"
+        "\nHYPOTHESIS:\nsome direction\n"
+    )
+    cfg = make_test_config(tmp_path)
+    ledger_path = tmp_path / "findings.jsonl"
+    orc = make_orchestrator(
+        tmp_path, cfg,
+        outcomes=[{"mode": "normal", "sleep_s": 0.0, "mean": 0.6, "std": 0.0}],
+        hypotheses=(handoff,),
+    )
+    orc.findings = FindingsLedger(ledger_path)
+
+    orc._step(orc.run_log.read_all())
+
+    # Positive control: the run really did produce hidden-test metrics.
+    quarantined = list(read_lines(cfg.paths.test_metrics_jsonl))
+    assert quarantined, "no test metrics were quarantined -- test would be vacuous"
+
+    # And the ledger really was written, so the scan below isn't trivially true.
+    assert ledger_path.exists()
+    raw = ledger_path.read_text()
+    assert raw.strip(), "ledger is empty -- test would be vacuous"
+    assert _no_forbidden_substrings(raw)

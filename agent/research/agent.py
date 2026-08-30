@@ -30,6 +30,11 @@ from agent.research.citations import (
     JsonCitationCatalog,
     validate_proposal_citations,
 )
+from agent.research.findings import (
+    DEFAULT_FINDINGS_PATH,
+    FindingsLedger,
+    findings_for_prompt,
+)
 from agent.research.context import ResearchContext, build_research_context
 from agent.research.prompts import SYSTEM_PROMPT, build_proposal_prompt, build_repair_prompt
 from agent.research.schemas import ProposalValidationError, ResearchProposal
@@ -254,6 +259,9 @@ class LLMResearchAgent:
     usage_log_path: Path = field(
         default_factory=lambda: REPO_ROOT / "logs" / "research_agent_usage.jsonl"
     )
+    # Cross-run Do/Don't ledger. Read-only here -- the Orchestrator owns
+    # writing it, keeping this agent's job scoped to proposing.
+    findings_path: Path = DEFAULT_FINDINGS_PATH
     max_repair_attempts: int = 1
     citation_limit: int = 20
     convergence: ConvergenceConfig = DEFAULT_CONFIG.convergence
@@ -270,7 +278,11 @@ class LLMResearchAgent:
 
     def propose(self, history: list[RunRecord]) -> Idea:
         """Return one validated, evidence-backed proposal as the existing Idea."""
-        context = build_research_context(history, self.convergence)
+        # Prior findings make SYSTEM_PROMPT's existing "do not repeat a measured
+        # dead end" rule enforceable on a fresh run, when this run's own history
+        # is empty and would otherwise give that rule nothing to point at.
+        prior = findings_for_prompt(FindingsLedger(self.findings_path).load())
+        context = build_research_context(history, self.convergence, prior_findings=prior)
         _assert_validation_only_context(context)
 
         query = self._citation_query(context)

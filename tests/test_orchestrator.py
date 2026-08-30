@@ -581,3 +581,153 @@ def test_summary_write_is_atomic_leaving_no_tmp_file(tmp_path):
 
     assert (cfg.paths.logs_dir / "summary.json").exists()
     assert not list(cfg.paths.logs_dir.glob("summary*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# Cross-run Do/Don't ledger: the Orchestrator logs Evaluator-judged outcomes so
+# a later run with an empty runs.jsonl still knows what has been measured.
+# The Orchestrator owns the write; the Evaluator's job stays judging.
+# ---------------------------------------------------------------------------
+
+def _proposal_hypothesis(hid="RP-001", text="use a pairwise BPR ranking loss"):
+    return (
+        "[RESEARCH_PROPOSAL v1]\n"
+        f"ID: {hid}\n"
+        "TITLE: a title\n"
+        "PARENT ITERATION: 0\n"
+        "\n"
+        "HYPOTHESIS:\n"
+        f"{text}\n"
+    )
+
+
+def _ledger_orchestrator(tmp_path, cfg, outcomes, hypotheses, evaluator=None):
+    from agent.research.findings import FindingsLedger
+
+    ledger = FindingsLedger(tmp_path / "findings.jsonl")
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=hypotheses,
+                            evaluator=evaluator)
+    orc.findings = ledger
+    return orc, ledger
+
+
+def test_a_reverted_iteration_is_logged_as_a_dont(tmp_path):
+    cfg = make_test_config(tmp_path)
+    # mean below the incumbent so FakeEvaluatorAgent reverts it.
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg,
+        [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.60},
+         {"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.55}],
+        hypotheses=(_proposal_hypothesis("RP-001"), _proposal_hypothesis("RP-002")),
+    )
+
+    orc._step(orc.run_log.read_all())      # accepted, becomes the incumbent
+    orc._step(orc.run_log.read_all())      # loses to it -> revert
+
+    stored = {f.direction: f for f in ledger.load()}
+    assert stored["RP-001"].verdict == "do"
+    assert stored["RP-002"].verdict == "dont"
+    assert stored["RP-002"].delta_vs_incumbent < 0
+
+
+def test_the_finding_survives_a_full_reset_of_the_run_state(tmp_path):
+    """The point of the feature: runs.jsonl, registry.json and
+    orchestrator_state.json all reset, and the ledger still remembers."""
+    from agent.research.findings import FindingsLedger
+
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.6}],
+        hypotheses=(_proposal_hypothesis("RP-001"),),
+    )
+    orc._step(orc.run_log.read_all())
+
+    # Wipe everything a "fresh run" resets.
+    for p in (cfg.paths.runs_jsonl, cfg.paths.registry_json, cfg.paths.orchestrator_state):
+        if p.exists():
+            p.unlink()
+
+    assert [f.direction for f in FindingsLedger(tmp_path / "findings.jsonl").load()] == ["RP-001"]
+
+
+def test_a_technical_abandon_is_not_logged(tmp_path):
+    """_handle_failed_run's abandon path has no Evaluator judgment and no
+    delta. A crash means the Coding agent couldn't build it -- not evidence
+    against the direction."""
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "crash", "sleep_s": 0.0}] * 3,
+        hypotheses=(_proposal_hypothesis("RP-009"),),
+    )
+
+    for _ in range(3):
+        orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.ABANDONED
+    assert ledger.load() == ()
+
+
+def test_a_record_without_a_proposal_id_is_not_logged(tmp_path):
+    """The seeded baseline and hand-written hypotheses have no stable direction
+    key to deduplicate on."""
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.6}],
+        hypotheses=("a plain hypothesis with no proposal envelope",),
+    )
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].decision is not None   # it WAS judged
+    assert ledger.load() == ()                                # but not logged
+
+
+def test_the_evaluators_own_words_become_the_reason(tmp_path):
+    """The 'why' is extracted from the Evaluator's commentary event -- no LLM
+    call in the write path."""
+    from agent.agents import Verdict
+
+    class _CommentingEvaluator:
+        def judge(self, record, history):
+            return Verdict(decision=Decision.REVERT,
+                           commentary="Regressed on validation primary; the loss is misaligned.")
+
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.6}],
+        hypotheses=(_proposal_hypothesis("RP-011"),),
+        evaluator=_CommentingEvaluator(),
+    )
+
+    orc._step(orc.run_log.read_all())
+
+    assert "misaligned" in ledger.load()[0].why
+
+
+def test_orchestrators_without_a_ledger_are_unaffected(tmp_path):
+    """findings defaults to None, so every existing caller and test is
+    unchanged and nothing is written anywhere."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}])
+
+    assert orc.findings is None
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.SUCCESS
+    assert not list(tmp_path.glob("**/findings.jsonl"))
+
+
+def test_a_broken_ledger_does_not_take_down_the_run(tmp_path):
+    """Observational write: the RunRecord is already appended by then."""
+    class _ExplodingLedger:
+        def record(self, finding):
+            raise RuntimeError("disk on fire")
+
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}],
+                            hypotheses=(_proposal_hypothesis("RP-012"),))
+    orc.findings = _ExplodingLedger()
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.SUCCESS
