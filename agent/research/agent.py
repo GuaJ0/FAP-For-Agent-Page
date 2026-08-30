@@ -11,7 +11,6 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -24,6 +23,22 @@ from agent.config import (
     ConvergenceConfig,
 )
 from agent.records import Decision, RunRecord, Status
+from agent.research.breadth import (
+    BreadthCandidate,
+    BreadthPlan,
+    BreadthValidationError,
+    MAX_BREADTH_CANDIDATES,
+    MIN_BREADTH_CANDIDATES,
+    MIN_BREADTH_SURVIVORS,
+    build_stack_coverage,
+    filter_breadth_candidates,
+    normalize_research_text,
+    parse_breadth_candidates_individually,
+    rank_breadth_candidates,
+    research_text_similarity,
+    validate_depth_alignment,
+    validate_research_direction_safety,
+)
 from agent.research.citations import (
     CitationSource,
     CitationValidationError,
@@ -36,11 +51,19 @@ from agent.research.findings import (
     findings_for_prompt,
 )
 from agent.research.context import ResearchContext, build_research_context
-from agent.research.prompts import SYSTEM_PROMPT, build_proposal_prompt, build_repair_prompt
+from agent.research.prompts import (
+    BREADTH_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_breadth_prompt,
+    build_breadth_repair_prompt,
+    build_proposal_prompt,
+    build_repair_prompt,
+)
 from agent.research.schemas import ProposalValidationError, ResearchProposal
 from runlog.emit import append_line, read_lines
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+BREADTH_CITATION_LIMIT = 10
 
 
 class ResearchAgentError(RuntimeError):
@@ -102,7 +125,7 @@ class ResearchUsageLog:
 
 
 def _normalise(text: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+    return normalize_research_text(text)
 
 
 def _section(text: str, heading: str) -> Optional[str]:
@@ -144,7 +167,7 @@ def _meaningful_variation(proposal: ResearchProposal, record: RunRecord) -> bool
     if not prior_hypothesis:
         return True
 
-    similarity = SequenceMatcher(None, current_hypothesis, prior_hypothesis).ratio()
+    similarity = research_text_similarity(current_hypothesis, prior_hypothesis)
     if similarity < 0.92:
         return True
 
@@ -171,7 +194,7 @@ def _reject_duplicate(proposal: ResearchProposal, history: Sequence[RunRecord]) 
         if not _was_attempted(record):
             continue
         prior = _historical_hypothesis(record)
-        similarity = SequenceMatcher(None, _normalise(proposal.hypothesis), _normalise(prior)).ratio()
+        similarity = research_text_similarity(proposal.hypothesis, prior)
         if similarity >= 0.92 and not _meaningful_variation(proposal, record):
             outcome = record.decision.value if record.decision is not None else record.status.value
             raise DuplicateHypothesisError(
@@ -252,7 +275,7 @@ def _assert_validation_only_context(context: ResearchContext) -> None:
 
 @dataclass
 class LLMResearchAgent:
-    """ResearchAgent implementation backed by the existing ``LLMClient``."""
+    """ResearchAgent with bounded breadth selection before detailed depth."""
 
     llm: LLMClient
     citation_source: CitationSource = field(default_factory=JsonCitationCatalog)
@@ -265,6 +288,7 @@ class LLMResearchAgent:
     max_repair_attempts: int = 1
     citation_limit: int = 20
     convergence: ConvergenceConfig = DEFAULT_CONFIG.convergence
+    breadth_candidate_count: int = 5
 
     last_usage: dict[str, Any] = field(default_factory=dict, init=False)
 
@@ -273,6 +297,11 @@ class LLMResearchAgent:
             raise ValueError("max_repair_attempts must be 0 or 1")
         if self.citation_limit < 1:
             raise ValueError("citation_limit must be positive")
+        if not MIN_BREADTH_CANDIDATES <= self.breadth_candidate_count <= MAX_BREADTH_CANDIDATES:
+            raise ValueError(
+                "breadth_candidate_count must be between "
+                f"{MIN_BREADTH_CANDIDATES} and {MAX_BREADTH_CANDIDATES}"
+            )
         self.usage_log_path = Path(self.usage_log_path)
         self.usage = ResearchUsageLog(self.usage_log_path)
 
@@ -292,55 +321,269 @@ class LLMResearchAgent:
                 "the configured CitationSource returned no evidence for the Research prompt"
             )
 
-        initial_prompt = build_proposal_prompt(context, citations)
         calls: list[LLMResponse] = []
-        errors: list[str] = []
-        user_prompt = initial_prompt
+        coverage = build_stack_coverage(history)
+        try:
+            selected = self._generate_breadth(
+                context=context,
+                history=history,
+                citations=citations[:BREADTH_CITATION_LIMIT],
+                coverage=coverage,
+                calls=calls,
+            )
+            proposal = self._generate_depth(
+                context=context,
+                history=history,
+                citations=citations,
+                selected=selected,
+                calls=calls,
+            )
+        except ResearchAgentError:
+            self._set_last_usage(calls)
+            raise
 
-        for attempt in range(self.max_repair_attempts + 1):
-            purpose = "propose" if attempt == 0 else "repair"
-            try:
-                response = self.llm.complete(SYSTEM_PROMPT, user_prompt, purpose=purpose)
-            except Exception as exc:
-                self._set_last_usage(calls)
-                raise ResearchAgentError(
-                    f"Research Agent LLM call failed during {purpose}: {exc}"
+        self._set_last_usage(calls)
+        return Idea(
+            hypothesis=proposal.to_handoff_text(),
+            # Use the selected incumbent from trusted context, rather than
+            # trusting the model to choose its own parent.
+            parent_iteration=context.parent_iteration,
+        )
+
+    def _complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        purpose: str,
+        attempt: int,
+        context: ResearchContext,
+        calls: list[LLMResponse],
+    ) -> LLMResponse:
+        try:
+            response = self.llm.complete(system_prompt, user_prompt, purpose=purpose)
+        except Exception as exc:
+            raise ResearchAgentError(
+                f"Research Agent LLM call failed during {purpose}: {exc}"
+            ) from exc
+        calls.append(response)
+        self.usage.record(
+            response,
+            purpose=purpose,
+            attempt=attempt,
+            parent_iteration=context.parent_iteration,
+        )
+        return response
+
+    def _generate_breadth(
+        self,
+        *,
+        context: ResearchContext,
+        history: Sequence[RunRecord],
+        citations,
+        coverage,
+        calls: list[LLMResponse],
+    ) -> BreadthCandidate:
+        initial_prompt = build_breadth_prompt(
+            context,
+            citations,
+            coverage,
+            max_candidates=self.breadth_candidate_count,
+        )
+        errors: list[str] = []
+        response = self._complete(
+            system_prompt=BREADTH_SYSTEM_PROMPT,
+            user_prompt=initial_prompt,
+            purpose="research_breadth",
+            attempt=0,
+            context=context,
+            calls=calls,
+        )
+        retained: tuple[BreadthCandidate, ...] = ()
+        rejections = ()
+        initial_candidate_ids: set[str] = set()
+        initial_count = 0
+        try:
+            # Keep individually valid work from a sound JSON envelope. A
+            # malformed top level still has no trustworthy candidates to keep.
+            parsed = parse_breadth_candidates_individually(
+                response.text,
+                min_candidates=1,
+                max_candidates=self.breadth_candidate_count,
+            )
+            initial_count = parsed.raw_candidate_count
+            initial_candidate_ids = set(parsed.reserved_candidate_ids)
+            retained, filter_rejections = filter_breadth_candidates(
+                parsed.plan,
+                history=history,
+                citation_source=self.citation_source,
+            )
+            rejections = (*parsed.rejections, *filter_rejections)
+            if (
+                initial_count == self.breadth_candidate_count
+                and not parsed.rejections
+                and len(retained) >= MIN_BREADTH_SURVIVORS
+            ):
+                ranked = rank_breadth_candidates(
+                    retained,
+                    history=history,
+                    coverage=coverage,
+                    context=context,
+                    citation_source=self.citation_source,
+                )
+                return ranked[0].candidate
+            detail = "; ".join(
+                f"{item.candidate_id}: {item.reason}" for item in rejections
+            ) or "no candidate-specific rejection"
+            count_detail = (
+                f"configured batch requires exactly {self.breadth_candidate_count}; "
+                f"model returned {initial_count}. "
+                if initial_count != self.breadth_candidate_count
+                else ""
+            )
+            raise BreadthValidationError(
+                count_detail
+                + "breadth requires at least "
+                f"{MIN_BREADTH_SURVIVORS} post-filter survivors; got "
+                f"{len(retained)}: {detail}"
+            )
+        except BreadthValidationError as exc:
+            errors.append(str(exc))
+            if self.max_repair_attempts == 0:
+                raise ResearchOutputError(
+                    "Research Agent breadth phase failed after 1 call(s): "
+                    f"attempt 1: {exc}"
                 ) from exc
-            calls.append(response)
-            self.usage.record(
-                response,
+
+        replacement_count = self.breadth_candidate_count - len(retained)
+        repair_prompt = build_breadth_repair_prompt(
+            original_prompt=initial_prompt,
+            original_response=response.text,
+            validation_error=errors[-1],
+            retained_candidates=retained,
+            rejections=rejections,
+            replacement_count=replacement_count,
+            configured_candidate_count=self.breadth_candidate_count,
+        )
+        repair_response = self._complete(
+            system_prompt=BREADTH_SYSTEM_PROMPT,
+            user_prompt=repair_prompt,
+            purpose="research_breadth_repair",
+            attempt=1,
+            context=context,
+            calls=calls,
+        )
+        try:
+            replacements = BreadthPlan.from_json_with_bounds(
+                repair_response.text,
+                min_candidates=1,
+                max_candidates=replacement_count,
+                exact_candidates=replacement_count,
+            )
+            reused_ids = sorted(
+                item.candidate_id
+                for item in replacements.candidates
+                if item.candidate_id.casefold() in initial_candidate_ids
+            )
+            if reused_ids:
+                raise BreadthValidationError(
+                    "breadth repair candidate IDs must be new; reused "
+                    + ", ".join(reused_ids)
+                )
+            combined_json = json.dumps({
+                "schema_version": 1,
+                "candidates": [
+                    candidate.to_prompt_dict()
+                    for candidate in (*retained, *replacements.candidates)
+                ],
+            })
+            combined = BreadthPlan.from_json_with_bounds(
+                combined_json,
+                min_candidates=MIN_BREADTH_CANDIDATES,
+                max_candidates=self.breadth_candidate_count,
+                exact_candidates=self.breadth_candidate_count,
+            )
+            final_survivors, final_rejections = filter_breadth_candidates(
+                combined,
+                history=history,
+                citation_source=self.citation_source,
+                protected_candidate_ids=frozenset(
+                    item.candidate_id for item in retained
+                ),
+            )
+            if len(final_survivors) < MIN_BREADTH_SURVIVORS:
+                detail = "; ".join(
+                    f"{item.candidate_id}: {item.reason}"
+                    for item in final_rejections
+                ) or "too few genuinely different candidates survived"
+                raise BreadthValidationError(
+                    "breadth requires at least "
+                    f"{MIN_BREADTH_SURVIVORS} post-filter survivors after repair; got "
+                    f"{len(final_survivors)}: {detail}"
+                )
+            ranked = rank_breadth_candidates(
+                final_survivors,
+                history=history,
+                coverage=coverage,
+                context=context,
+                citation_source=self.citation_source,
+            )
+            return ranked[0].candidate
+        except BreadthValidationError as exc:
+            errors.append(str(exc))
+            raise ResearchOutputError(
+                "Research Agent breadth phase failed after 2 call(s): "
+                + " | ".join(
+                    f"attempt {index + 1}: {error}"
+                    for index, error in enumerate(errors)
+                )
+            ) from exc
+
+    def _generate_depth(
+        self,
+        *,
+        context: ResearchContext,
+        history: Sequence[RunRecord],
+        citations,
+        selected: BreadthCandidate,
+        calls: list[LLMResponse],
+    ) -> ResearchProposal:
+        initial_prompt = build_proposal_prompt(context, citations, selected)
+        user_prompt = initial_prompt
+        errors: list[str] = []
+        for attempt in range(self.max_repair_attempts + 1):
+            purpose = "research_depth" if attempt == 0 else "research_depth_repair"
+            response = self._complete(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=user_prompt,
                 purpose=purpose,
                 attempt=attempt,
-                parent_iteration=context.parent_iteration,
+                context=context,
+                calls=calls,
             )
-
             try:
-                proposal = self._validate_response(response.text, context, history)
+                return self._validate_response(
+                    response.text,
+                    context,
+                    history,
+                    selected=selected,
+                )
             except (ProposalValidationError, CitationValidationError) as exc:
                 errors.append(str(exc))
                 if attempt >= self.max_repair_attempts:
-                    self._set_last_usage(calls)
                     raise ResearchOutputError(
-                        "Research Agent failed to produce a valid proposal after "
-                        f"{len(calls)} call(s): " + " | ".join(
-                            f"attempt {i + 1}: {error}" for i, error in enumerate(errors)
+                        "Research Agent depth phase failed after "
+                        f"{attempt + 1} call(s): " + " | ".join(
+                            f"attempt {index + 1}: {error}"
+                            for index, error in enumerate(errors)
                         )
                     ) from exc
                 user_prompt = build_repair_prompt(
                     original_prompt=initial_prompt,
                     original_response=response.text,
                     validation_error=str(exc),
+                    selected_candidate=selected,
                 )
-                continue
-
-            self._set_last_usage(calls)
-            return Idea(
-                hypothesis=proposal.to_handoff_text(),
-                # Use the selected incumbent from trusted context, rather than
-                # trusting the model to choose its own parent.
-                parent_iteration=context.parent_iteration,
-            )
-
         raise AssertionError("unreachable")
 
     def _validate_response(
@@ -348,10 +591,18 @@ class LLMResearchAgent:
         text: str,
         context: ResearchContext,
         history: Sequence[RunRecord],
+        *,
+        selected: Optional[BreadthCandidate] = None,
     ) -> ResearchProposal:
         proposal = ResearchProposal.from_json(text)
+        validate_research_direction_safety(
+            proposal.to_dict(),
+            origin="depth Research proposal",
+        )
         _validate_proposal_against_context(proposal, context, history)
         validate_proposal_citations(proposal, self.citation_source)
+        if selected is not None:
+            validate_depth_alignment(proposal, selected)
         return proposal
 
     @staticmethod

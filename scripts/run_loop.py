@@ -54,7 +54,6 @@ from agent.executor import Executor  # noqa: E402
 from agent.orchestrator import BootstrapError, Orchestrator  # noqa: E402
 from agent.records import RunLog  # noqa: E402
 from agent.research import LLMResearchAgent, OfflineResearchAgent  # noqa: E402
-from agent.research.offline import OfflineBacklogExhausted  # noqa: E402
 from agent.research.findings import DEFAULT_FINDINGS_PATH, FindingsLedger  # noqa: E402
 from agent.registry import CheckpointRegistry  # noqa: E402
 from agent.state import StateStore  # noqa: E402
@@ -281,14 +280,17 @@ def _main() -> int:
         print(f"[baseline] iteration 0: valid primary={agg.primary_mean:.4f} "
               f"(std {agg.primary_std:.4f}) over {agg.n_seeds} seed(s) -- this is the bar")
 
-    try:
-        history = orc.run()
-    except OfflineBacklogExhausted as e:
-        # The deterministic backlog running out is the natural end of an
-        # exploration pass, not a failure: every idea it holds has been tried.
-        # Records already written are durable, so re-read rather than lose them.
-        print(f"\n[research] offline backlog exhausted -- stopping cleanly: {e}")
-        history = orc.run_log.read_all()
+    history = orc.run()
+    # getattr: the wiring tests substitute a minimal Orchestrator stub whose
+    # only contract is run(). Reporting why a run stopped must not require
+    # every stand-in to grow internal state to stay callable.
+    if getattr(getattr(orc, "state", None), "research_exhausted", False):
+        # The natural end of an exploration pass: every idea the backlog holds
+        # has been tried. Orchestrator stops the loop cleanly for this (see
+        # _handle_research_exhausted) rather than recording it as a failure to
+        # propose, so there is nothing to catch here -- only to report.
+        print(f"\n[research] nothing left to propose -- stopped cleanly: "
+              f"{orc.state.research_exhausted_reason}")
 
     print(f"\n=== finished in {time.time() - t0:.0f}s, {len(history)} record(s) ===")
     for r in history:

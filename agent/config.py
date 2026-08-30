@@ -51,6 +51,11 @@ class RetryConfig:
     max_fix_attempts: int = 3               # tier 1: fixes on the same idea before abandoning it
     max_consecutive_abandonments: int = 2   # tier 2: back-to-back abandonments before halting for a human
     idea_time_backstop_s: float = 45 * 60.0  # abandon an idea past this wall time regardless of attempt count
+    # Separate from the two above: this fires before an idea even exists.
+    # A ResearchAgent that can't produce ONE proposal is a different failure
+    # mode from an idea whose implementation keeps failing, and needs its own
+    # cap rather than overloading max_fix_attempts/max_consecutive_abandonments.
+    max_consecutive_research_failures: int = 3   # halt for a human after this many propose() failures in a row
 
 
 @dataclass(frozen=True)

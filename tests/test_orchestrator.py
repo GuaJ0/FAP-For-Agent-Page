@@ -731,3 +731,230 @@ def test_a_broken_ledger_does_not_take_down_the_run(tmp_path):
     orc._step(orc.run_log.read_all())
 
     assert orc.run_log.read_all()[-1].status == Status.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# A ResearchAgent.propose() failure must never crash the whole run -- exposed
+# by a real live run where the Research agent's depth-phase validation raised
+# ResearchOutputError with nothing catching it, killing the entire process
+# after only the baseline had run. CodingAgent.implement() and
+# EvaluatorAgent.judge() were both built to never raise; propose() had no such
+# contract and _step() had nothing guarding the call.
+# ---------------------------------------------------------------------------
+
+class _FlakyResearchAgent:
+    """Raises on propose() for the first `fail_times` calls, then succeeds."""
+
+    def __init__(self, fail_times, hypothesis="a real idea"):
+        self._remaining = fail_times
+        self._hypothesis = hypothesis
+
+    def propose(self, history):
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise RuntimeError("simulated Research proposal failure")
+        from agent.agents import Idea
+        parent = history[-1].iteration if history else None
+        return Idea(hypothesis=self._hypothesis, parent_iteration=parent)
+
+
+def test_a_research_failure_is_recorded_and_the_run_continues(tmp_path):
+    cfg = make_test_config(tmp_path)
+    research = _FlakyResearchAgent(fail_times=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    orc._step(orc.run_log.read_all())   # the failed propose() attempt
+    history = orc.run_log.read_all()
+    assert len(history) == 1
+    assert history[0].status == Status.FAILED
+    assert history[0].aggregate is None
+    assert "RuntimeError" in history[0].events[0].detail
+    assert orc.state.halted is False
+    assert orc.state.consecutive_research_failures == 1
+
+    orc._step(orc.run_log.read_all())   # this time propose() succeeds
+    history = orc.run_log.read_all()
+    assert len(history) == 2
+    assert history[-1].status == Status.SUCCESS
+    assert orc.state.consecutive_research_failures == 0, "a successful propose() must reset the counter"
+
+
+def test_repeated_research_failures_halt_for_a_human(tmp_path):
+    cfg = make_test_config(tmp_path)   # default max_consecutive_research_failures=3
+    research = _FlakyResearchAgent(fail_times=10)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    for _ in range(2):
+        orc._step(orc.run_log.read_all())
+    assert orc.state.halted is False
+
+    orc._step(orc.run_log.read_all())   # the 3rd consecutive failure
+    assert orc.state.halted is True
+    assert "3 consecutive Research proposal failures" in orc.state.halt_reason
+
+    history = orc.run_log.read_all()
+    assert len(history) == 3
+    assert [r.status for r in history] == [Status.FAILED, Status.FAILED, Status.ABANDONED]
+
+    with pytest.raises(OrchestratorHalted):
+        orc.run()
+
+
+def test_research_failure_records_do_not_consume_a_max_iterations_slot(tmp_path):
+    """2 failures stay below the default max_consecutive_research_failures=3,
+    so both records are FAILED (not ABANDONED) -- and FAILED records, like a
+    failed training attempt, must not count against max_iterations."""
+    from agent.config import ConvergenceConfig
+    from agent.convergence import should_stop
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=1))
+    research = _FlakyResearchAgent(fail_times=2)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    for _ in range(2):
+        orc._step(orc.run_log.read_all())
+
+    history = orc.run_log.read_all()
+    assert [r.status for r in history] == [Status.FAILED, Status.FAILED]
+
+    stop, reason = should_stop(history, cfg.convergence)
+    assert stop is False, "FAILED research-proposal records must not trip max_iterations=1"
+
+
+# ---------------------------------------------------------------------------
+# An exhausted Research agent has FINISHED, not failed.
+#
+# The distinction matters because the two are handled oppositely. A failure to
+# propose is recorded, retried, and escalated to a human once enough pile up --
+# right for an agent that cannot produce a valid proposal, wrong for a
+# deterministic backlog that has proposed every idea it holds. Without this
+# split, an exploration campaign reaching its natural end would write failed
+# records describing no real experiment and then halt as if it had broken.
+# ---------------------------------------------------------------------------
+
+class _ExhaustedResearchAgent:
+    """Proposes `n` real ideas, then reports it has nothing left."""
+
+    def __init__(self, n=0, hypothesis="a real idea"):
+        self._remaining = n
+        self._hypothesis = hypothesis
+        self.calls = 0
+
+    def propose(self, history):
+        from agent.agents import Idea, ResearchExhausted
+
+        self.calls += 1
+        if self._remaining <= 0:
+            raise ResearchExhausted("backlog exhausted: every idea has been tried")
+        self._remaining -= 1
+        return Idea(hypothesis=self._hypothesis,
+                    parent_iteration=history[-1].iteration if history else None)
+
+
+def test_an_exhausted_research_agent_stops_the_run_without_recording_a_failure(tmp_path):
+    cfg = make_test_config(tmp_path)
+    research = _ExhaustedResearchAgent(n=0)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    history = orc.run()
+
+    assert history == []                                   # no junk iteration recorded
+    assert orc.state.research_exhausted is True
+    assert "exhausted" in orc.state.research_exhausted_reason
+    assert orc.state.consecutive_research_failures == 0     # it did not fail at anything
+    assert orc.state.halted is False                        # and nobody is being paged
+
+
+def test_exhaustion_never_escalates_however_long_the_run_would_continue(tmp_path):
+    """The failure path halts after max_consecutive_research_failures. If
+    exhaustion went down that path, a finished campaign would report itself as
+    a breakdown needing human intervention."""
+    from agent.config import ConvergenceConfig
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=50))
+    research = _ExhaustedResearchAgent(n=0)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    orc.run()
+
+    assert research.calls == 1          # asked once, believed the answer
+    assert orc.state.halted is False
+    assert not orc.run_log.read_all()
+
+
+def test_a_resumed_run_whose_backlog_was_exhausted_stops_immediately(tmp_path):
+    """Terminal and persisted: re-running must not call propose() again just to
+    be told the same thing."""
+    cfg = make_test_config(tmp_path)
+    research = _ExhaustedResearchAgent(n=0)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+    orc.run()
+    assert research.calls == 1
+
+    resumed = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+    assert resumed.state.research_exhausted is True     # survived the state file
+    resumed.run()
+
+    assert research.calls == 1                          # not asked a second time
+
+
+def test_ideas_proposed_before_exhaustion_still_run_normally(tmp_path):
+    """Exhaustion ends the run at the point it happens -- it does not discard
+    the work the campaign already did."""
+    from agent.config import ConvergenceConfig
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=50))
+    research = _ExhaustedResearchAgent(n=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    history = orc.run()
+
+    assert [r.status for r in history] == [Status.SUCCESS]
+    assert history[0].decision is not None               # really judged
+    assert orc.state.research_exhausted is True
+
+
+def test_a_plain_exception_is_still_a_failure_not_an_orderly_finish(tmp_path):
+    """The split must not have loosened the failure path: anything that is not
+    ResearchExhausted still records, retries and can escalate."""
+    cfg = make_test_config(tmp_path)
+    research = _FlakyResearchAgent(fail_times=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.state.research_exhausted is False
+    assert orc.state.consecutive_research_failures == 1
+    assert [r.status for r in orc.run_log.read_all()] == [Status.FAILED]
+
+
+def test_an_orderly_finish_is_visible_in_summary_json(tmp_path):
+    """Why a run stopped has to be on disk -- no RunRecord is written for an
+    orderly finish, so summary.json is where it has to show up."""
+    import json
+
+    from agent.config import ConvergenceConfig
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=50))
+    research = _ExhaustedResearchAgent(n=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    orc.run()
+
+    summary = json.loads((cfg.paths.logs_dir / "summary.json").read_text())
+    assert "exhausted" in summary["stopped_because"]
+
+
+def test_the_offline_backlog_exhaustion_error_is_an_orderly_finish(tmp_path):
+    """The concrete case this exists for: OfflineResearchAgent running out of
+    backlog entries at the end of an exploration campaign."""
+    from agent.agents import ResearchExhausted
+    from agent.research.offline import OfflineBacklogExhausted, OfflineResearchError
+
+    assert issubclass(OfflineBacklogExhausted, ResearchExhausted)
+    # and still what existing callers/tests catch
+    assert issubclass(OfflineBacklogExhausted, OfflineResearchError)

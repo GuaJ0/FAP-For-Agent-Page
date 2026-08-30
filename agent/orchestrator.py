@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent
+from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent, ResearchExhausted
 from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
 # _parse_ts is imported rather than re-implemented on purpose: summary.json's
 # wall_s and convergence.should_stop's wall-clock budget must be the SAME
@@ -123,11 +123,18 @@ class Orchestrator:
         while True:
             if self.state.halted:
                 raise OrchestratorHalted(self.state.halt_reason)
+            # Checked before should_stop as well as after _step, so a resumed
+            # run whose backlog was already exhausted stops immediately rather
+            # than calling propose() again just to be told the same thing.
+            if self.state.research_exhausted:
+                break
             history = self.run_log.read_all()
             stop, reason = should_stop(history, self.cfg.convergence)
             if stop:
                 break
             self._step(history)
+            if self.state.research_exhausted:
+                break
         return self.run_log.read_all()
 
     def bootstrap_baseline(self, idea: Idea, diff: Diff) -> RunRecord:
@@ -312,11 +319,27 @@ class Orchestrator:
 
         idea = self.state.get_current_idea()
         if idea is None:
-            idea = self.research.propose(history)
+            # No try/except here used to mean one bad proposal could take
+            # down the entire run -- see _handle_research_failure's docstring.
+            # CodingAgent.implement() and EvaluatorAgent.judge() were both
+            # built to never raise; ResearchAgent.propose() had no such
+            # contract, and _step() had nothing guarding the call.
+            try:
+                idea = self.research.propose(history)
+            except ResearchExhausted as e:
+                # Ordered BEFORE the broad except: an agent that has finished
+                # has not failed, and must not be retried or escalated. See
+                # _handle_research_exhausted.
+                self._handle_research_exhausted(e)
+                return
+            except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring below
+                self._handle_research_failure(e, history)
+                return
             self.state.set_current_idea(idea)
             self.state.fix_attempts = 0
             self.state.idea_start_time = now
             self.state.last_failure_feedback = None
+            self.state.consecutive_research_failures = 0
             self._save_state()
 
         diff = self.coding.implement(idea, self.state.last_failure_feedback)
@@ -339,6 +362,85 @@ class Orchestrator:
             self._handle_successful_run(iteration, idea, diff, seeds, agg, history)
 
         self.state.iteration = iteration
+        self._save_state()
+        self._write_summary()
+
+    def _handle_research_exhausted(self, error: Exception) -> None:
+        """Research reported it has nothing left to propose. End the run cleanly.
+
+        Deliberately NOT _handle_research_failure: that path records a failed
+        iteration, counts toward consecutive_research_failures and escalates to
+        a human once enough pile up. Applied to an orderly finish it would log
+        records describing no real experiment, then report a run that completed
+        its whole backlog as a breakdown needing intervention.
+
+        No RunRecord is written for the same reason: runs.jsonl records
+        iterations, and this is the absence of one. The reason is kept in
+        orchestrator state and lands in summary.json, so why the run stopped is
+        still on disk and still auditable.
+        """
+        self.state.research_exhausted = True
+        self.state.research_exhausted_reason = f"{type(error).__name__}: {error}"[:2000]
+        self._save_state()
+        self._write_summary()
+
+    def _handle_research_failure(self, error: Exception, history: list[RunRecord]) -> None:
+        """A ResearchAgent.propose() call raised. Record it as a real, honest
+        failed iteration and let the run continue -- never let one bad
+        proposal end an unattended 6h run, the same principle already applied
+        to CodingAgent (always returns a Diff, even on total repair failure)
+        and EvaluatorAgent (falls back rather than raising on a bad verdict).
+
+        Why the record still matters even though no idea/diff/metrics exist:
+        it is exactly the "error/recovery event, and how it was handled"
+        Deliverable 3 asks for, and it is what keeps convergence's wall-clock
+        check honest -- each attempt gets a fresh timestamp, so a run stuck
+        repeatedly failing to propose still measures real elapsed time
+        instead of the window silently freezing on the last successful
+        record. A FAILED status also means it does NOT consume a
+        max_iterations slot, same as a failed training attempt.
+
+        Escalates to a human (OrchestratorHalted, same mechanism as tier-2)
+        after max_consecutive_research_failures in a row -- a Research agent
+        that cannot propose at all is a categorically different problem from
+        one hard idea, and burning the whole wall-clock/cost budget retrying
+        it forever would be worse than stopping and asking.
+        """
+        self.state.consecutive_research_failures += 1
+        iteration = self.state.iteration + 1
+        halt = self.state.consecutive_research_failures >= self.cfg.retry.max_consecutive_research_failures
+
+        record = RunRecord(
+            iteration=iteration,
+            parent_iteration=history[-1].iteration if history else None,
+            timestamp=_iso_now(),
+            hypothesis=f"[no proposal produced: {type(error).__name__}: {error}]"[:2000],
+            diff_path=None,
+            status=Status.ABANDONED if halt else Status.FAILED,
+            seeds=[],
+            aggregate=None,
+            delta_vs_current_best=None,
+            decision=Decision.ABANDON if halt else None,
+            events=[Event(
+                type="research_failed",
+                detail=(
+                    f"consecutive_research_failures={self.state.consecutive_research_failures} "
+                    f"reason={type(error).__name__}: {error}"
+                )[:2000],
+                agent_action="research",
+            )],
+            resources=ResourceUsage(wall_s=0.0),
+        )
+        self.run_log.append(record)
+        self.state.iteration = iteration
+
+        if halt:
+            self.state.halted = True
+            self.state.halt_reason = (
+                f"{self.state.consecutive_research_failures} consecutive Research proposal "
+                f"failures; escalating to human. Last error: {type(error).__name__}: {error}"
+            )
+
         self._save_state()
         self._write_summary()
 
@@ -670,6 +772,10 @@ class Orchestrator:
             "best_iteration": best.iteration if best else None,
             "best_val_primary": best.val_primary if best else None,
             "usage": usage,
+            # None while the run is live. Set when Research reported it had
+            # nothing left to propose, so an orderly finish is distinguishable
+            # on disk from a run that was killed or that hit convergence.
+            "stopped_because": self.state.research_exhausted_reason,
         }
 
         path = self.cfg.paths.logs_dir / "summary.json"

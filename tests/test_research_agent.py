@@ -14,7 +14,9 @@ from agent.research.agent import (
     ResearchInputError,
     ResearchOutputError,
 )
+from agent.research.breadth import BreadthCandidate
 from agent.research.citations import JsonCitationCatalog
+from agent.research.context import build_research_context
 from agent.research.schemas import ResearchProposal
 
 
@@ -31,7 +33,7 @@ def _proposal(
         "schema_version": 1,
         "hypothesis_id": hypothesis_id,
         "parent_iteration": parent,
-        "title": "Hybrid pointwise and pairwise objective",
+        "title": "Weighted BPR objective addition",
         "hypothesis": hypothesis or (
             "Add a small BPR term to the incumbent pointwise objective so direct within-user "
             "ranking pressure is added without discarding its useful signal."
@@ -77,6 +79,92 @@ def _proposal(
     }
 
 
+def _breadth():
+    return {
+        "schema_version": 1,
+        "candidates": [{
+            "candidate_id": "B-HYBRID-RANKING",
+            "title": "Hybrid pointwise and pairwise ranking objective",
+            "stack_stage": "objective_sampling",
+            "primary_change": "Add a weighted BPR pairwise objective term.",
+            "mechanism": (
+                "Blend retained pointwise supervision with a weighted within-user "
+                "pairwise term."
+            ),
+            "metric_rationale": "Direct ordering pressure should improve GAUC and nDCG@5.",
+            "expected_upside": "high",
+            "implementation_risk": "low",
+            "experiment_cost": "medium",
+            "evidence": [
+                {
+                    "citation_id": "rendle2009bpr",
+                    "claim_id": "pairwise-ranking-objective",
+                },
+                {
+                    "citation_id": "covington2016youtube",
+                    "claim_id": "ranking-objective-and-watch-time",
+                },
+            ],
+        }, {
+            "candidate_id": "B-CONTENT-FEATURES",
+            "title": "Candidate content features",
+            "stack_stage": "features",
+            "primary_change": "Add candidate video metadata content features.",
+            "mechanism": "Add video metadata content features for each candidate item.",
+            "metric_rationale": "Metadata may improve validation ranking.",
+            "expected_upside": "medium",
+            "implementation_risk": "medium",
+            "experiment_cost": "medium",
+            "evidence": [{
+                "citation_id": "covington2016youtube",
+                "claim_id": "ranking-objective-and-watch-time",
+            }],
+        }, {
+            "candidate_id": "B-DEEPFM",
+            "title": "DeepFM interaction architecture",
+            "stack_stage": "architecture",
+            "primary_change": "Add a DeepFM interaction architecture.",
+            "mechanism": "Add a DeepFM interaction tower architecture.",
+            "metric_rationale": "Feature interactions may improve validation ranking.",
+            "expected_upside": "medium",
+            "implementation_risk": "medium",
+            "experiment_cost": "medium",
+            "evidence": [{
+                "citation_id": "guo2017deepfm",
+                "claim_id": "joint-low-high-order-interactions",
+            }],
+        }, {
+            "candidate_id": "B-REGULARIZATION",
+            "title": "Embedding dropout regularization",
+            "stack_stage": "optimization_regularization",
+            "primary_change": "Apply embedding dropout regularization.",
+            "mechanism": "Regularize embeddings with dropout while retaining the model architecture.",
+            "metric_rationale": "Regularization may improve validation generalization.",
+            "expected_upside": "medium",
+            "implementation_risk": "low",
+            "experiment_cost": "low",
+            "evidence": [{
+                "citation_id": "guo2017deepfm",
+                "claim_id": "joint-low-high-order-interactions",
+            }],
+        }, {
+            "candidate_id": "B-ENSEMBLE",
+            "title": "Checkpoint prediction averaging",
+            "stack_stage": "inference_ensemble",
+            "primary_change": "Use prediction averaging.",
+            "mechanism": "Average predictions from retained checkpoints without changing training.",
+            "metric_rationale": "Averaging may stabilize GAUC and nDCG@5.",
+            "expected_upside": "low",
+            "implementation_risk": "low",
+            "experiment_cost": "low",
+            "evidence": [{
+                "citation_id": "covington2016youtube",
+                "claim_id": "ranking-objective-and-watch-time",
+            }],
+        }],
+    }
+
+
 def _record(
     iteration,
     primary,
@@ -109,8 +197,8 @@ def _record(
     )
 
 
-def _agent(tmp_path, responses, **kwargs):
-    client = ScriptedClient(list(responses))
+def _agent(tmp_path, responses, *, breadth=None, **kwargs):
+    client = ScriptedClient([json.dumps(breadth or _breadth()), *responses])
     agent = LLMResearchAgent(
         llm=client,
         citation_source=JsonCitationCatalog(),
@@ -129,7 +217,10 @@ def test_valid_proposal_returns_existing_idea_contract(tmp_path):
     assert idea.parent_iteration == 3
     assert idea.hypothesis.startswith("[RESEARCH_PROPOSAL v1]")
     assert "relative to accepted parent iteration 3" in idea.hypothesis
-    assert client.calls[0][2] == "propose"
+    assert [purpose for _, _, purpose in client.calls] == [
+        "research_breadth",
+        "research_depth",
+    ]
 
 
 def test_custom_convergence_config_is_used_in_llm_research_context(tmp_path):
@@ -177,11 +268,15 @@ def test_malformed_json_can_be_repaired_once(tmp_path):
     idea = agent.propose([_record(3, 0.62, Decision.ACCEPT)])
 
     assert idea.parent_iteration == 3
-    assert [purpose for _, _, purpose in client.calls] == ["propose", "repair"]
-    repair_prompt = client.calls[1][1]
+    assert [purpose for _, _, purpose in client.calls] == [
+        "research_breadth",
+        "research_depth",
+        "research_depth_repair",
+    ]
+    repair_prompt = client.calls[2][1]
     assert "proposal is not valid JSON" in repair_prompt
-    assert "<previous_response>" in repair_prompt
-    assert "{broken}" in repair_prompt
+    assert "<previous_response>" not in repair_prompt
+    assert json.dumps("```json\n{broken}\n```", ensure_ascii=False) in repair_prompt
 
 
 def test_failed_repair_raises_clear_research_error(tmp_path):
@@ -211,13 +306,17 @@ def test_prior_results_must_exist_in_research_history(tmp_path):
 
 
 def test_hypothesis_id_cannot_collide_with_an_attempted_id(tmp_path):
-    historical = ResearchProposal.from_dict(
-        _proposal(
-            parent=3,
-            hypothesis_id="H-USED",
-            hypothesis="Calibrate the incumbent scores with a held-out monotonic mapping.",
-        )
-    ).to_handoff_text()
+    historical_data = _proposal(
+        parent=3,
+        hypothesis_id="H-USED",
+        hypothesis="Calibrate the incumbent scores with a held-out monotonic mapping.",
+    )
+    historical_data["title"] = "Monotonic score calibration"
+    historical_data["implementation"]["target_components"] = ["score calibration"]
+    historical_data["implementation"]["steps"] = [
+        "Fit a monotonic score calibration mapping on validation-safe data."
+    ]
+    historical = ResearchProposal.from_dict(historical_data).to_handoff_text()
     history = [
         _record(3, 0.62, Decision.ACCEPT),
         _record(4, 0.64, Decision.ACCEPT, hypothesis=historical),
@@ -281,11 +380,31 @@ def test_meaningful_follow_up_to_accepted_hypothesis_is_allowed_with_a_new_id(tm
         "Anneal the pairwise coefficient linearly during the first four epochs."
     )
     follow_up["implementation"]["hyperparameters"]["anneal_epochs"] = 4
-    agent, _ = _agent(tmp_path, [json.dumps(follow_up)])
+    follow_up_breadth = _breadth()
+    follow_up_breadth["candidates"][0]["title"] = "Annealed hybrid pairwise objective"
+    follow_up_breadth["candidates"][0]["primary_change"] = (
+        "Anneal the coefficient of the existing BPR pairwise objective term."
+    )
+    follow_up_breadth["candidates"][0]["mechanism"] = (
+        "Add a BPR pairwise term and anneal its coefficient over four epochs."
+    )
+    agent, _ = _agent(
+        tmp_path,
+        [],
+        breadth=follow_up_breadth,
+    )
+    selected = BreadthCandidate.from_dict(
+        follow_up_breadth["candidates"][0], "candidate"
+    )
+    proposal = agent._validate_response(
+        json.dumps(follow_up),
+        build_research_context(history),
+        history,
+        selected=selected,
+    )
 
-    idea = agent.propose(history)
-
-    assert "ID: H-FOLLOW-UP" in idea.hypothesis
+    assert proposal.parent_iteration == 4
+    assert proposal.hypothesis_id == "H-FOLLOW-UP"
 
 
 def test_parent_is_selected_from_best_accepted_incumbent(tmp_path):
@@ -317,7 +436,7 @@ def test_research_usage_accounting_is_scoped_and_persisted(tmp_path):
 
     agent.propose([_record(3, 0.62, Decision.ACCEPT)])
 
-    assert agent.last_usage["llm_calls"] == 1
+    assert agent.last_usage["llm_calls"] == 2
     assert agent.last_usage["tokens_in"] > 0
     assert agent.last_usage["tokens_out"] > 0
     # ScriptedClient uses the existing estimator; unknown scripted model price
@@ -325,7 +444,7 @@ def test_research_usage_accounting_is_scoped_and_persisted(tmp_path):
     assert agent.last_usage["cost_usd"] == 0.0
     rows = [json.loads(line) for line in (tmp_path / "research_usage.jsonl").read_text().splitlines()]
     assert rows[0]["agent"] == "research"
-    assert rows[0]["purpose"] == "propose"
+    assert [row["purpose"] for row in rows] == ["research_breadth", "research_depth"]
     assert agent.usage.totals()["tokens_in"] == agent.last_usage["tokens_in"]
 
 

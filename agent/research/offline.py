@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
-from agent.agents import Idea
+from agent.agents import Idea, ResearchExhausted
 from agent.config import ConvergenceConfig, DEFAULT_CONFIG
 from agent.records import RunRecord
 from agent.research.agent import (
@@ -34,8 +34,15 @@ class OfflineResearchError(ResearchAgentError):
     """The deterministic Research configuration itself is invalid."""
 
 
-class OfflineBacklogExhausted(OfflineResearchError):
-    """No untried, citation-valid idea fits the remaining experiment budget."""
+class OfflineBacklogExhausted(OfflineResearchError, ResearchExhausted):
+    """No untried, citation-valid idea fits the remaining experiment budget.
+
+    Also a ResearchExhausted, which is what tells the Orchestrator this is an
+    orderly finish rather than a failure to propose: retrying a backlog that
+    has run out cannot succeed, so it must not accumulate failed records or
+    escalate to a human. Still an OfflineResearchError so existing callers and
+    tests that catch that keep catching it.
+    """
 
 
 @dataclass(frozen=True)

@@ -56,16 +56,73 @@ injection. It does not own an API client or make assumptions about the provider.
 The agent:
 
 1. builds and leak-checks Research context;
-2. retrieves an evidence packet from its configured `CitationSource`;
-3. requests one strict JSON `ResearchProposal`;
-4. validates schema, parent iteration, citations, claims, and duplication; and
-5. returns the shared handoff text.
+2. summarizes current-run coverage across `features`, `architecture`,
+   `objective_sampling`, `optimization_regularization`, and
+   `inference_ensemble`;
+3. retrieves a compact evidence packet from its configured `CitationSource`;
+4. makes one bounded breadth call for exactly the configured number of shallow
+   candidate directions (five by default; the absolute supported range remains
+   three to eight), each with one bounded `primary_change` that identifies its
+   intervention;
+5. deterministically hard-filters malformed, unsafe, benchmark-manipulating,
+   unsupported, duplicate, ambiguous-stage, and mislabelled-stage candidates;
+6. requires at least three genuinely different candidates to survive those
+   filters, otherwise invoking the single bounded breadth repair;
+7. softly ranks survivors using structural mechanism novelty, relevant
+   distinct-source evidence,
+   stack coverage, remaining budget, and modest feasibility/upside priors;
+8. gives only the selected direction to the existing detailed depth prompt;
+9. safety-scans the final proposal and validates that it retains the selected
+   stage, mechanism, and supporting evidence; and
+10. returns the shared handoff text.
 
-Malformed or invalid output gets at most one repair call. The repair prompt
-contains the original response and deterministic validation error. A second
-failure raises `ResearchOutputError`; malformed output is never accepted
-silently. Research token counts and estimated cost are written independently to
+Coverage is a soft preference. An unexplored stage receives a diversity bonus,
+while repeated or most-recently explored stages receive a bounded penalty. A
+strong repeated-stage candidate can still win when its independently checked
+evidence, novelty, and feasibility outweigh that penalty. Self-reported upside,
+risk, and cost are weak priors rather than dominant signals; their maximum
+combined advantage is smaller than one relevant evidence source. Under a tight
+budget, candidate-declared cost receives no second adjustment beyond the
+ordinary weak cost prior; objective feasibility signals can be added separately
+in the future.
+Evidence count is based on distinct citation IDs, capped at two, and a source
+receives full ranking credit only when a confident primary mechanism family and
+stack stage in its trusted title/claim match the candidate. Copied technical
+tokens do not earn that credit. Multiple claims from one source do not inflate
+it. Citation identity and claim provenance remain valid even when ranking
+relevance is zero; this relevance heuristic is not proof of semantic support.
+Only the one winning candidate reaches the Coding Agent.
+
+Malformed or short breadth, or a batch with fewer than three surviving
+candidates, gets at most one breadth repair. Valid survivors are retained; the
+repair response supplies only fresh replacement IDs, and the combined pool is
+passed through the same safety, evidence, mechanism, history-duplicate, and
+intra-pool duplicate filters before the three-survivor invariant is checked
+again. The depth proposal independently gets at most one schema/alignment/safety
+repair. Its repair prompt repeats the binding selected stack stage, primary
+change, and deterministically inferred primary family so vague wording can be
+corrected without bypassing alignment. Both original and repaired outputs pass
+the same safety boundary. Normal operation therefore uses two calls—one cheap
+breadth call and one detailed depth call—and the configured default permits at
+most four total calls. A second failure in either phase raises
+`ResearchOutputError`; malformed output is never accepted silently. Usage rows
+distinguish `research_breadth`, `research_breadth_repair`, `research_depth`, and
+`research_depth_repair`. Research token counts and estimated cost remain in
 `logs/research_agent_usage.jsonl`; Coding Agent accounting is not modified.
+
+Generated breadth and depth fields share one safety boundary. It combines the
+existing encoded-text/injection scanner with a normalized, bounded
+action--target policy for forbidden test/competition evaluation feedback,
+leaderboard feedback, and scorer manipulation. Unicode, punctuation,
+hyphenation, common inflections, and scorer/evaluator synonyms are normalized.
+Deterministic clause boundaries keep negation and preservation local: statements
+such as "do not use final competition results" and "preserve evaluate.py
+exactly" are allowed, but they cannot neutralize a later unsafe action in
+another clause or field.
+
+The bundled catalog remains the only active literature source. This
+breadth-then-depth flow does not connect the Phase 4A retrieval foundations and
+does not add web search, scholarly APIs, or full-text retrieval.
 
 ## Offline mode
 
@@ -124,10 +181,38 @@ owners decide whether those dependencies can be installed and executed.
 - The offline backlog is finite and intentionally conservative.
 - The bundled literature catalog is small; broader retrieval is a future
   `CitationSource`, not part of the current implementation.
+- Stack classification uses deterministic whole-token, presence-based matching
+  through an internal structural fingerprint containing stack stage, primary
+  family, primary intervention tags, and secondary tags. Repetition cannot vote
+  one incompatible same-stage family above another. For new breadth candidates,
+  `primary_change` is authoritative; optimizer, regularizer, sampler, and
+  training details enrich secondary tags without overriding a clear DeepFM or
+  BPR primary mechanism. Optimization/regularization remains primary when it is
+  itself the stated intervention. Mixed core stages, conflicting same-stage
+  families, unknown primary changes, and confident declaration/mechanism
+  mismatches are rejected.
+- Depth alignment infers title, hypothesis, target components, and individual
+  implementation steps independently. Any ambiguous intervention field or
+  confident core-family conflict fails closed; keep-constant controls, risks,
+  evidence, hyperparameters, and evaluation prose do not vote on the family.
+- Structured historical signatures fall through unknown hypothesis text to the
+  title and implementation-change sections. Coherent ancillary details are
+  retained as tags, while confident primary-family conflicts remain ambiguous.
+- Breadth ranking uses intentionally coarse, documented weights. It improves
+  exploration discipline but is not a learned estimate of experiment value.
+  Structural signature novelty is the main novelty signal; raw lexical
+  dissimilarity contributes only a small bounded amount.
 - Evaluator interpretation is currently limited to commentary already present
   in `RunRecord.events`.
-- Duplicate detection is deterministic text/implementation comparison, not a
-  semantic model.
+- Duplicate detection primarily compares canonical structural fingerprints and
+  extracts intervention-bearing fields from structured history while excluding
+  evidence, risks, constants, hyperparameters, and metric boilerplate. Renaming
+  DeepFM or BPR does not create novelty. A conservative same-family proposal can
+  remain eligible only when `primary_change` supplies a materially new primary
+  intervention tag; ancillary prose cannot manufacture that variation. Lexical
+  similarity is a small fallback for unknown signatures. Tied duplicate
+  selection uses canonical structural/semantic content, not candidate ID or
+  model output order.
 - Research context cannot recover facts that were never written to the shared
   validation history.
 
