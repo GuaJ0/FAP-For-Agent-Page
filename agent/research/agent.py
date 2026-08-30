@@ -33,6 +33,7 @@ from agent.research.breadth import (
     build_stack_coverage,
     filter_breadth_candidates,
     normalize_research_text,
+    parse_breadth_candidates_individually,
     rank_breadth_candidates,
     research_text_similarity,
     validate_depth_alignment,
@@ -377,61 +378,154 @@ class LLMResearchAgent:
             coverage,
             max_candidates=self.breadth_candidate_count,
         )
-        user_prompt = initial_prompt
         errors: list[str] = []
-        for attempt in range(self.max_repair_attempts + 1):
-            purpose = "research_breadth" if attempt == 0 else "research_breadth_repair"
-            response = self._complete(
-                system_prompt=BREADTH_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                purpose=purpose,
-                attempt=attempt,
-                context=context,
-                calls=calls,
+        response = self._complete(
+            system_prompt=BREADTH_SYSTEM_PROMPT,
+            user_prompt=initial_prompt,
+            purpose="research_breadth",
+            attempt=0,
+            context=context,
+            calls=calls,
+        )
+        retained: tuple[BreadthCandidate, ...] = ()
+        rejections = ()
+        initial_candidate_ids: set[str] = set()
+        initial_count = 0
+        try:
+            # Keep individually valid work from a sound JSON envelope. A
+            # malformed top level still has no trustworthy candidates to keep.
+            parsed = parse_breadth_candidates_individually(
+                response.text,
+                min_candidates=1,
+                max_candidates=self.breadth_candidate_count,
             )
-            try:
-                plan = BreadthPlan.from_json(
-                    response.text,
-                    max_candidates=self.breadth_candidate_count,
-                )
-                survivors, rejections = filter_breadth_candidates(
-                    plan,
-                    history=history,
-                    citation_source=self.citation_source,
-                )
-                if len(survivors) < MIN_BREADTH_SURVIVORS:
-                    detail = "; ".join(
-                        f"{item.candidate_id}: {item.reason}" for item in rejections
-                    ) or "too few genuinely different candidates survived"
-                    raise BreadthValidationError(
-                        "breadth requires at least "
-                        f"{MIN_BREADTH_SURVIVORS} post-filter survivors; got "
-                        f"{len(survivors)}: {detail}"
-                    )
+            initial_count = parsed.raw_candidate_count
+            initial_candidate_ids = set(parsed.reserved_candidate_ids)
+            retained, filter_rejections = filter_breadth_candidates(
+                parsed.plan,
+                history=history,
+                citation_source=self.citation_source,
+            )
+            rejections = (*parsed.rejections, *filter_rejections)
+            if (
+                initial_count == self.breadth_candidate_count
+                and not parsed.rejections
+                and len(retained) >= MIN_BREADTH_SURVIVORS
+            ):
                 ranked = rank_breadth_candidates(
-                    survivors,
+                    retained,
                     history=history,
                     coverage=coverage,
                     context=context,
                     citation_source=self.citation_source,
                 )
                 return ranked[0].candidate
-            except BreadthValidationError as exc:
-                errors.append(str(exc))
-                if attempt >= self.max_repair_attempts:
-                    raise ResearchOutputError(
-                        "Research Agent breadth phase failed after "
-                        f"{attempt + 1} call(s): " + " | ".join(
-                            f"attempt {index + 1}: {error}"
-                            for index, error in enumerate(errors)
-                        )
-                    ) from exc
-                user_prompt = build_breadth_repair_prompt(
-                    original_prompt=initial_prompt,
-                    original_response=response.text,
-                    validation_error=str(exc),
+            detail = "; ".join(
+                f"{item.candidate_id}: {item.reason}" for item in rejections
+            ) or "no candidate-specific rejection"
+            count_detail = (
+                f"configured batch requires exactly {self.breadth_candidate_count}; "
+                f"model returned {initial_count}. "
+                if initial_count != self.breadth_candidate_count
+                else ""
+            )
+            raise BreadthValidationError(
+                count_detail
+                + "breadth requires at least "
+                f"{MIN_BREADTH_SURVIVORS} post-filter survivors; got "
+                f"{len(retained)}: {detail}"
+            )
+        except BreadthValidationError as exc:
+            errors.append(str(exc))
+            if self.max_repair_attempts == 0:
+                raise ResearchOutputError(
+                    "Research Agent breadth phase failed after 1 call(s): "
+                    f"attempt 1: {exc}"
+                ) from exc
+
+        replacement_count = self.breadth_candidate_count - len(retained)
+        repair_prompt = build_breadth_repair_prompt(
+            original_prompt=initial_prompt,
+            original_response=response.text,
+            validation_error=errors[-1],
+            retained_candidates=retained,
+            rejections=rejections,
+            replacement_count=replacement_count,
+            configured_candidate_count=self.breadth_candidate_count,
+        )
+        repair_response = self._complete(
+            system_prompt=BREADTH_SYSTEM_PROMPT,
+            user_prompt=repair_prompt,
+            purpose="research_breadth_repair",
+            attempt=1,
+            context=context,
+            calls=calls,
+        )
+        try:
+            replacements = BreadthPlan.from_json_with_bounds(
+                repair_response.text,
+                min_candidates=1,
+                max_candidates=replacement_count,
+                exact_candidates=replacement_count,
+            )
+            reused_ids = sorted(
+                item.candidate_id
+                for item in replacements.candidates
+                if item.candidate_id.casefold() in initial_candidate_ids
+            )
+            if reused_ids:
+                raise BreadthValidationError(
+                    "breadth repair candidate IDs must be new; reused "
+                    + ", ".join(reused_ids)
                 )
-        raise AssertionError("unreachable")
+            combined_json = json.dumps({
+                "schema_version": 1,
+                "candidates": [
+                    candidate.to_prompt_dict()
+                    for candidate in (*retained, *replacements.candidates)
+                ],
+            })
+            combined = BreadthPlan.from_json_with_bounds(
+                combined_json,
+                min_candidates=MIN_BREADTH_CANDIDATES,
+                max_candidates=self.breadth_candidate_count,
+                exact_candidates=self.breadth_candidate_count,
+            )
+            final_survivors, final_rejections = filter_breadth_candidates(
+                combined,
+                history=history,
+                citation_source=self.citation_source,
+                protected_candidate_ids=frozenset(
+                    item.candidate_id for item in retained
+                ),
+            )
+            if len(final_survivors) < MIN_BREADTH_SURVIVORS:
+                detail = "; ".join(
+                    f"{item.candidate_id}: {item.reason}"
+                    for item in final_rejections
+                ) or "too few genuinely different candidates survived"
+                raise BreadthValidationError(
+                    "breadth requires at least "
+                    f"{MIN_BREADTH_SURVIVORS} post-filter survivors after repair; got "
+                    f"{len(final_survivors)}: {detail}"
+                )
+            ranked = rank_breadth_candidates(
+                final_survivors,
+                history=history,
+                coverage=coverage,
+                context=context,
+                citation_source=self.citation_source,
+            )
+            return ranked[0].candidate
+        except BreadthValidationError as exc:
+            errors.append(str(exc))
+            raise ResearchOutputError(
+                "Research Agent breadth phase failed after 2 call(s): "
+                + " | ".join(
+                    f"attempt {index + 1}: {error}"
+                    for index, error in enumerate(errors)
+                )
+            ) from exc
 
     def _generate_depth(
         self,
@@ -476,6 +570,7 @@ class LLMResearchAgent:
                     original_prompt=initial_prompt,
                     original_response=response.text,
                     validation_error=str(exc),
+                    selected_candidate=selected,
                 )
         raise AssertionError("unreachable")
 

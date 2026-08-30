@@ -139,7 +139,8 @@ _DATA_ACTIONS = frozenset({
     "select", "set", "train", "tune", "use",
 })
 _SCORER_ACTIONS = frozenset({
-    "alter", "change", "modify", "optimize", "patch", "replace", "rewrite", "tune",
+    "adjust", "alter", "calibrate", "change", "modify", "optimize", "patch",
+    "replace", "rewrite", "tune",
 })
 _ACTION_CANONICAL = {
     "adjusted": "adjust", "adjusting": "adjust", "calibrated": "calibrate", "calibrating": "calibrate",
@@ -156,6 +157,8 @@ _ACTION_CANONICAL = {
     "adjusts": "adjust", "calibrates": "calibrate", "chooses": "choose", "decides": "decide",
     "guides": "guide", "optimizes": "optimize", "picks": "pick", "refines": "refine",
     "selects": "select", "trains": "train", "tunes": "tune", "uses": "use",
+    "alters": "alter", "changes": "change", "modifies": "modify", "patches": "patch",
+    "replaces": "replace", "rewrites": "rewrite",
     "adapted": "adapt", "adapting": "adapt", "adapts": "adapt",
     "based": "base", "bases": "base", "basing": "base",
     "conditioned": "condition", "conditioning": "condition", "conditions": "condition",
@@ -324,19 +327,54 @@ class BreadthCandidate:
 
 
 @dataclass(frozen=True)
+class BreadthRejection:
+    candidate_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class BreadthPlan:
     schema_version: int
     candidates: tuple[BreadthCandidate, ...]
 
     @classmethod
     def from_json(cls, text: str, *, max_candidates: int) -> "BreadthPlan":
+        return cls.from_json_with_bounds(
+            text,
+            min_candidates=MIN_BREADTH_CANDIDATES,
+            max_candidates=max_candidates,
+        )
+
+    @classmethod
+    def from_json_with_bounds(
+        cls,
+        text: str,
+        *,
+        min_candidates: int,
+        max_candidates: int,
+        exact_candidates: Optional[int] = None,
+    ) -> "BreadthPlan":
+        """Parse a normal batch or a smaller incremental replacement batch."""
         if not isinstance(max_candidates, int) or isinstance(max_candidates, bool):
             raise BreadthValidationError("max_candidates must be an integer")
-        if max_candidates < MIN_BREADTH_CANDIDATES:
+        if not isinstance(min_candidates, int) or isinstance(min_candidates, bool):
+            raise BreadthValidationError("min_candidates must be an integer")
+        if min_candidates < 1:
+            raise BreadthValidationError("min_candidates must be positive")
+        if max_candidates < min_candidates:
             raise BreadthValidationError(
-                f"max_candidates must be at least {MIN_BREADTH_CANDIDATES}"
+                "max_candidates must be at least min_candidates"
             )
         effective_maximum = min(max_candidates, MAX_BREADTH_CANDIDATES)
+        if exact_candidates is not None:
+            if (
+                not isinstance(exact_candidates, int)
+                or isinstance(exact_candidates, bool)
+                or not min_candidates <= exact_candidates <= effective_maximum
+            ):
+                raise BreadthValidationError(
+                    "exact_candidates must be within the configured candidate bounds"
+                )
         try:
             value = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -353,15 +391,20 @@ class BreadthPlan:
         raw_candidates = data["candidates"]
         if not isinstance(raw_candidates, Sequence) or isinstance(raw_candidates, (str, bytes)):
             raise BreadthValidationError("breadth.candidates must be an array")
-        if len(raw_candidates) < MIN_BREADTH_CANDIDATES:
+        if len(raw_candidates) < min_candidates:
             raise BreadthValidationError(
                 "breadth.candidates must contain at least "
-                f"{MIN_BREADTH_CANDIDATES} competing directions"
+                f"{min_candidates} competing direction(s)"
             )
         if len(raw_candidates) > effective_maximum:
             raise BreadthValidationError(
                 "breadth.candidates exceeds maximum "
                 f"{effective_maximum} (absolute maximum {MAX_BREADTH_CANDIDATES})"
+            )
+        if exact_candidates is not None and len(raw_candidates) != exact_candidates:
+            raise BreadthValidationError(
+                "breadth.candidates must contain exactly "
+                f"{exact_candidates} candidate(s); got {len(raw_candidates)}"
             )
         candidates = tuple(
             BreadthCandidate.from_dict(item, f"breadth.candidates[{index}]")
@@ -371,6 +414,116 @@ class BreadthPlan:
         if len(identifiers) != len(set(identifiers)):
             raise BreadthValidationError("breadth.candidates contains duplicate candidate IDs")
         return cls(schema_version=1, candidates=candidates)
+
+
+@dataclass(frozen=True)
+class BreadthParseResult:
+    """Valid candidates plus candidate-local failures from one JSON envelope."""
+
+    plan: BreadthPlan
+    rejections: tuple[BreadthRejection, ...]
+    reserved_candidate_ids: frozenset[str]
+    raw_candidate_count: int
+
+
+def _usable_raw_candidate_id(value: Any) -> Optional[str]:
+    if not isinstance(value, Mapping):
+        return None
+    candidate_id = value.get("candidate_id")
+    if not isinstance(candidate_id, str):
+        return None
+    candidate_id = candidate_id.strip()
+    if (
+        not candidate_id
+        or len(candidate_id) > MAX_CANDIDATE_ID_CHARS
+        or _IDENTIFIER.fullmatch(candidate_id) is None
+    ):
+        return None
+    return candidate_id
+
+
+def parse_breadth_candidates_individually(
+    text: str,
+    *,
+    min_candidates: int,
+    max_candidates: int,
+) -> BreadthParseResult:
+    """Parse a valid breadth envelope without discarding valid siblings.
+
+    Envelope shape, version, and raw candidate-count bounds remain atomic. Each
+    array item then receives the unchanged strict ``BreadthCandidate`` schema.
+    Usable raw IDs are reserved before detailed validation so a malformed item
+    cannot free its identity for a replacement.
+    """
+    if not isinstance(max_candidates, int) or isinstance(max_candidates, bool):
+        raise BreadthValidationError("max_candidates must be an integer")
+    if not isinstance(min_candidates, int) or isinstance(min_candidates, bool):
+        raise BreadthValidationError("min_candidates must be an integer")
+    if min_candidates < 1:
+        raise BreadthValidationError("min_candidates must be positive")
+    if max_candidates < min_candidates:
+        raise BreadthValidationError("max_candidates must be at least min_candidates")
+    effective_maximum = min(max_candidates, MAX_BREADTH_CANDIDATES)
+
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise BreadthValidationError(f"breadth response is not valid JSON: {exc}") from exc
+    data = _mapping(value, "breadth")
+    _exact_keys(data, {"schema_version", "candidates"}, "breadth")
+    _json_safe(data["schema_version"], "breadth.schema_version")
+    if (
+        not isinstance(data["schema_version"], int)
+        or isinstance(data["schema_version"], bool)
+        or data["schema_version"] != 1
+    ):
+        raise BreadthValidationError("breadth.schema_version must be 1")
+    raw_candidates = data["candidates"]
+    if not isinstance(raw_candidates, Sequence) or isinstance(raw_candidates, (str, bytes)):
+        raise BreadthValidationError("breadth.candidates must be an array")
+    if len(raw_candidates) < min_candidates:
+        raise BreadthValidationError(
+            "breadth.candidates must contain at least "
+            f"{min_candidates} competing direction(s)"
+        )
+    if len(raw_candidates) > effective_maximum:
+        raise BreadthValidationError(
+            "breadth.candidates exceeds maximum "
+            f"{effective_maximum} (absolute maximum {MAX_BREADTH_CANDIDATES})"
+        )
+
+    raw_ids = tuple(_usable_raw_candidate_id(item) for item in raw_candidates)
+    reserved_ids = frozenset(
+        candidate_id.casefold() for candidate_id in raw_ids if candidate_id is not None
+    )
+    id_counts: dict[str, int] = {}
+    for candidate_id in raw_ids:
+        if candidate_id is not None:
+            key = candidate_id.casefold()
+            id_counts[key] = id_counts.get(key, 0) + 1
+
+    candidates: list[BreadthCandidate] = []
+    rejections: list[BreadthRejection] = []
+    for index, item in enumerate(raw_candidates):
+        path = f"breadth.candidates[{index}]"
+        diagnostic_id = raw_ids[index] or f"candidate[{index}]"
+        try:
+            _json_safe(item, path)
+            candidate = BreadthCandidate.from_dict(item, path)
+            if id_counts.get(candidate.candidate_id.casefold(), 0) > 1:
+                raise BreadthValidationError(
+                    f"{path}.candidate_id duplicates another original candidate ID"
+                )
+            candidates.append(candidate)
+        except BreadthValidationError as exc:
+            rejections.append(BreadthRejection(diagnostic_id, str(exc)))
+
+    return BreadthParseResult(
+        plan=BreadthPlan(schema_version=1, candidates=tuple(candidates)),
+        rejections=tuple(rejections),
+        reserved_candidate_ids=reserved_ids,
+        raw_candidate_count=len(raw_candidates),
+    )
 
 
 @dataclass(frozen=True)
@@ -775,15 +928,39 @@ def _data_target_positions(tokens: Sequence[str]) -> set[int]:
 def _scorer_target_positions(tokens: Sequence[str]) -> set[int]:
     positions: set[int] = set()
     for index, token in enumerate(tokens):
+        suffix = tokens[index + 1:index + 6]
+        preservation_bridges = {
+            "be", "code", "implementation", "is", "must", "remain", "remains",
+            "script", "stay", "stays", "weighting",
+        }
+        preserved = any(
+            item in _PRESERVATION_TOKENS
+            and all(prefix in preservation_bridges for prefix in suffix[:offset])
+            for offset, item in enumerate(suffix)
+        )
+        if preserved:
+            continue
         if token in {"scorer", "evaluator", "evaluate_py"}:
             positions.add(index)
         if token in {"script", "implementation", "code"} and _near(
-            tokens, index, {"scoring", "benchmark", "metric", "official"}, 4
+            tokens,
+            index,
+            {
+                "benchmark", "evaluate_py", "evaluation", "evaluator", "metric",
+                "official", "scoring",
+            },
+            4,
         ):
             positions.add(index)
         if token == "metric" and _near(tokens, index, {"official", "benchmark"}, 3):
             positions.add(index)
     return positions
+
+
+_MODEL_SIDE_TARGETS = frozenset({
+    "architecture", "deepfm", "dropout", "embedding", "feature", "loss", "model",
+    "objective", "optimizer", "parameter", "regularization", "sampler", "training",
+})
 
 
 def _action_targets(
@@ -803,6 +980,73 @@ def _action_targets(
     return False
 
 
+def _scorer_action_targets(tokens: Sequence[str]) -> bool:
+    """Match scorer actions without treating a model-side object as the scorer.
+
+    A phrase such as "tune model regularization to improve the official metric"
+    contains scorer vocabulary but directs ``tune`` at regularization.  A
+    nearer explicit model target protects only that action-target pair.  It
+    does not protect coordinated targets ("model and official metric") or a
+    later independent action ("tune model, then modify evaluate.py").
+    """
+    targets = _scorer_target_positions(tokens)
+    for action_index, token in enumerate(tokens):
+        if token not in _SCORER_ACTIONS or _is_negated(tokens, action_index):
+            continue
+        for target in sorted(targets, key=lambda item: abs(item - action_index)):
+            if abs(action_index - target) > 12:
+                continue
+            lower, upper = sorted((action_index, target))
+            between = tokens[lower + 1:upper]
+            nearby_model_positions = [
+                index for index, item in enumerate(tokens)
+                if item in _MODEL_SIDE_TARGETS and abs(index - action_index) <= 12
+            ]
+            scorer_implementation_is_explicit = any(
+                item in {"code", "implementation", "script", "scoring", "weighting"}
+                for item in tokens[max(0, target - 3):target + 4]
+            )
+            model_before_scorer = [
+                index for index in nearby_model_positions
+                if action_index < index < target
+            ]
+            direct_model_before_scorer = (
+                bool(model_before_scorer)
+                and min(model_before_scorer) - action_index <= 4
+                and "and" not in between
+            )
+            purpose_marker = action_index < target and any(
+                item in {"for", "toward", "towards"}
+                for item in tokens[action_index + 1:target]
+            )
+            model_after_purpose = [
+                index for index in nearby_model_positions if target < index
+            ]
+            reordered_model_object = (
+                purpose_marker
+                and bool(model_after_purpose)
+                and min(model_after_purpose) - target <= 6
+                and "rather" not in between
+                and "than" not in between
+            )
+            model_before_action = [
+                index for index in nearby_model_positions if index < action_index
+            ]
+            trailing_metric_purpose = (
+                bool(model_before_action)
+                and action_index - max(model_before_action) <= 4
+                and purpose_marker
+            )
+            model_target_is_direct = (
+                direct_model_before_scorer
+                or reordered_model_object
+                or trailing_metric_purpose
+            )
+            if scorer_implementation_is_explicit or not model_target_is_direct:
+                return True
+    return False
+
+
 def _semantic_policy_violation(text: str) -> Optional[str]:
     """Match normalized ACTION + TARGET concepts in a bounded local window."""
     for clause in _clause_texts(text):
@@ -811,7 +1055,7 @@ def _semantic_policy_violation(text: str) -> Optional[str]:
             continue
         if _action_targets(tokens, _DATA_ACTIONS, _data_target_positions(tokens)):
             return "uses forbidden evaluation data or feedback for development"
-        if _action_targets(tokens, _SCORER_ACTIONS, _scorer_target_positions(tokens)):
+        if _scorer_action_targets(tokens):
             return "modifies or tunes the official scorer/metric implementation"
     return None
 
@@ -888,12 +1132,6 @@ def build_stack_coverage(history: Sequence[RunRecord]) -> StackCoverageSummary:
         },
         unclassified_attempts=unclassified,
     )
-
-
-@dataclass(frozen=True)
-class BreadthRejection:
-    candidate_id: str
-    reason: str
 
 
 def _candidate_has_valid_evidence(candidate: BreadthCandidate, source: CitationSource) -> bool:
@@ -1042,18 +1280,40 @@ def filter_breadth_candidates(
     *,
     history: Sequence[RunRecord],
     citation_source: CitationSource,
+    protected_candidate_ids: frozenset[str] = frozenset(),
 ) -> tuple[tuple[BreadthCandidate, ...], tuple[BreadthRejection, ...]]:
-    """Apply deterministic safety, evidence, and duplicate filters."""
+    """Apply deterministic safety, evidence, and duplicate filters.
+
+    ``protected_candidate_ids`` is used only by incremental repair.  Those
+    candidates already survived this exact filter once, so they are processed
+    first to prevent a replacement duplicate from displacing valid retained
+    work.  They are nevertheless revalidated through every filter.
+    """
     attempted = [
         (historical_hypothesis(record), historical_mechanism_signature(record))
         for record in history if was_attempted(record)
     ]
     eligible: list[BreadthCandidate] = []
     rejected: list[BreadthRejection] = []
-    for candidate in sorted(
+    identifiers = {item.candidate_id.casefold() for item in plan.candidates}
+    missing_protected = {
+        item.casefold() for item in protected_candidate_ids
+    } - identifiers
+    if missing_protected:
+        raise BreadthValidationError(
+            "protected breadth candidates are absent from the combined repair pool: "
+            + ", ".join(sorted(missing_protected))
+        )
+    ordered_candidates = sorted(
         plan.candidates,
-        key=lambda item: _candidate_quality_key(item, citation_source),
-    ):
+        key=lambda item: (
+            0 if item.candidate_id.casefold() in {
+                value.casefold() for value in protected_candidate_ids
+            } else 1,
+            _candidate_quality_key(item, citation_source),
+        ),
+    )
+    for candidate in ordered_candidates:
         safety_error = _candidate_safety_error(candidate)
         if safety_error is not None:
             rejected.append(BreadthRejection(candidate.candidate_id, safety_error))
