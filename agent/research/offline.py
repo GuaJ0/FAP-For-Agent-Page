@@ -199,7 +199,11 @@ DEFAULT_BACKLOG: tuple[BacklogEntry, ...] = (
             "Sample users in proportion to their positive-impression count instead of uniformly.",
             "Compare weighted and uniform sampling with identical pair counts and seeds.",
         ),
-        hyperparameters={"user_sampling": ["uniform", "positive_count_weighted"]},
+        # Treatment FIRST, control second. The first non-null value is what
+        # reaches config.json and therefore what actually runs; listing
+        # "uniform" first made this entry measure the control condition and
+        # report the incumbent's behaviour as the idea's result.
+        hyperparameters={"user_sampling": ["positive_count_weighted", "uniform"]},
         must_hold_constant=("pairwise loss", "pair count", "features", "model capacity", "optimizer"),
         dependencies=(),
         hardware="Existing CPU environment",

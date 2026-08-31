@@ -448,3 +448,45 @@ def test_entries_may_propose_an_external_library_but_must_not_assume_one():
                         f"{entry.key} names {lib!r}, which is not installed, without "
                         f"saying so: {dep!r}"
                     )
+
+
+def test_no_entry_sends_its_control_condition_to_the_config():
+    """The first non-null hyperparameter value is what reaches config.json and
+    therefore what actually runs. An entry that lists its control first
+    measures the incumbent and reports it as the idea having failed -- which is
+    how GAUC-WEIGHTED-BPR came to declare ["uniform", "positive_count_weighted"]
+    and would have run plain uniform sampling.
+
+    Heuristic by necessity: 'control' is not a machine-readable property. This
+    flags the values that almost always mean "unchanged" so a new entry has to
+    justify one rather than ship it by accident.
+    """
+    from agent.coding.agent import hyperparameters_from_handoff
+
+    agent = OfflineResearchAgent(convergence=ConvergenceConfig(max_iterations=50))
+    context = build_research_context([], agent.convergence)
+    CONTROL_LIKE = {0, 0.0, False, None, "uniform", "none", "off", "baseline", "disabled"}
+
+    for entry in DEFAULT_BACKLOG:
+        applied = hyperparameters_from_handoff(entry.build(context).to_handoff_text())
+        for key, value in applied.items():
+            if isinstance(value, (list, dict)):
+                continue
+            assert value not in CONTROL_LIKE, (
+                f"{entry.key} sends {key}={value!r} to the config, which reads as the "
+                f"control condition -- the run would measure the incumbent"
+            )
+
+
+def test_every_entry_puts_something_real_into_the_config():
+    """An entry whose settings never reach config.json leaves the generated
+    train.py free to pick its own defaults -- which is how TIME-DRIFT ran with
+    recency weighting and the time cross both switched off."""
+    from agent.coding.agent import hyperparameters_from_handoff
+
+    agent = OfflineResearchAgent(convergence=ConvergenceConfig(max_iterations=50))
+    context = build_research_context([], agent.convergence)
+
+    for entry in DEFAULT_BACKLOG:
+        applied = hyperparameters_from_handoff(entry.build(context).to_handoff_text())
+        assert applied, f"{entry.key} declares no runnable setting"
