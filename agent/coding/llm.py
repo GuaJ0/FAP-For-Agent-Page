@@ -196,6 +196,44 @@ class OpenAIClient:
             raw_finish_reason=getattr(choice, "finish_reason", None),
         )
 
+    def complete_structured(
+        self,
+        system: str,
+        user: str,
+        *,
+        schema_name: str,
+        json_schema: dict[str, Any],
+        purpose: str = "",
+    ) -> LLMResponse:
+        """Request strict JSON for Research without changing ``complete`` callers."""
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            },
+        )
+        choice = resp.choices[0]
+        usage = getattr(resp, "usage", None)
+        tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+        tokens_out = getattr(usage, "completion_tokens", 0) or 0
+        return LLMResponse(
+            text=choice.message.content or "",
+            model=resp.model or self.model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=estimate_cost(resp.model or self.model, tokens_in, tokens_out),
+            raw_finish_reason=getattr(choice, "finish_reason", None),
+        )
+
 
 @dataclass
 class ScriptedClient:

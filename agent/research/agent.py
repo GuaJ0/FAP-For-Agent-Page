@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from agent.agents import Idea
 from agent.coding.llm import LLMClient, LLMResponse
@@ -55,10 +55,20 @@ from agent.research.prompts import (
     build_repair_prompt,
 )
 from agent.research.schemas import ProposalValidationError, ResearchProposal
+from agent.research.structured import breadth_response_schema, proposal_response_schema
 from runlog.emit import append_line, read_lines
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BREADTH_CITATION_LIMIT = 10
+FAILURE_RESPONSE_LIMIT = 16_000
+FAILURE_ERROR_LIMIT = 4_000
+_TRACE_SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(
+        r"(?i)\b(?:api[_ -]?key|authorization|bearer|password|secret|access[_ -]?token)"
+        r"\s*[:=]\s*[^\s,;]{8,}"
+    ),
+)
 
 
 class ResearchAgentError(RuntimeError):
@@ -117,6 +127,53 @@ class ResearchUsageLog:
             "tokens_out": sum(int(row.get("tokens_out", 0)) for row in rows),
             "cost_usd": round(sum(float(row.get("cost_usd", 0.0)) for row in rows), 6),
         }
+
+
+@dataclass
+class ResearchFailureLog:
+    """Bounded local trace for rejected validation-only Research output."""
+
+    path: Path
+
+    @staticmethod
+    def _safe_text(value: str, *, origin: str, limit: int) -> str:
+        bounded = value[:limit]
+        if len(value) > limit:
+            bounded += "\n... (trace truncated)"
+        if any(pattern.search(bounded) for pattern in _TRACE_SECRET_PATTERNS):
+            return "[REDACTED: credential-like Research output]"
+        try:
+            validate_research_direction_safety({"text": bounded}, origin=origin)
+        except BreadthValidationError:
+            return "[REDACTED: unsafe or forbidden Research output]"
+        return bounded
+
+    def record(
+        self,
+        *,
+        purpose: str,
+        attempt: int,
+        validation_error: str,
+        generated_response: str,
+        parent_iteration: Optional[int],
+    ) -> None:
+        append_line(self.path, {
+            "timestamp": time.time(),
+            "agent": "research",
+            "purpose": purpose,
+            "attempt": attempt,
+            "parent_iteration": parent_iteration,
+            "validation_error": self._safe_text(
+                validation_error,
+                origin="Research validation failure",
+                limit=FAILURE_ERROR_LIMIT,
+            ),
+            "generated_response": self._safe_text(
+                generated_response,
+                origin="rejected Research response",
+                limit=FAILURE_RESPONSE_LIMIT,
+            ),
+        })
 
 
 def _normalise(text: str) -> str:
@@ -277,6 +334,7 @@ class LLMResearchAgent:
     usage_log_path: Path = field(
         default_factory=lambda: REPO_ROOT / "logs" / "research_agent_usage.jsonl"
     )
+    failure_log_path: Optional[Path] = None
     max_repair_attempts: int = 1
     citation_limit: int = 20
     convergence: ConvergenceConfig = DEFAULT_CONFIG.convergence
@@ -296,6 +354,13 @@ class LLMResearchAgent:
             )
         self.usage_log_path = Path(self.usage_log_path)
         self.usage = ResearchUsageLog(self.usage_log_path)
+        if self.failure_log_path is None:
+            self.failure_log_path = self.usage_log_path.with_name(
+                "research_agent_failures.jsonl"
+            )
+        else:
+            self.failure_log_path = Path(self.failure_log_path)
+        self.failures = ResearchFailureLog(self.failure_log_path)
 
     def propose(self, history: list[RunRecord]) -> Idea:
         """Return one validated, evidence-backed proposal as the existing Idea."""
@@ -332,7 +397,11 @@ class LLMResearchAgent:
 
         self._set_last_usage(calls)
         return Idea(
-            hypothesis=proposal.to_handoff_text(),
+            hypothesis=proposal.to_handoff_text(
+                stack_stage=selected.stack_stage.value,
+                primary_family=selected.primary_family,
+                primary_change=selected.primary_change,
+            ),
             # Use the selected incumbent from trusted context, rather than
             # trusting the model to choose its own parent.
             parent_iteration=context.parent_iteration,
@@ -347,9 +416,21 @@ class LLMResearchAgent:
         attempt: int,
         context: ResearchContext,
         calls: list[LLMResponse],
+        json_schema: Optional[Mapping[str, Any]] = None,
+        schema_name: Optional[str] = None,
     ) -> LLMResponse:
         try:
-            response = self.llm.complete(system_prompt, user_prompt, purpose=purpose)
+            structured_complete = getattr(self.llm, "complete_structured", None)
+            if json_schema is not None and callable(structured_complete):
+                response = structured_complete(
+                    system_prompt,
+                    user_prompt,
+                    schema_name=schema_name or purpose,
+                    json_schema=dict(json_schema),
+                    purpose=purpose,
+                )
+            else:
+                response = self.llm.complete(system_prompt, user_prompt, purpose=purpose)
         except Exception as exc:
             raise ResearchAgentError(
                 f"Research Agent LLM call failed during {purpose}: {exc}"
@@ -386,6 +467,10 @@ class LLMResearchAgent:
             attempt=0,
             context=context,
             calls=calls,
+            json_schema=breadth_response_schema(
+                exact_candidates=self.breadth_candidate_count
+            ),
+            schema_name=f"research_breadth_{self.breadth_candidate_count}",
         )
         retained: tuple[BreadthCandidate, ...] = ()
         rejections = ()
@@ -436,6 +521,13 @@ class LLMResearchAgent:
                 f"{len(retained)}: {detail}"
             )
         except BreadthValidationError as exc:
+            self.failures.record(
+                purpose="research_breadth",
+                attempt=0,
+                validation_error=str(exc),
+                generated_response=response.text,
+                parent_iteration=context.parent_iteration,
+            )
             errors.append(str(exc))
             if self.max_repair_attempts == 0:
                 raise ResearchOutputError(
@@ -460,6 +552,8 @@ class LLMResearchAgent:
             attempt=1,
             context=context,
             calls=calls,
+            json_schema=breadth_response_schema(exact_candidates=replacement_count),
+            schema_name=f"research_breadth_repair_{replacement_count}",
         )
         try:
             replacements = BreadthPlan.from_json_with_bounds(
@@ -518,6 +612,13 @@ class LLMResearchAgent:
             )
             return ranked[0].candidate
         except BreadthValidationError as exc:
+            self.failures.record(
+                purpose="research_breadth_repair",
+                attempt=1,
+                validation_error=str(exc),
+                generated_response=repair_response.text,
+                parent_iteration=context.parent_iteration,
+            )
             errors.append(str(exc))
             raise ResearchOutputError(
                 "Research Agent breadth phase failed after 2 call(s): "
@@ -548,6 +649,8 @@ class LLMResearchAgent:
                 attempt=attempt,
                 context=context,
                 calls=calls,
+                json_schema=proposal_response_schema(context),
+                schema_name="research_proposal",
             )
             try:
                 return self._validate_response(
@@ -557,6 +660,13 @@ class LLMResearchAgent:
                     selected=selected,
                 )
             except (ProposalValidationError, CitationValidationError) as exc:
+                self.failures.record(
+                    purpose=purpose,
+                    attempt=attempt,
+                    validation_error=str(exc),
+                    generated_response=response.text,
+                    parent_iteration=context.parent_iteration,
+                )
                 errors.append(str(exc))
                 if attempt >= self.max_repair_attempts:
                     raise ResearchOutputError(

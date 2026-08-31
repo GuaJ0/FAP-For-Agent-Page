@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
-from agent.coding.llm import ScriptedClient
+from agent.coding.llm import OpenAIClient, ScriptedClient
 from agent.config import ConvergenceConfig
 from agent.records import AggregateMetrics, Decision, Event, ResourceUsage, RunRecord, Status
 from agent.research.agent import (
     LLMResearchAgent,
+    ResearchFailureLog,
     ResearchInputError,
     ResearchOutputError,
 )
@@ -86,6 +88,7 @@ def _breadth():
             "candidate_id": "B-HYBRID-RANKING",
             "title": "Hybrid pointwise and pairwise ranking objective",
             "stack_stage": "objective_sampling",
+            "primary_family": "pairwise",
             "primary_change": "Add a weighted BPR pairwise objective term.",
             "mechanism": (
                 "Blend retained pointwise supervision with a weighted within-user "
@@ -109,6 +112,7 @@ def _breadth():
             "candidate_id": "B-CONTENT-FEATURES",
             "title": "Candidate content features",
             "stack_stage": "features",
+            "primary_family": "metadata_features",
             "primary_change": "Add candidate video metadata content features.",
             "mechanism": "Add video metadata content features for each candidate item.",
             "metric_rationale": "Metadata may improve validation ranking.",
@@ -123,6 +127,7 @@ def _breadth():
             "candidate_id": "B-DEEPFM",
             "title": "DeepFM interaction architecture",
             "stack_stage": "architecture",
+            "primary_family": "deepfm",
             "primary_change": "Add a DeepFM interaction architecture.",
             "mechanism": "Add a DeepFM interaction tower architecture.",
             "metric_rationale": "Feature interactions may improve validation ranking.",
@@ -137,6 +142,7 @@ def _breadth():
             "candidate_id": "B-REGULARIZATION",
             "title": "Embedding dropout regularization",
             "stack_stage": "optimization_regularization",
+            "primary_family": "regularization",
             "primary_change": "Apply embedding dropout regularization.",
             "mechanism": "Regularize embeddings with dropout while retaining the model architecture.",
             "metric_rationale": "Regularization may improve validation generalization.",
@@ -151,6 +157,7 @@ def _breadth():
             "candidate_id": "B-ENSEMBLE",
             "title": "Checkpoint prediction averaging",
             "stack_stage": "inference_ensemble",
+            "primary_family": "prediction_averaging",
             "primary_change": "Use prediction averaging.",
             "mechanism": "Average predictions from retained checkpoints without changing training.",
             "metric_rationale": "Averaging may stabilize GAUC and nDCG@5.",
@@ -206,6 +213,27 @@ def _agent(tmp_path, responses, *, breadth=None, **kwargs):
         **kwargs,
     )
     return agent, client
+
+
+class _StructuredScriptedClient:
+    def __init__(self, responses):
+        self.inner = ScriptedClient(list(responses))
+        self.structured_calls = []
+        self.plain_calls = 0
+
+    @property
+    def calls(self):
+        return self.inner.calls
+
+    def complete(self, system, user, *, purpose=""):
+        self.plain_calls += 1
+        return self.inner.complete(system, user, purpose=purpose)
+
+    def complete_structured(
+        self, system, user, *, schema_name, json_schema, purpose=""
+    ):
+        self.structured_calls.append((purpose, schema_name, json_schema))
+        return self.inner.complete(system, user, purpose=purpose)
 
 
 def test_valid_proposal_returns_existing_idea_contract(tmp_path):
@@ -286,6 +314,82 @@ def test_failed_repair_raises_clear_research_error(tmp_path):
         agent.propose([_record(3, 0.62, Decision.ACCEPT)])
 
     assert "attempt 1" in str(exc.value) and "attempt 2" in str(exc.value)
+
+
+def test_structured_output_path_bounds_breadth_and_rejects_malformed_depth(tmp_path):
+    client = _StructuredScriptedClient([
+        json.dumps(_breadth()),
+        "not valid proposal JSON",
+        "still not valid proposal JSON",
+    ])
+    agent = LLMResearchAgent(
+        llm=client,
+        citation_source=JsonCitationCatalog(),
+        usage_log_path=tmp_path / "research_usage.jsonl",
+    )
+
+    with pytest.raises(ResearchOutputError, match=r"depth phase failed after 2 call\(s\)"):
+        agent.propose([_record(3, 0.62, Decision.ACCEPT)])
+
+    assert client.plain_calls == 0
+    assert [item[0] for item in client.structured_calls] == [
+        "research_breadth", "research_depth", "research_depth_repair",
+    ]
+    breadth_schema = client.structured_calls[0][2]
+    assert breadth_schema["additionalProperties"] is False
+    assert breadth_schema["properties"]["candidates"]["minItems"] == 5
+    assert breadth_schema["properties"]["candidates"]["maxItems"] == 5
+    assert "primary_family" in (
+        breadth_schema["properties"]["candidates"]["items"]["required"]
+    )
+    for _, schema_name, schema in client.structured_calls[1:]:
+        assert schema_name == "research_proposal"
+        assert schema["additionalProperties"] is False
+
+
+def test_openai_client_structured_method_sends_strict_json_schema_without_api_call():
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content='{"ok":true}'),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3),
+            model="gpt-5",
+        )
+
+    client = object.__new__(OpenAIClient)
+    client.model = "gpt-5"
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+
+    response = client.complete_structured(
+        "system",
+        "user",
+        schema_name="research_test",
+        json_schema=schema,
+        purpose="research_depth",
+    )
+
+    assert response.text == '{"ok":true}'
+    assert captured["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "research_test",
+            "strict": True,
+            "schema": schema,
+        },
+    }
 
 
 def test_invalid_citation_is_rejected(tmp_path):
@@ -446,6 +550,80 @@ def test_research_usage_accounting_is_scoped_and_persisted(tmp_path):
     assert rows[0]["agent"] == "research"
     assert [row["purpose"] for row in rows] == ["research_breadth", "research_depth"]
     assert agent.usage.totals()["tokens_in"] == agent.last_usage["tokens_in"]
+
+
+def test_rejected_depth_output_is_recorded_in_bounded_local_failure_trace(tmp_path):
+    agent, client = _agent(tmp_path, ["ordinary malformed depth response"], max_repair_attempts=0)
+
+    with pytest.raises(ResearchOutputError, match="depth phase failed after 1 call"):
+        agent.propose([_record(3, 0.62, Decision.ACCEPT)])
+
+    path = tmp_path / "research_agent_failures.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["agent"] == "research"
+    assert rows[0]["purpose"] == "research_depth"
+    assert rows[0]["attempt"] == 0
+    assert rows[0]["parent_iteration"] == 3
+    assert "not valid JSON" in rows[0]["validation_error"]
+    assert rows[0]["generated_response"] == "ordinary malformed depth response"
+    assert [call[2] for call in client.calls] == ["research_breadth", "research_depth"]
+
+
+def test_failure_trace_truncates_generated_output_without_unbounded_logging(tmp_path):
+    trace = ResearchFailureLog(tmp_path / "research_agent_failures.jsonl")
+    trace.record(
+        purpose="research_depth",
+        attempt=0,
+        validation_error="ordinary schema failure",
+        generated_response="ordinary validation prose " * 1_000,
+        parent_iteration=3,
+    )
+
+    row = json.loads(
+        (tmp_path / "research_agent_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert row["generated_response"].endswith("... (trace truncated)")
+    assert len(row["generated_response"]) <= 16_030
+
+
+def test_unsafe_rejected_output_is_redacted_from_failure_trace(tmp_path):
+    unsafe = _proposal(parent=3)
+    unsafe["hypothesis"] = "Use the private leaderboard result to select the method."
+    agent, _ = _agent(tmp_path, [json.dumps(unsafe)], max_repair_attempts=0)
+
+    with pytest.raises(ResearchOutputError, match="unsafe Research direction"):
+        agent.propose([_record(3, 0.62, Decision.ACCEPT)])
+
+    row = json.loads(
+        (tmp_path / "research_agent_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert row["generated_response"].startswith("[REDACTED:")
+    assert "leaderboard" not in row["generated_response"].casefold()
+    assert "leaderboard" not in row["validation_error"].casefold()
+
+
+def test_credential_like_output_is_redacted_from_failure_trace(tmp_path):
+    trace = ResearchFailureLog(tmp_path / "research_agent_failures.jsonl")
+    trace.record(
+        purpose="research_depth",
+        attempt=0,
+        validation_error="ordinary schema failure",
+        generated_response="OPENAI_API_KEY=sk-examplecredential123456",
+        parent_iteration=3,
+    )
+
+    row = json.loads(
+        (tmp_path / "research_agent_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert row["generated_response"] == "[REDACTED: credential-like Research output]"
+    assert "examplecredential" not in json.dumps(row)
 
 
 def test_hidden_test_material_is_blocked_before_the_llm_call(tmp_path):

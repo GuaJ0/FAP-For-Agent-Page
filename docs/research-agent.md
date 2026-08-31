@@ -62,18 +62,20 @@ The agent:
 3. retrieves a compact evidence packet from its configured `CitationSource`;
 4. makes one bounded breadth call for exactly the configured number of shallow
    candidate directions (five by default; the absolute supported range remains
-   three to eight), each with one bounded `primary_change` that identifies its
-   intervention;
+   three to eight), each with a canonical `stack_stage` plus allowlisted
+   `primary_family` declaration and one bounded `primary_change` description;
 5. deterministically hard-filters malformed, unsafe, benchmark-manipulating,
-   unsupported, duplicate, ambiguous-stage, and mislabelled-stage candidates;
+   unsupported, duplicate, and confidently contradictory candidates; unknown
+   natural-language classifier output does not override the canonical family;
 6. requires at least three genuinely different candidates to survive those
    filters, otherwise invoking the single bounded breadth repair;
 7. softly ranks survivors using structural mechanism novelty, relevant
    distinct-source evidence,
    stack coverage, remaining budget, and modest feasibility/upside priors;
 8. gives only the selected direction to the existing detailed depth prompt;
-9. safety-scans the final proposal and validates that it retains the selected
-   stage, mechanism, and supporting evidence; and
+9. treats the selected canonical stage, family, and primary change as
+   authoritative, safety-scans the final proposal, and rejects any generated
+   field that actually switches to a conflicting method; and
 10. returns the shared handoff text.
 
 Coverage is a soft preference. An unexplored stage receives a diversity bonus,
@@ -100,12 +102,19 @@ passed through the same safety, evidence, mechanism, history-duplicate, and
 intra-pool duplicate filters before the three-survivor invariant is checked
 again. The depth proposal independently gets at most one schema/alignment/safety
 repair. Its repair prompt repeats the binding selected stack stage, primary
-change, and deterministically inferred primary family so vague wording can be
-corrected without bypassing alignment. Both original and repaired outputs pass
-the same safety boundary. Normal operation therefore uses two calls—one cheap
+change, and declared primary family so conflicting method-switch wording can be
+removed without bypassing alignment. Both original and repaired outputs pass
+the same safety boundary. When the injected client supports Research structured
+completion, breadth and depth calls use strict JSON Schema; deterministic
+schema, safety, citation, duplicate, and alignment validation still runs after
+parsing. Coding and Evaluator calls continue to use their unchanged free-text
+client method. Normal operation therefore uses two calls—one cheap
 breadth call and one detailed depth call—and the configured default permits at
 most four total calls. A second failure in either phase raises
-`ResearchOutputError`; malformed output is never accepted silently. Usage rows
+`ResearchOutputError`; malformed output is never accepted silently. Rejected
+validation-only responses are written to a bounded local
+`logs/research_agent_failures.jsonl` trace with their purpose, attempt, and
+validation error; unsafe output is redacted before persistence. Usage rows
 distinguish `research_breadth`, `research_breadth_repair`, `research_depth`, and
 `research_depth_repair`. Research token counts and estimated cost remain in
 `logs/research_agent_usage.jsonl`; Coding Agent accounting is not modified.
@@ -188,13 +197,16 @@ owners decide whether those dependencies can be installed and executed.
   `primary_change` is authoritative; optimizer, regularizer, sampler, and
   training details enrich secondary tags without overriding a clear DeepFM or
   BPR primary mechanism. Optimization/regularization remains primary when it is
-  itself the stated intervention. Mixed core stages, conflicting same-stage
-  families, unknown primary changes, and confident declaration/mechanism
-  mismatches are rejected.
-- Depth alignment infers title, hypothesis, target components, and individual
-  implementation steps independently. Any ambiguous intervention field or
-  confident core-family conflict fails closed; keep-constant controls, risks,
-  evidence, hyperparameters, and evaluation prose do not vote on the family.
+  itself the stated intervention. Unknown prose is allowed, but mixed core
+  stages, conflicting same-stage families, and confident
+  declaration/mechanism mismatches are rejected.
+- Depth alignment scans title, hypothesis, target components, and individual
+  implementation steps for actual method switches. Unknown or neutral wording
+  does not override the authoritative selected breadth declaration, while a
+  clause that introduces a conflicting stack stage or primary family fails
+  closed. Preserved incumbent context and bare component names do not count as
+  switches; keep-constant controls, risks, evidence, hyperparameters, and
+  evaluation prose do not vote on the family.
 - Structured historical signatures fall through unknown hypothesis text to the
   title and implementation-change sections. Coherent ancillary details are
   retained as tags, while confident primary-family conflicts remain ambiguous.

@@ -331,8 +331,21 @@ class ResearchProposal:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def to_handoff_text(self) -> str:
+    def to_handoff_text(
+        self,
+        *,
+        stack_stage: Optional[str] = None,
+        primary_family: Optional[str] = None,
+        primary_change: Optional[str] = None,
+    ) -> str:
         """Render the existing Coding Agent's ``Idea.hypothesis`` payload."""
+        canonical_values = (stack_stage, primary_family, primary_change)
+        if any(value is None for value in canonical_values) and any(
+            value is not None for value in canonical_values
+        ):
+            raise ValueError(
+                "stack_stage, primary_family, and primary_change must be supplied together"
+            )
         impl = self.implementation
         ev = self.evaluation
         lines = [
@@ -340,6 +353,18 @@ class ResearchProposal:
             f"ID: {self.hypothesis_id}",
             f"TITLE: {self.title}",
             f"PARENT ITERATION: {self.parent_iteration if self.parent_iteration is not None else 'none'}",
+        ]
+        if (
+            stack_stage is not None
+            and primary_family is not None
+            and primary_change is not None
+        ):
+            lines.extend([
+                f"STACK STAGE: {stack_stage}",
+                f"PRIMARY FAMILY: {primary_family}",
+                f"PRIMARY CHANGE: {primary_change}",
+            ])
+        lines.extend([
             "",
             "HYPOTHESIS:",
             self.hypothesis,
@@ -349,7 +374,7 @@ class ResearchProposal:
             f"Metric alignment: {', '.join(self.rationale.metric_alignment)}",
             "",
             "EVIDENCE:",
-        ]
+        ])
         lines.extend(
             f"- [{item.citation_id}/{item.claim_id}] {item.application}"
             for item in self.rationale.evidence
