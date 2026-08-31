@@ -948,3 +948,82 @@ def test_the_prompt_forbids_defaulting_the_mechanism_off():
     sp = prompts.system_prompt(available_third_party())
     assert "MUST BE ON BY DEFAULT" in sp
     assert "FAIL LOUDLY" in sp
+
+
+# ---------------------------------------------------------------------------
+# Split hygiene: a solution must not LEARN from validation or test rows.
+#
+# The gap this closes is stated in agent/verification.py's own docstring: it
+# proves the reported metrics are arithmetically consistent with the
+# predictions a run persisted, and never establishes which rows produced them.
+# A train.py that fits on validation scores brilliantly on validation, wins
+# ACCEPT, becomes the incumbent, and collapses on the held-out split.
+# ---------------------------------------------------------------------------
+
+import ast as _ast  # noqa: E402
+
+from agent.coding.agent import check_split_hygiene  # noqa: E402
+
+
+@pytest.mark.parametrize("label,src", [
+    ("fit directly on valid",
+     'Xva,yva,_=enc["valid"]\nm.fit(Xva,yva)'),
+    ("optimiser step on valid",
+     'Xva,yva,_=enc["valid"]\nm.step(Xva,yva)'),
+    ("train on the test split",
+     'Xte,yte,_=enc["test"]\nm.train(Xte,yte)'),
+    ("valid swept in by concatenate, then fitted",
+     'Xtr,ytr,_=enc["train"]\nXva,yva,_=enc["valid"]\nXa=np.concatenate([Xtr,Xva])\nm.fit(Xa,ytr)'),
+    ("tainted through a slice",
+     'Xva,yva,_=enc["valid"]\ne=Xva[mask]\nm.partial_fit(e,yva)'),
+    ("tainted through a torch conversion",
+     'Xva,yva,_=enc["valid"]\nt=torch.from_numpy(Xva)\nm.step(t,yva)'),
+])
+def test_learning_from_held_out_rows_is_rejected(label, src):
+    assert check_split_hygiene(_ast.parse(src)), label
+
+
+@pytest.mark.parametrize("label,src", [
+    ("early stopping on valid -- required, the baseline does it",
+     'Xva,yva,uva=enc["valid"]\nva=evaluate(uva,yva,m.predict(Xva))'),
+    ("scoring test for the quarantined TEST_METRICS line",
+     'Xte,yte,ute=enc["test"]\ntm=evaluate(ute,yte,m.predict(Xte))'),
+    ("building one id vocabulary across splits -- ids only, no labels",
+     'tr=f["train"]\nva=f["valid"]\nv=np.concatenate([tr.vid,va.vid])\nmp=build(v)'),
+    ("positional multi-split unpack must not taint the train matrix",
+     'Xtr,Xva=by["train"],by["valid"]\nm.step(Xtr,ytr)'),
+])
+def test_legitimate_validation_use_is_not_rejected(label, src):
+    assert check_split_hygiene(_ast.parse(src)) == [], label
+
+
+def test_no_real_solution_is_falsely_flagged():
+    """Calibration against every train.py this pipeline has actually produced.
+
+    The first version of this check flagged 10 of them -- tainting `loss`,
+    `int` and even the training matrix -- which would have made the repair loop
+    fight a phantom on most iterations. A split-hygiene check that cries wolf is
+    worse than none: it burns attempts and teaches nothing.
+    """
+    import glob
+
+    files = ["solution/train.py", "agent/coding/templates/train_ranking.py"]
+    files += sorted(glob.glob("runs/exploration-archived-*/solutions/attempt_*/train.py"))
+    checked, flagged = 0, []
+    for f in files:
+        try:
+            tree = _ast.parse(Path(f).read_text())
+        except (SyntaxError, OSError):
+            continue
+        checked += 1
+        if check_split_hygiene(tree):
+            flagged.append(f)
+    if checked < 2:
+        pytest.skip("no generated solutions on disk to calibrate against")
+    assert flagged == [], f"{len(flagged)} of {checked} known-good solutions flagged"
+
+
+def test_the_check_runs_as_part_of_static_check():
+    """It has to be in the free pre-flight, not a separate opt-in call."""
+    problems = static_check('Xva,yva,_=enc["valid"]\nm.fit(Xva,yva)\n')
+    assert any("trains the model" in p for p in problems), problems

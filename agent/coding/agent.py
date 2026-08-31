@@ -105,6 +105,157 @@ FORBIDDEN_IMPORTS = {
 }
 
 
+# Calls that FIT a model, as opposed to scoring one. Scoring the validation
+# split is not only legal but required -- the baseline early-stops on it -- so
+# this check has to separate "used valid to select" from "used valid to learn",
+# and only the second is a violation.
+_TRAINING_CALLS = frozenset({
+    "fit", "partial_fit", "step", "train", "train_epoch", "run_training",
+    "update", "learn", "train_on_batch", "fit_transform",
+})
+
+# Operations that CARRY data through, so a result built from validation rows is
+# still validation rows. Taint follows these and nothing else: propagating
+# through every call instead marks `va = evaluate(uva, yva, ...)` as data, and
+# from there everything downstream, which is how the first version of this
+# check flagged `loss`, `int` and even the training matrix itself.
+_DATA_CARRYING_CALLS = frozenset({
+    "concatenate", "vstack", "hstack", "stack", "cat", "concat", "asarray",
+    "array", "copy", "reshape", "astype", "ravel", "flatten", "tensor", "from_numpy",
+})
+
+_HELD_OUT_KEYS = frozenset({"valid", "validation", "test"})
+
+
+def _held_out_taint(tree: ast.AST) -> set[str]:
+    """Names holding validation or test ROWS.
+
+    Seeded from split subscripts (`enc["valid"]`, `splits["test"]`) and
+    propagated only through aliasing, indexing, and the data-carrying calls
+    above -- so `Xva, yva, _ = enc["valid"]`, `a = Xva[mask]` and
+    `Xall = np.concatenate([Xtr, Xva])` are all tainted, while `va =
+    evaluate(uva, yva, ...)` is not: that is a score, not the rows.
+
+    Two passes covers the shapes real solutions use and keeps this a static
+    check rather than a dataflow engine.
+    """
+    tainted: set[str] = set()
+
+    def _reads_held_out(node) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Subscript):
+                key = getattr(sub.slice, "value", None)
+                if isinstance(key, str) and key in _HELD_OUT_KEYS:
+                    return True
+        return False
+
+    def _carries_taint(value) -> bool:
+        """Whether this expression yields held-out DATA (not a number about it)."""
+        if isinstance(value, ast.Name):
+            return value.id in tainted
+        if isinstance(value, (ast.Subscript, ast.Attribute)):
+            return _carries_taint(value.value)
+        if isinstance(value, (ast.Tuple, ast.List)):
+            return any(_carries_taint(e) for e in value.elts)
+        if isinstance(value, ast.Call):
+            fn = value.func.attr if isinstance(value.func, ast.Attribute) else \
+                 getattr(value.func, "id", "")
+            if fn not in _DATA_CARRYING_CALLS:
+                return False
+            return any(_carries_taint(a) for a in value.args) or \
+                   any(_carries_taint(k.value) for k in value.keywords)
+        return False
+
+    def _taint_target(target, value):
+        for t, v in _pairs(target, value):
+            if not (_reads_held_out(v) or _carries_taint(v)):
+                continue
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name):
+                    tainted.add(n.id)
+
+    for _ in range(2):
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                _taint_target(target, value)
+    return tainted
+
+
+def _pairs(target, value):
+    """Match `a, b = x, y` element-wise instead of tainting every name.
+
+    Without this, `Xtr, Xva, Xte = by_split["train"], by_split["valid"],
+    by_split["test"]` marks the TRAINING matrix as held-out data, and the very
+    next `m.step(Xtr, ytr)` is reported as training on validation -- a real
+    solution hit exactly that and it was the last false positive left.
+    """
+    if (isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)):
+        for t, v in zip(target.elts, value.elts):
+            yield from _pairs(t, v)
+    else:
+        yield target, value
+
+
+def check_split_hygiene(tree: ast.AST) -> list[str]:
+    """Reject a solution that appears to LEARN from validation or test rows.
+
+    THE FAILURE THIS CATCHES
+    ------------------------
+    A train.py that fits on validation rows scores brilliantly on validation,
+    wins ACCEPT, becomes the incumbent, and collapses on the held-out split.
+    Nothing else notices: agent/verification.py proves the reported metrics are
+    arithmetically consistent with the predictions the run persisted, and says
+    so in its own docstring -- it never establishes which rows produced them.
+
+    The exposure grew rather than shrank: solutions now reach for torch and for
+    extra columns via dataset.load_full, so there is far more data handling to
+    get wrong than in the numpy FM this pipeline was built around.
+
+    DELIBERATELY NARROW
+    -------------------
+    Only held-out rows reaching a FITTING call are flagged. Combining splits is
+    not flagged by itself, because doing so is often legitimate -- a solution
+    that concatenates train/valid/test video_ids to build one id vocabulary
+    uses no labels and leaks nothing. It becomes a problem only when that
+    combined array is then trained on, which the taint rules above follow.
+
+    This catches the plausible ACCIDENT. It does not pretend to stop a solution
+    determined to cheat, which would need the executor to observe what the
+    process actually read.
+    """
+    problems: list[str] = []
+    tainted = _held_out_taint(tree)
+    if not tainted:
+        return problems
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else \
+               getattr(node.func, "id", "")
+        if name not in _TRAINING_CALLS:
+            continue
+        used = {n.id for a in node.args for n in ast.walk(a) if isinstance(n, ast.Name)}
+        used |= {n.id for k in node.keywords for n in ast.walk(k.value) if isinstance(n, ast.Name)}
+        hit = sorted(used & tainted)
+        if hit:
+            problems.append(
+                f"line {node.lineno}: passes validation/test data {hit} into {name}(), "
+                f"which trains the model. Scoring the validation split is required "
+                f"(early stopping); FITTING on it inflates validation, wins ACCEPT, and "
+                f"collapses on the held-out split. Train on the 'train' split only."
+            )
+    return problems
+
+
 def hyperparameters_from_handoff(hypothesis: str) -> dict[str, Any]:
     """The proposal's declared settings, as a config the executor can run.
 
@@ -292,6 +443,8 @@ def static_check(source: str) -> list[str]:
                 f"Installed and available: {', '.join(available_third_party())}, "
                 f"plus the stdlib and the vendored `evaluate`/`data` modules."
             )
+
+    problems.extend(check_split_hygiene(tree))
 
     for flag in ("--config", "--seed", "--out"):
         if flag not in source:

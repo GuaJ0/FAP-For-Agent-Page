@@ -321,14 +321,39 @@ because `convergence.py` needs it too and `orchestrator.py` already imports
 `should_stop` from `convergence.py`; `config.py` is imported by both and
 imports neither.
 
-## 4. What metric verification does *not* catch
+## 4. ~~What metric verification does *not* catch~~ — PARTLY CLOSED
 
-`agent/verification.py` proves the reported metrics are arithmetically
+**Was:** `agent/verification.py` proves the reported metrics are arithmetically
 consistent with the predictions the run persisted. It does not prove those
 predictions came from the validation split. A `train.py` that trained on
-validation, or that persisted test-split arrays, would verify clean. That is
-data hygiene rather than arithmetic honesty and would need the executor to know
-the split definitions.
+validation would verify clean, score brilliantly on validation, win ACCEPT,
+become the incumbent, and collapse on the held-out split.
+
+**Now:** `static_check` includes `check_split_hygiene`, an AST check that
+rejects held-out rows reaching a fitting call — free, and before the run rather
+than after it. Taint is seeded from split subscripts (`enc["valid"]`) and
+follows aliasing, indexing and data-carrying calls (`concatenate`, `asarray`,
+`from_numpy`), so a validation array swept into the training matrix and then
+fitted is caught.
+
+Deliberately narrow, in both directions:
+
+- **Only fitting is flagged.** Scoring validation is required — the baseline
+  early-stops on it — so `m.predict(Xva)` and `evaluate(uva, yva, ...)` pass.
+- **Combining splits is not flagged by itself.** A solution that concatenates
+  train/valid/test `video_id`s to build one vocabulary uses no labels and leaks
+  nothing; it becomes a problem only if the result is then trained on.
+
+Calibrated against every `train.py` this pipeline has produced: zero false
+positives across 20 real solutions, with the six accident patterns caught. That
+calibration is a test, because the first version of this check flagged 10 of
+those 20 — tainting `loss`, `int` and even the training matrix — and a
+split-hygiene check that cries wolf is worse than none, since it burns repair
+attempts and teaches nothing.
+
+**Still open:** this catches the plausible accident, not a determined cheat.
+Proving which rows a process actually read needs the executor to observe the
+run, not the source. Persisting test-split arrays is also still uncaught.
 
 ---
 
