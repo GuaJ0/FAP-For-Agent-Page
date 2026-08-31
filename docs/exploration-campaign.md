@@ -36,12 +36,21 @@ list rather than letting a model choose.
 |---|---|---|
 | `logs/`, `solutions/`, registry, state, artifacts | `runs/exploration/` | repo-root `logs/` |
 | Do/Don't ledger | `runs/exploration/findings.jsonl` | `agent/research/findings.jsonl` |
+| stall rule | window 15 — cannot fire | window 3 (`ConvergenceConfig` default) |
 | repair attempts | 5 | 3 (`RetryConfig` default) |
 | per-idea backstop | 90 min | 45 min |
 | per-run timeout | 60 min | 15 min |
 
 The campaign's iterations, wall-clock and convergence window are per-run state
 inside that scratch `logs/`, so it cannot consume the graded run's budget.
+
+**The stall rule is deliberately disarmed for this pass.** It stops a graded run
+once it has stopped improving — correct there, and exactly wrong for a coverage
+pass, where most directions are *expected* to fail and failing is the
+measurement. The first real campaign stopped after 3 of 14 directions on *"no
+improvement > 0.002 in best validation primary over the last 3 scored
+iterations"*, leaving 11 unmeasured. The window is now set above the backlog
+size, so backlog exhaustion is the real stopping condition.
 `--promote` is the separate, explicit step that merges reviewed findings into
 the committed ledger; until you run it the graded run's memory is untouched.
 

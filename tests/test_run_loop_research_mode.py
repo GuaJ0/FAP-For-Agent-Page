@@ -275,3 +275,25 @@ def test_root_isolates_every_run_artifact_from_the_graded_run(monkeypatch, tmp_p
     for path in (paths.logs_dir, paths.runs_jsonl, paths.orchestrator_state,
                  paths.registry_json, paths.artifacts_dir, paths.quarantine_dir):
         assert root in path.parents or path == root, path
+
+
+def test_convergence_defaults_match_the_graded_run_exactly(monkeypatch, tmp_path):
+    """Omitting the flags must reproduce agent/config.ConvergenceConfig, so
+    exposing them cannot have changed what the graded run does."""
+    from agent.config import ConvergenceConfig
+
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path)
+
+    conv = captured["orchestrator"].kwargs["cfg"].convergence
+    assert conv.epsilon == ConvergenceConfig.epsilon
+    assert conv.n_window == ConvergenceConfig.n_window
+
+
+def test_the_stall_rule_can_be_widened_for_a_coverage_pass(monkeypatch, tmp_path):
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path, "--stall-window", "15", "--epsilon", "0.005")
+
+    conv = captured["orchestrator"].kwargs["cfg"].convergence
+    assert conv.n_window == 15
+    assert conv.epsilon == 0.005

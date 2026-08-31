@@ -229,3 +229,58 @@ def test_a_family_mixing_a_diagnostic_with_real_variants_still_promotes():
          mock.patch.dict("agent.research.findings._FAMILY_BY_MEMBER",
                          {"LOG-RANDOM-IPS-REWEIGHT": "UNBIASED-VALIDATION"}):
         assert "UNBIASED-VALIDATION" not in sf._report_only_families()
+
+
+def test_the_campaign_cannot_be_stopped_early_by_the_stall_rule(monkeypatch, tmp_path):
+    """The first real campaign stopped after 3 of 14 directions on "no
+    improvement > 0.002 over the last 3 scored iterations", leaving 11
+    unmeasured.
+
+    The stall rule is a graded-run mechanism: stop burning budget once you have
+    stopped improving. For a coverage pass it is exactly wrong -- most
+    directions are EXPECTED to fail, and failing is the measurement. So the
+    window has to sit above the number of ideas to be covered, leaving backlog
+    exhaustion as the real stopping condition."""
+    from agent.research.offline import DEFAULT_BACKLOG
+
+    seen = _capture_argv(monkeypatch)
+    _run(monkeypatch, "--root", str(tmp_path / "s"))
+
+    argv = seen["argv"]
+    window = int(argv[argv.index("--stall-window") + 1])
+    rounds = int(argv[argv.index("--max-iterations") + 1])
+    assert rounds == len(DEFAULT_BACKLOG)
+    assert window > rounds, "the stall rule could still fire before the backlog is covered"
+
+
+def test_a_run_of_all_failing_iterations_would_now_survive_the_stall_rule():
+    """Directly reproduces the stop we hit: three consecutive non-improving
+    iterations. Under the graded default that halts the run; under the
+    campaign's window it does not."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent.config import ConvergenceConfig
+    from agent.convergence import should_stop
+    from agent.records import AggregateMetrics, Decision, Event, ResourceUsage, RunRecord, Status
+    from scripts.seed_findings import EXPLORATION_STALL_WINDOW
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history = []
+    for i, primary in enumerate([0.6016, 0.6016, 0.5971, 0.6001]):   # the real numbers
+        history.append(RunRecord(
+            iteration=i, parent_iteration=0 if i else None,
+            timestamp=(t0 + timedelta(minutes=5 * i)).isoformat(),
+            hypothesis=f"idea {i}", diff_path="c.json", status=Status.SUCCESS, seeds=[],
+            aggregate=AggregateMetrics(primary, 0.0003, primary + 0.066, primary - 0.066, 2),
+            delta_vs_current_best=primary - 0.6016,
+            decision=Decision.ACCEPT if i == 0 else Decision.REVERT,
+            events=[Event("eval_finished", "", "evaluator")],
+            resources=ResourceUsage(wall_s=1.0),
+        ))
+
+    graded_stop, reason = should_stop(history, ConvergenceConfig())
+    assert graded_stop is True and "improvement" in reason      # what actually happened
+
+    campaign_stop, _ = should_stop(
+        history, ConvergenceConfig(max_iterations=14, n_window=EXPLORATION_STALL_WINDOW))
+    assert campaign_stop is False, "the campaign would still stop early"

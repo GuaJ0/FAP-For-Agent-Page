@@ -86,6 +86,19 @@ EXPLORATION_IDEA_BACKSTOP_S = 90 * 60.0     # vs 45 min
 EXPLORATION_PER_RUN_TIMEOUT_S = 60 * 60.0   # vs 15 min
 EXPLORATION_MAX_WALL_S = 24 * 3600.0
 
+# The stall rule must not fire during an exploration pass. It exists to stop a
+# graded run burning budget once it has stopped improving -- right there, and
+# exactly wrong here: this campaign's job is to COVER the backlog, and most
+# directions are expected to fail. The first attempt at it stopped after 3 of
+# 14 rounds, on "no improvement > 0.002 over the last 3 scored iterations",
+# leaving 11 directions unmeasured.
+#
+# Set above the backlog size rather than to a disabled sentinel, so the rule
+# still exists and still reads as a number of iterations -- it simply cannot be
+# reached before the backlog is exhausted, which is the real stopping condition
+# for this mode (OfflineBacklogExhausted -> a clean finish).
+EXPLORATION_STALL_WINDOW = len(DEFAULT_BACKLOG) + 1
+
 
 def _describe_campaign() -> str:
     from agent.research.findings import resolve_family
@@ -207,6 +220,7 @@ def main() -> int:
         "--max-fix-attempts", str(EXPLORATION_MAX_FIX_ATTEMPTS),
         "--idea-backstop-s", str(EXPLORATION_IDEA_BACKSTOP_S),
         "--max-wall-s", str(EXPLORATION_MAX_WALL_S),
+        "--stall-window", str(EXPLORATION_STALL_WINDOW),
         *passthrough,
     ]
 

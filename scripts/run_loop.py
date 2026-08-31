@@ -96,7 +96,14 @@ def build_config(root: Path, args) -> Config:
     # bootstrap iteration from its max_iterations count, so this is passed
     # straight through and means exactly what it says. It used to need a +1.
     return Config(
-        convergence=ConvergenceConfig(max_iterations=args.max_iterations, max_wall_s=args.max_wall_s),
+        # getattr for the stall rule, as for retry below: build_config is shared
+        # with scripts/config_sweep.py, which declares neither flag.
+        convergence=ConvergenceConfig(
+            max_iterations=args.max_iterations,
+            max_wall_s=args.max_wall_s,
+            epsilon=getattr(args, "epsilon", ConvergenceConfig.epsilon),
+            n_window=getattr(args, "stall_window", ConvergenceConfig.n_window),
+        ),
         # Overridable so an exploration pass can buy more repair attempts and a
         # longer per-idea backstop than the graded run, without editing the
         # defaults in agent/config.py that the graded run relies on.
@@ -177,6 +184,13 @@ def _main() -> int:
                          "exploration pass so a complex idea is not abandoned over a fixable bug.")
     ap.add_argument("--idea-backstop-s", type=float, default=RetryConfig.idea_time_backstop_s,
                     help="abandon an idea past this wall time regardless of attempt count.")
+    ap.add_argument("--epsilon", type=float, default=ConvergenceConfig.epsilon,
+                    help="minimum validation-primary improvement that does not count as a stall.")
+    ap.add_argument("--stall-window", type=int, default=ConvergenceConfig.n_window,
+                    help="consecutive stalled iterations before stopping. Raise it above the "
+                         "number of ideas to be covered when the goal is COVERAGE rather than "
+                         "convergence -- an exploration pass expects most directions to fail, so "
+                         "the stall rule would end it long before the backlog is exhausted.")
     ap.add_argument("--findings-path", default=None,
                     help="cross-run Do/Don't ledger to write. Defaults to the committed "
                          "agent/research/findings.jsonl. Point this at a scratch file to keep an "
