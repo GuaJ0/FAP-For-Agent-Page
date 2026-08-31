@@ -44,6 +44,14 @@ SCIENTIFIC RULES
     direction may be reproposed, but the proposal must say what it is doing
     differently from the variant named in `variants`. `attempts` and `deltas`
     show how many measurements stand behind the entry and how they spread.
+  - Weigh a "do" by its `effect` field, which says how much the metric actually
+    moved -- a different question from how often it was measured.
+    "substantive" cleared the meaningful-improvement bar. "marginal" is a real
+    but small effect. "within_noise" means the best attempt could not be told
+    apart from no change at all: that direction has NOT been shown to work,
+    only shown not to fail, so building on it needs a reason beyond the entry
+    itself. An entry can be `do` + `well_tested` + `within_noise` at once --
+    measured repeatedly, and repeatedly measured as nothing.
   - `prior_findings` entries with verdict "do" are directions that previously
     beat their incumbent. Prefer building on one of those over an untested
     direction, unless the context shows it has since been superseded.

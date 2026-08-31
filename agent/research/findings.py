@@ -100,6 +100,49 @@ CONFIDENCE_WELL_TESTED = "well_tested"     # 3+ attempts across a stated range
 
 _WELL_TESTED_ATTEMPTS = 3
 
+# How BIG the measured effect was, as opposed to how many times it was measured.
+# Confidence and effect are independent axes and both are needed: three attempts
+# agreeing on a delta of +0.00005 is well-measured evidence of approximately
+# nothing, and recording it as "do / well_tested" tells Research to build on a
+# direction nobody has shown moves the metric.
+EFFECT_SUBSTANTIVE = "substantive"    # clearly moved the metric (see SUBSTANTIVE_DELTA)
+EFFECT_MARGINAL = "marginal"          # distinguishable from noise, but below it
+EFFECT_WITHIN_NOISE = "within_noise"  # not distinguishable from zero at all
+EFFECT_UNKNOWN = "unknown"            # no aggregate to judge from
+
+# Deliberately NOT ConvergenceConfig.epsilon, which was the first thing tried.
+# That number is the STOPPING RULE -- "has this run gone quiet?" -- and lowering
+# it makes a graded run harder to declare stalled, so it keeps spending budget.
+# Reusing it here coupled two unrelated decisions and, at 0.002, labelled the
+# only genuine result the first full campaign produced (+0.00157) as "marginal".
+#
+# Calibrated to what this task actually does instead. Measured over 15 runs:
+# median seed std 0.00015, so the noise floor (2 std) sits near 0.0003. This is
+# ~3x that -- comfortably above noise, while still reachable: the best single
+# iteration observed was +0.00157, and the whole 14-direction campaign gained
+# +0.00205 in total. A 0.002 iteration would be 0.8% of all remaining headroom
+# in one step, which is not the scale improvements arrive at here.
+SUBSTANTIVE_DELTA = 0.001
+
+
+def effect_for(delta: Optional[float], primary_std: Optional[float]) -> str:
+    """How much the metric actually moved.
+
+    "Within noise" is judged against the run's OWN seed spread rather than a
+    fixed floor, because that spread is the only estimate available of what
+    this configuration does when nothing changes. Two standard deviations is
+    deliberately loose: with the two seeds these runs use, the std is itself a
+    poor estimate, so the bar for claiming an effect should be generous to the
+    null rather than to the hypothesis.
+    """
+    if delta is None:
+        return EFFECT_UNKNOWN
+    if abs(delta) >= SUBSTANTIVE_DELTA:
+        return EFFECT_SUBSTANTIVE
+    if primary_std is not None and abs(delta) <= 2 * primary_std:
+        return EFFECT_WITHIN_NOISE
+    return EFFECT_MARGINAL
+
 
 def confidence_for(attempts: int) -> str:
     if attempts >= _WELL_TESTED_ATTEMPTS:
@@ -183,7 +226,8 @@ class Finding:
     variants: tuple[str, ...] = ()      # proposal ids / sweep points behind those attempts
     deltas: tuple[float, ...] = ()      # one per attempt, so the spread is visible
     coverage: str = ""                  # hyperparameter range the attempts spanned
-    confidence: str = CONFIDENCE_INCONCLUSIVE
+    confidence: str = CONFIDENCE_INCONCLUSIVE   # how MANY attempts stand behind it
+    effect: str = EFFECT_UNKNOWN                # how MUCH the best one moved the metric
 
     @property
     def evidence_strength(self) -> float:
@@ -200,6 +244,15 @@ class Finding:
     def is_conclusive(self) -> bool:
         """False for a one-attempt result, whatever its verdict."""
         return self.confidence != CONFIDENCE_INCONCLUSIVE
+
+    @property
+    def moved_the_metric(self) -> bool:
+        """False when the best attempt is indistinguishable from no change.
+
+        A "do" that is False here is not a direction to build on -- it is a
+        direction that did not fail.
+        """
+        return self.effect in (EFFECT_SUBSTANTIVE, EFFECT_MARGINAL)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -374,6 +427,7 @@ def build_finding(
         deltas=() if delta is None else (delta,),
         coverage=_hyperparameters_section(record.hypothesis),
         confidence=CONFIDENCE_INCONCLUSIVE,
+        effect=effect_for(delta, record.aggregate.primary_std if record.aggregate else None),
     )
 
 
@@ -433,6 +487,9 @@ def _merge(prior: Optional[Finding], new: Finding) -> Finding:
         deltas=deltas,
         coverage=_merge_coverage(prior.coverage, new.coverage),
         confidence=confidence_for(attempts),
+        # The winner's, because delta_vs_incumbent is the winner's: the headline
+        # delta and the size claim about it must describe the same run.
+        effect=winner.effect,
     )
 
 
@@ -544,6 +601,10 @@ def findings_for_prompt(findings: Iterable[Finding]) -> tuple[dict[str, Any], ..
         key=lambda f: (
             f.verdict != VERDICT_DONT,
             not f.is_conclusive,
+            # Among "do"s, one that actually moved the metric leads one that did
+            # not -- otherwise the first direction Research reads as promising
+            # may be a result indistinguishable from no change.
+            not f.moved_the_metric,
             -f.evidence_strength,
             f.direction,
         ),

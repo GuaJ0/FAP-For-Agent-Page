@@ -515,3 +515,111 @@ def test_the_six_false_findings_from_the_campaign_would_now_be_refused():
                              ("UNBIASED-VALIDATION", 0.0)):
         record = _record(decision=Decision.REVERT, primary=0.6016151905059814, delta=delta)
         assert build_finding(record, direction=direction, title="t") is None, direction
+
+
+# ---------------------------------------------------------------------------
+# Effect size: how much the metric moved, as opposed to how often it was
+# measured. Both axes are needed -- three attempts agreeing on +0.00005 is
+# well-measured evidence of approximately nothing, and "do / well_tested" alone
+# tells Research to build on a direction nobody has shown moves the metric.
+# ---------------------------------------------------------------------------
+
+from agent.research.findings import (  # noqa: E402
+    EFFECT_MARGINAL,
+    EFFECT_SUBSTANTIVE,
+    EFFECT_UNKNOWN,
+    EFFECT_WITHIN_NOISE,
+    SUBSTANTIVE_DELTA,
+    effect_for,
+)
+
+
+def _record_with_std(delta, std, primary=0.6030, decision=Decision.ACCEPT):
+    record = _record(decision=decision, primary=primary, delta=delta)
+    record.aggregate = AggregateMetrics(primary, std, primary + 0.06, primary - 0.06, 2)
+    return record
+
+
+def test_the_effect_threshold_is_not_the_convergence_epsilon():
+    """They answer different questions and must move independently: epsilon is
+    the stopping rule, and lowering it makes a graded run harder to declare
+    stalled. Reusing it here labelled the best real result 'marginal'."""
+    from agent.config import DEFAULT_CONFIG
+
+    assert SUBSTANTIVE_DELTA != DEFAULT_CONFIG.convergence.epsilon
+    assert SUBSTANTIVE_DELTA < DEFAULT_CONFIG.convergence.epsilon
+
+
+@pytest.mark.parametrize("delta,std,expected", [
+    (0.00157, 0.00020, EFFECT_SUBSTANTIVE),    # the campaign's one real result
+    (-0.00731, 0.00030, EFFECT_SUBSTANTIVE),   # a real regression is substantive too
+    (0.00026, 0.00003, EFFECT_MARGINAL),       # above noise, below the bar
+    (0.00005, 0.00028, EFFECT_WITHIN_NOISE),   # WATCHTIME: indistinguishable from zero
+    (0.00012, 0.00006, EFFECT_WITHIN_NOISE),   # exactly at 2*std
+    (None, None, EFFECT_UNKNOWN),
+])
+def test_effect_tiers_match_the_real_campaign_numbers(delta, std, expected):
+    assert effect_for(delta, std) == expected
+
+
+def test_noise_is_judged_against_the_run_s_own_seed_spread():
+    """Not a fixed floor: the seed spread is the only estimate available of what
+    this configuration does when nothing changes, so the same delta can be real
+    in a quiet run and noise in a jittery one."""
+    assert effect_for(0.0004, 0.00002) == EFFECT_MARGINAL        # quiet run
+    assert effect_for(0.0004, 0.00050) == EFFECT_WITHIN_NOISE    # jittery run
+
+
+def test_a_do_that_moved_nothing_is_flagged_as_such():
+    finding = build_finding(_record_with_std(0.00005, 0.00028),
+                            direction="WATCHTIME", title="watch-time aux")
+
+    assert finding.verdict == VERDICT_DO      # it did not fail...
+    assert finding.effect == EFFECT_WITHIN_NOISE
+    assert finding.moved_the_metric is False  # ...but it did not work either
+
+
+def test_effect_follows_the_winning_attempt_through_a_merge(tmp_path):
+    """delta_vs_incumbent is the winner's, so the size claim about it has to
+    describe the same run or the entry contradicts itself."""
+    ledger = FindingsLedger(tmp_path / "f.jsonl")
+    ledger.record(build_finding(_record_with_std(0.00004, 0.00002),
+                                direction="OFFLINE-A", title="t", family="FAM"))
+    ledger.record(build_finding(_record_with_std(0.00157, 0.00020),
+                                direction="OFFLINE-B", title="t", family="FAM"))
+
+    entry = ledger.load()[0]
+    assert entry.delta_vs_incumbent == pytest.approx(0.00157)
+    assert entry.effect == EFFECT_SUBSTANTIVE
+    assert entry.attempts == 2
+
+
+def test_a_do_that_moved_the_metric_leads_one_that_did_not():
+    """If the prompt is read top-down, the promising direction should be the one
+    that actually is."""
+    real = Finding(direction="REAL", title="t", verdict=VERDICT_DO, decision="accept",
+                   delta_vs_incumbent=0.00157, validation_primary=0.603, why="w",
+                   iteration=2, attempts=2, confidence=CONFIDENCE_TESTED,
+                   effect=EFFECT_SUBSTANTIVE)
+    hollow = Finding(direction="HOLLOW", title="t", verdict=VERDICT_DO, decision="accept",
+                     delta_vs_incumbent=0.00005, validation_primary=0.603, why="w",
+                     iteration=5, attempts=3, confidence=CONFIDENCE_WELL_TESTED,
+                     effect=EFFECT_WITHIN_NOISE)
+
+    rendered = findings_for_prompt([hollow, real])
+
+    assert [f["direction"] for f in rendered] == ["REAL", "HOLLOW"]
+
+
+def test_pre_effect_entries_still_load():
+    path = Path(__file__).parent / "_tmp_effect.jsonl"
+    path.write_text(json.dumps({
+        "direction": "OLD", "title": "t", "verdict": VERDICT_DONT, "decision": "revert",
+        "delta_vs_incumbent": -0.003, "validation_primary": 0.59, "why": "w", "iteration": 1,
+    }) + "\n")
+    try:
+        entry = FindingsLedger(path).load()[0]
+        assert entry.effect == EFFECT_UNKNOWN
+        assert entry.moved_the_metric is False
+    finally:
+        path.unlink()
