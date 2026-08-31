@@ -1,0 +1,1 @@
+{"max_train_rows": 20000, "epochs": 3, "patience": 2, "batch_size": 2048, "click_weight": 0.2, "like_weight": 0.2}
