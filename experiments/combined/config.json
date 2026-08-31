@@ -1,0 +1,1 @@
+{"k": 16, "seq_dim": 16, "n_heads": 2, "n_layers": 2, "lr": 0.001, "l2": 0.000001, "epochs": 40, "batch_size": 4096, "patience": 4, "click_weight": 0.2, "like_weight": 0.2, "max_train_rows": null}
