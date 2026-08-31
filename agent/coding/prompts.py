@@ -56,6 +56,19 @@ INVOCATION CONTRACT (exact -- the executor drives this)
 
   `--config` is a YAML or JSON file of flat key/value pairs. Read every
   hyperparameter from it with a sensible default; never hardcode a path.
+
+  THE HYPOTHESIS MUST BE ON BY DEFAULT. The keys named in the hypothesis's
+  HYPERPARAMETERS block are supplied in the config, but your defaults must
+  ALSO enable the mechanism, so that running your train.py with no config at
+  all still tests the idea. Defaulting the mechanism off (lambda=0,
+  use_x=False, window=None) and relying on the config to switch it on means a
+  missing key silently measures the unchanged baseline and reports it as the
+  idea having failed. If the hypothesis names a control setting, that is a
+  comparison for the ablation -- never the default.
+
+  If the data you need is not available, FAIL LOUDLY: raise with a clear
+  message. Do not silently skip the mechanism and score the baseline. A run
+  that cannot test the idea must not look like a run where the idea lost.
   Resolve the data directory as: config `data_dir`, else the KUAIRAND_PATH
   environment variable, else "./KuaiRand-Pure/data".
 

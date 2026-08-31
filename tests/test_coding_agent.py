@@ -850,3 +850,101 @@ def test_smoke_run_still_ships_a_merely_weak_model(tmp_path):
 
     manifest = json.loads((Path(diff.solution_dir) / "attempt.json").read_text())
     assert manifest["succeeded"] is True, manifest["cycles"]
+
+
+# ---------------------------------------------------------------------------
+# The proposal's declared settings must reach the config the executor runs.
+#
+# The gap this closes, from the first full campaign: hyperparameters reached
+# the model as prose in the handoff and stopped there. TIME-DRIFT's generated
+# train.py implemented recency weighting and the time cross, then defaulted
+# both to None; the executor ran it with neither set, measured the control
+# cell, and the ledger recorded the direction as a dead end.
+# ---------------------------------------------------------------------------
+
+HANDOFF_WITH_HP = """[RESEARCH_PROPOSAL v1]
+ID: OFFLINE-TIME-DRIFT
+TITLE: recency weighting
+
+HYPOTHESIS:
+down-weight older impressions
+
+HYPERPARAMETERS:
+- recency_half_life_days: [3,14,null]
+- hour_buckets: [8]
+- time_cross: ["hour_bucket_x_dur_bucket"]
+- pairs_per_positive: 1
+
+KEEP CONSTANT:
+- label
+"""
+
+
+def test_proposal_hyperparameters_are_parsed_from_the_handoff():
+    from agent.coding.agent import hyperparameters_from_handoff
+
+    hp = hyperparameters_from_handoff(HANDOFF_WITH_HP)
+
+    # a sweep list collapses to its first real value...
+    assert hp["recency_half_life_days"] == 3
+    # ...never to the control cell, which is the one value that must not run
+    assert hp["recency_half_life_days"] is not None
+    assert hp["hour_buckets"] == 8
+    assert hp["time_cross"] == "hour_bucket_x_dur_bucket"
+    assert hp["pairs_per_positive"] == 1          # a scalar stays a scalar
+
+
+def test_a_nested_list_hyperparameter_keeps_its_structure():
+    from agent.coding.agent import hyperparameters_from_handoff
+
+    hp = hyperparameters_from_handoff(
+        'HYPERPARAMETERS:\n- hidden_layers: [[64,32]]\n'
+        '- auxiliary_tasks: [["is_click","is_like"]]\n')
+
+    assert hp["hidden_layers"] == [64, 32]
+    assert hp["auxiliary_tasks"] == ["is_click", "is_like"]
+
+
+def test_a_hyperparameter_whose_options_are_all_null_is_skipped():
+    """[null] means the entry only declares a control; running it would measure
+    the baseline, which is exactly the failure being fixed."""
+    from agent.coding.agent import hyperparameters_from_handoff
+
+    assert hyperparameters_from_handoff("HYPERPARAMETERS:\n- knob: [null]\n") == {}
+
+
+def test_a_legacy_hypothesis_without_the_block_changes_nothing():
+    from agent.coding.agent import hyperparameters_from_handoff
+
+    assert hyperparameters_from_handoff("just try a pairwise loss") == {}
+
+
+def test_the_written_config_carries_the_proposal_settings(tmp_path):
+    agent = _agent(tmp_path, [_fenced(BASELINE)])
+
+    diff = agent.implement(Idea(HANDOFF_WITH_HP, None), None)
+
+    cfg = json.loads(Path(diff.config_path).read_text())
+    assert cfg["recency_half_life_days"] == 3
+    assert cfg["time_cross"] == "hour_bucket_x_dur_bucket"
+
+
+def test_an_explicit_base_config_override_outranks_the_proposal(tmp_path):
+    """base_config is the operator pinning something for the whole run; the
+    proposal must not silently override that."""
+    agent = _agent(tmp_path, [_fenced(BASELINE)], base_config={"hour_buckets": 24})
+
+    diff = agent.implement(Idea(HANDOFF_WITH_HP, None), None)
+
+    cfg = json.loads(Path(diff.config_path).read_text())
+    assert cfg["hour_buckets"] == 24               # operator wins
+    assert cfg["recency_half_life_days"] == 3      # proposal still applies elsewhere
+
+
+def test_the_prompt_forbids_defaulting_the_mechanism_off():
+    from agent.coding import prompts
+    from agent.coding.agent import available_third_party
+
+    sp = prompts.system_prompt(available_third_party())
+    assert "MUST BE ON BY DEFAULT" in sp
+    assert "FAIL LOUDLY" in sp

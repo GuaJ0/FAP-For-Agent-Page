@@ -105,6 +105,65 @@ FORBIDDEN_IMPORTS = {
 }
 
 
+def hyperparameters_from_handoff(hypothesis: str) -> dict[str, Any]:
+    """The proposal's declared settings, as a config the executor can run.
+
+    WHY THIS EXISTS
+    ---------------
+    ResearchProposal.implementation.hyperparameters is the *variable being
+    tested* -- it is what "we measured this direction" means. It reached the
+    model as prose inside the handoff text and stopped there: nothing wrote it
+    into config.json, so every generated train.py fell back to whatever default
+    it invented for itself.
+
+    Those defaults were sometimes OFF. In the first full exploration campaign
+    the TIME-DRIFT solution implemented recency weighting and the time cross
+    correctly, then defaulted both to None; the executor ran it with neither
+    set, measured the control cell, and the ledger recorded the direction as a
+    dead end. Seven of sixteen iterations scored bit-identically to the
+    baseline that way.
+
+    LISTS ARE SWEEPS, CONFIGS ARE SCALARS
+    -------------------------------------
+    A proposal declares `lambda_watch: [0.05, 0.1]` meaning "test these"; a
+    config needs one value. The first non-null element is taken -- first
+    because a backlog entry lists its primary setting first and its ablation
+    values after, and non-null because a None in the list is the control cell
+    (`recency_half_life_days: [3, 14, None]`), which is the one value that must
+    not be what gets run. A nested list stays a list: `hidden_layers: [[64,32]]`
+    yields [64,32], and `auxiliary_tasks: [["is_click","is_like"]]` yields the
+    task list itself.
+
+    Returns {} for a free-text or legacy hypothesis with no HYPERPARAMETERS
+    block, which correctly changes nothing.
+    """
+    match = re.search(
+        r"(?ms)^HYPERPARAMETERS:\s*\n(.*?)(?=\n[A-Z][A-Z ]+:\s*\n|\Z)", hypothesis or "",
+    )
+    if not match:
+        return {}
+
+    out: dict[str, Any] = {}
+    for line in match.group(1).splitlines():
+        line = line.strip().lstrip("-").strip()
+        if not line or ":" not in line:
+            continue
+        key, _, raw = line.partition(":")
+        key, raw = key.strip(), raw.strip()
+        if not key:
+            continue
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue                      # unparseable: leave it to the model's default
+        if isinstance(value, list):
+            value = next((v for v in value if v is not None), None)
+            if value is None:
+                continue                  # every option was the control cell
+        out[key] = value
+    return out
+
+
 def module_available(root: str) -> bool:
     """Whether `root` can actually be imported in the interpreter that will run
     the solution.
@@ -293,6 +352,8 @@ class LLMCodingAgent:
     smoke_timeout_s: float = 600.0
 
     base_config: dict[str, Any] = field(default_factory=dict)
+    # Populated per implement() call from the proposal's HYPERPARAMETERS block.
+    _proposal_hyperparameters: dict[str, Any] = field(default_factory=dict, init=False)
 
     # ACCUMULATION: where to look up "the current best solution" so a new idea
     # builds on what has been accepted rather than always on the static
@@ -328,6 +389,9 @@ class LLMCodingAgent:
         is known-bad still gets handed over, the executor fails it honestly,
         and tier-1 retry/abandonment does its job.
         """
+        # The proposal declares what is being tested; without this it reached the
+        # model as prose and never reached the config the executor runs.
+        self._proposal_hyperparameters = hyperparameters_from_handoff(idea.hypothesis)
         t0 = time.time()
         sol_dir = self._next_solution_dir()
         self._scaffold(sol_dir)
@@ -680,9 +744,17 @@ class LLMCodingAgent:
         )
 
     def _config_dict(self) -> dict[str, Any]:
+        """data_dir, then the proposal's declared settings, then base_config.
+
+        Order matters. The proposal's hyperparameters are the experiment; an
+        explicit base_config override from the caller outranks them, because
+        that is the operator deliberately pinning something (loss, epochs) for
+        the whole run.
+        """
         cfg: dict[str, Any] = {}
         if self.data_dir:
             cfg["data_dir"] = str(self.data_dir)
+        cfg.update(self._proposal_hyperparameters)
         cfg.update(self.base_config)
         return cfg
 

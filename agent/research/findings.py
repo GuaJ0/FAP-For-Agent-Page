@@ -271,6 +271,40 @@ def _hyperparameters_section(hypothesis: str) -> str:
 SUB_RANDOM_GAUC = 0.5
 
 
+# A delta this small means the run reproduced the incumbent's computation, not
+# that it tied it. Two seeds agreeing to ~1e-9 does not happen by coincidence
+# between different models; it happens when the same model ran twice.
+NO_OP_DELTA = 1e-9
+
+
+def _is_no_op(record: RunRecord) -> bool:
+    """Whether this run scored bit-identically to the incumbent.
+
+    In the first full exploration campaign, seven of sixteen iterations scored
+    exactly 0.6016 -- the baseline, to every decimal, across both seeds. None
+    of them had tied it honestly. Two causes, both silent:
+
+      - the proposal's hyperparameters never reached config.json, so a
+        generated train.py that defaulted its own mechanism off (TIME-DRIFT
+        defaulted recency_half_life_days and time_cross to None) ran the
+        control cell;
+      - the vendored data.py exposes seven columns and none of the engagement
+        or watch-time labels, so watch-time and multi-task solutions found no
+        auxiliary target and skipped the head entirely.
+
+    Either way the run measured the incumbent and the ledger recorded the
+    direction as a dead end -- and because every variant in a family shares the
+    same cause, three of them rolled up to "well_tested". That is the worst
+    possible outcome: a false Don't at the highest confidence tier.
+
+    Both causes are now fixed upstream, but this stays as the backstop. A
+    direction that cannot be built must not be recordable as a direction that
+    failed.
+    """
+    delta = record.delta_vs_current_best
+    return delta is not None and abs(delta) < NO_OP_DELTA
+
+
 def _is_sub_random(record: RunRecord) -> bool:
     """Whether this result ranks worse than chance within users."""
     agg = record.aggregate
@@ -313,6 +347,11 @@ def build_finding(
     #
     # Returning None rather than a "do": nothing was measured either way.
     if _is_sub_random(record):
+        return None
+
+    # Bit-identical to the incumbent: the mechanism did not run. Nothing was
+    # measured, so nothing is recorded -- see _is_no_op.
+    if _is_no_op(record):
         return None
 
     verdict = VERDICT_DO if record.decision == Decision.ACCEPT else VERDICT_DONT

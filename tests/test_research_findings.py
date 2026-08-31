@@ -468,3 +468,50 @@ def test_a_record_with_no_aggregate_is_unaffected_by_the_guard():
     no Evaluator decision."""
     record = _record(decision=None, primary=None)
     assert build_finding(record, direction="D", title="t") is None
+
+
+# ---------------------------------------------------------------------------
+# A run that reproduced the incumbent measured nothing.
+#
+# From the first full campaign: seven of sixteen iterations scored exactly
+# 0.6016 across both seeds -- the baseline, to every decimal. The mechanism had
+# not run (hyperparameters never reached config.json; the vendored loader has
+# no watch-time or engagement columns). Every one was recorded as a "dont", and
+# because a whole family shares the cause, three rolled up to "well_tested".
+# ---------------------------------------------------------------------------
+
+from agent.research.findings import NO_OP_DELTA  # noqa: E402
+
+
+def test_a_run_identical_to_the_incumbent_is_not_recorded():
+    record = _record(decision=Decision.REVERT, primary=0.6016151905059814, delta=0.0)
+    assert build_finding(record, direction="WATCHTIME", title="watch-time aux") is None
+
+
+def test_a_real_but_tiny_regression_is_still_recorded():
+    """The guard must not swallow genuine near-ties -- only bit-identical ones.
+    A model that really did run and lost by 1e-4 measured something."""
+    record = _record(decision=Decision.REVERT, primary=0.6015, delta=-1e-4)
+    finding = build_finding(record, direction="D", title="t")
+
+    assert finding is not None
+    assert finding.verdict == VERDICT_DONT
+
+
+def test_the_no_op_threshold_is_tight_enough_to_mean_identical():
+    """1e-9 is 'the same computation ran twice', not 'these were close'."""
+    assert NO_OP_DELTA == 1e-9
+    assert build_finding(_record(decision=Decision.REVERT, primary=0.6, delta=1e-10),
+                         direction="D", title="t") is None
+    assert build_finding(_record(decision=Decision.REVERT, primary=0.6, delta=1e-8),
+                         direction="D", title="t") is not None
+
+
+def test_the_six_false_findings_from_the_campaign_would_now_be_refused():
+    """Replays the real deltas. WATCHTIME rolled up to well_tested on three
+    runs that each reproduced the incumbent exactly."""
+    for direction, delta in (("WATCHTIME", 0.0), ("WATCHTIME", 0.0), ("WATCHTIME", 0.0),
+                             ("MULTITASK", 0.0), ("TIME-DRIFT", 0.0),
+                             ("UNBIASED-VALIDATION", 0.0)):
+        record = _record(decision=Decision.REVERT, primary=0.6016151905059814, delta=delta)
+        assert build_finding(record, direction=direction, title="t") is None, direction
