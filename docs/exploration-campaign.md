@@ -45,6 +45,34 @@ inside that scratch `logs/`, so it cannot consume the graded run's budget.
 `--promote` is the separate, explicit step that merges reviewed findings into
 the committed ledger; until you run it the graded run's memory is untouched.
 
+## Re-running: the scratch root resumes, it does not restart
+
+`runs/exploration/` holds `runs.jsonl`, `orchestrator_state.json` and the
+registry, and the orchestrator is deliberately crash-resume safe — so pointing a
+second run at a root that already finished is a **no-op**, not a fresh run.
+`should_stop` fires before the first `_step()` and `run()` returns immediately.
+
+This is easy to mistake for success. The summary still prints the previous
+run's records, the previous run's LLM totals and a `finished in 0s` line that is
+the only real tell:
+
+```
+=== finished in 0s, 3 record(s) ===
+...
+coding totals:    {'calls': 4, ...}      <- unchanged from the previous run
+```
+
+To genuinely re-run, move the root aside first:
+
+```bash
+mv runs/exploration "runs/exploration-archived-$(date +%Y%m%d-%H%M%S)"
+python scripts/seed_findings.py --model gpt-5
+```
+
+Archive rather than delete: a scratch run's `solutions/` are the evidence for
+whatever its findings claim, and the whole point of the campaign is that those
+claims are checkable.
+
 ## Confidence, and why a single attempt is not a "Don't"
 
 Ledger entries roll up by **family**, not by individual proposal id, so the
