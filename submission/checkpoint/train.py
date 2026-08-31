@@ -1,4 +1,4 @@
-/"""Multi-task FM: same 5 baseline fields, same FM interaction structure, but
+"""Multi-task FM: same 5 baseline fields, same FM interaction structure, but
 trained with auxiliary heads on is_click / is_like alongside the main
 long_view head, sharing the same embeddings.
 
