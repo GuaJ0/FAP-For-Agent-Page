@@ -51,6 +51,11 @@ class ResearchContext:
     remaining_wall_s: float
     minimum_meaningful_delta: float
     history_fingerprint: str
+    # Cross-run Do/Don't ledger (agent/research/findings.py). Empty on a run
+    # with no prior findings. Carried here rather than injected at prompt-build
+    # time so it passes through _assert_validation_only_context() like every
+    # other field -- the safety boundary is the context object, not the caller.
+    prior_findings: tuple[dict[str, Any], ...] = ()
     task: str = "KuaiRand-Pure within-user ranking of logged impressions"
     label: str = "long_view"
     primary_metric: str = "mean(GAUC, nDCG@5)"
@@ -132,6 +137,7 @@ def _incumbent(history: Sequence[RunRecord]) -> Optional[IncumbentSummary]:
 def build_research_context(
     history: Sequence[RunRecord],
     cfg: ConvergenceConfig = DEFAULT_CONFIG.convergence,
+    prior_findings: Sequence[dict[str, Any]] = (),
 ) -> ResearchContext:
     """Return only data already permitted in the agent-facing RunRecord.
 
@@ -166,6 +172,7 @@ def build_research_context(
         remaining_wall_s=remaining_wall_s,
         minimum_meaningful_delta=cfg.epsilon,
         history_fingerprint=build_history_fingerprint(records),
+        prior_findings=tuple(prior_findings),
     )
     # Structural backstop: this is the exact JSON-compatible payload that will
     # later be placed in the Research prompt.

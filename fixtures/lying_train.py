@@ -8,7 +8,7 @@ this one is the adversary for the *scoring* contract.
 
 `<cfg>` is JSON, with:
 
-    mode: one of
+    mode: one of ("invert" ranks backwards: sub-random GAUC, honest reporting)
       "honest"    -- persist predictions, report exactly what evaluate.py says
       "inflate"   -- persist predictions, report `claimed` instead (the case
                      that matters: well-formed result.json, false numbers)
@@ -83,6 +83,12 @@ def main():
     fmt = cfg.get("raw_format", "npz")
 
     users, labels, scores = synth(a.seed, cfg.get("n_users", 40), cfg.get("n_per_user", 12))
+    if mode == "invert":
+        # Rank every user's items backwards. The reported metrics stay perfectly
+        # consistent with the persisted predictions, so verification passes --
+        # this is exactly the failure metric verification cannot see, and what
+        # the sub-random GAUC check exists for.
+        scores = [-s for s in scores]
     truth = evaluate(users, labels, scores)
 
     out_path = Path(a.out)

@@ -45,3 +45,18 @@ Both numbers reproduced locally against the freshly downloaded dataset:
 | `baseline.py --model random` test primary | ~0.475 (+-0.001) | **0.4757** |
 | `baseline.py --model fm --seed 0` test primary | 0.5946 (+-0.0008 seed std) | **0.5953** |
 | `baseline.py --model fm --seed 0` valid primary | 0.6016 | **0.6015** |
+
+
+## `dataset.py` is ours, not the starter kit's
+
+`dataset.py` sits alongside the vendored files and is vendored into each
+solution dir with them, but it is **not** a starter-kit file and is not
+hash-pinned. It exists because `data.load()` exposes 7 of the log's 19 columns,
+and several research directions need the others (`play_time_ms` for watch-time
+work, `is_click`/`is_like`/... for multi-task, `hourmin`/`time_ms` for drift).
+
+It adds from the outside rather than editing `data.py`, so the hash guard on
+the vendored files keeps working and there is never a question about which
+lines are the competition's and which are ours. It imports `SPLITS` and `LABEL`
+from `data.py` rather than restating them, so it cannot disagree with the
+official loader about where the held-out boundary is.

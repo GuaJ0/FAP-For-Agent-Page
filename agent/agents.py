@@ -72,9 +72,35 @@ class Diff:
     usage: Optional[AgentUsage] = None
 
 
+class ResearchExhausted(Exception):
+    """The Research agent has nothing left to propose, and that is not an error.
+
+    Distinct from every other exception propose() can raise. Orchestrator
+    treats an unexpected exception as a research FAILURE: it records a failed
+    iteration, increments consecutive_research_failures, retries, and escalates
+    to a human after max_consecutive_research_failures in a row. That is right
+    for an agent that cannot produce a valid proposal -- retrying may work, and
+    burning a 6h budget on one that never will is worse than stopping to ask.
+
+    It is wrong for an agent that has simply finished. A deterministic backlog
+    that has proposed every idea it holds has not failed at anything; retrying
+    it cannot succeed, the failed records it would accumulate describe no real
+    experiment, and escalating to a human misreports an orderly finish as a
+    breakdown needing intervention. Raising this instead ends the run cleanly.
+
+    Only an agent that is genuinely out of ideas should raise it -- it is a
+    terminal condition for the whole run, not a way to skip one iteration.
+    """
+
+
 class ResearchAgent(Protocol):
     def propose(self, history: list[RunRecord]) -> Idea:
-        """Propose the next idea given everything tried so far."""
+        """Propose the next idea given everything tried so far.
+
+        Raise ResearchExhausted to end the run cleanly when there is nothing
+        left to propose. Any other exception is treated as a failure to
+        propose: recorded, retried, and escalated if it keeps happening.
+        """
         ...
 
 

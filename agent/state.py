@@ -30,6 +30,11 @@ class OrchestratorState:
     consecutive_research_failures: int = 0
     halted: bool = False
     halt_reason: Optional[str] = None
+    # Set when ResearchAgent.propose() reported it has nothing left to propose.
+    # Terminal and deliberately persisted: a resumed run whose backlog was
+    # already exhausted must stop again rather than re-derive the same finish.
+    research_exhausted: bool = False
+    research_exhausted_reason: Optional[str] = None
     run_start_time: Optional[float] = None       # epoch seconds; set once, for adaptive-seeding projections
     seed_costs: list = field(default_factory=list)  # observed wall_s per completed seed run
     # One-shot: set True by resume_after_human(), consumed (reset to False) by

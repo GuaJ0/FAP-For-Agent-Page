@@ -584,6 +584,156 @@ def test_summary_write_is_atomic_leaving_no_tmp_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Cross-run Do/Don't ledger: the Orchestrator logs Evaluator-judged outcomes so
+# a later run with an empty runs.jsonl still knows what has been measured.
+# The Orchestrator owns the write; the Evaluator's job stays judging.
+# ---------------------------------------------------------------------------
+
+def _proposal_hypothesis(hid="RP-001", text="use a pairwise BPR ranking loss"):
+    return (
+        "[RESEARCH_PROPOSAL v1]\n"
+        f"ID: {hid}\n"
+        "TITLE: a title\n"
+        "PARENT ITERATION: 0\n"
+        "\n"
+        "HYPOTHESIS:\n"
+        f"{text}\n"
+    )
+
+
+def _ledger_orchestrator(tmp_path, cfg, outcomes, hypotheses, evaluator=None):
+    from agent.research.findings import FindingsLedger
+
+    ledger = FindingsLedger(tmp_path / "findings.jsonl")
+    orc = make_orchestrator(tmp_path, cfg, outcomes, hypotheses=hypotheses,
+                            evaluator=evaluator)
+    orc.findings = ledger
+    return orc, ledger
+
+
+def test_a_reverted_iteration_is_logged_as_a_dont(tmp_path):
+    cfg = make_test_config(tmp_path)
+    # mean below the incumbent so FakeEvaluatorAgent reverts it.
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg,
+        [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.60},
+         {"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.55}],
+        hypotheses=(_proposal_hypothesis("RP-001"), _proposal_hypothesis("RP-002")),
+    )
+
+    orc._step(orc.run_log.read_all())      # accepted, becomes the incumbent
+    orc._step(orc.run_log.read_all())      # loses to it -> revert
+
+    stored = {f.direction: f for f in ledger.load()}
+    assert stored["RP-001"].verdict == "do"
+    assert stored["RP-002"].verdict == "dont"
+    assert stored["RP-002"].delta_vs_incumbent < 0
+
+
+def test_the_finding_survives_a_full_reset_of_the_run_state(tmp_path):
+    """The point of the feature: runs.jsonl, registry.json and
+    orchestrator_state.json all reset, and the ledger still remembers."""
+    from agent.research.findings import FindingsLedger
+
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.6}],
+        hypotheses=(_proposal_hypothesis("RP-001"),),
+    )
+    orc._step(orc.run_log.read_all())
+
+    # Wipe everything a "fresh run" resets.
+    for p in (cfg.paths.runs_jsonl, cfg.paths.registry_json, cfg.paths.orchestrator_state):
+        if p.exists():
+            p.unlink()
+
+    assert [f.direction for f in FindingsLedger(tmp_path / "findings.jsonl").load()] == ["RP-001"]
+
+
+def test_a_technical_abandon_is_not_logged(tmp_path):
+    """_handle_failed_run's abandon path has no Evaluator judgment and no
+    delta. A crash means the Coding agent couldn't build it -- not evidence
+    against the direction."""
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "crash", "sleep_s": 0.0}] * 3,
+        hypotheses=(_proposal_hypothesis("RP-009"),),
+    )
+
+    for _ in range(3):
+        orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.ABANDONED
+    assert ledger.load() == ()
+
+
+def test_a_record_without_a_proposal_id_is_not_logged(tmp_path):
+    """The seeded baseline and hand-written hypotheses have no stable direction
+    key to deduplicate on."""
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.6}],
+        hypotheses=("a plain hypothesis with no proposal envelope",),
+    )
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].decision is not None   # it WAS judged
+    assert ledger.load() == ()                                # but not logged
+
+
+def test_the_evaluators_own_words_become_the_reason(tmp_path):
+    """The 'why' is extracted from the Evaluator's commentary event -- no LLM
+    call in the write path."""
+    from agent.agents import Verdict
+
+    class _CommentingEvaluator:
+        def judge(self, record, history):
+            return Verdict(decision=Decision.REVERT,
+                           commentary="Regressed on validation primary; the loss is misaligned.")
+
+    cfg = make_test_config(tmp_path)
+    orc, ledger = _ledger_orchestrator(
+        tmp_path, cfg, [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.6}],
+        hypotheses=(_proposal_hypothesis("RP-011"),),
+        evaluator=_CommentingEvaluator(),
+    )
+
+    orc._step(orc.run_log.read_all())
+
+    assert "misaligned" in ledger.load()[0].why
+
+
+def test_orchestrators_without_a_ledger_are_unaffected(tmp_path):
+    """findings defaults to None, so every existing caller and test is
+    unchanged and nothing is written anywhere."""
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}])
+
+    assert orc.findings is None
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.SUCCESS
+    assert not list(tmp_path.glob("**/findings.jsonl"))
+
+
+def test_a_broken_ledger_does_not_take_down_the_run(tmp_path):
+    """Observational write: the RunRecord is already appended by then."""
+    class _ExplodingLedger:
+        def record(self, finding):
+            raise RuntimeError("disk on fire")
+
+    cfg = make_test_config(tmp_path)
+    orc = make_orchestrator(tmp_path, cfg, [{"mode": "normal", "sleep_s": 0.0}],
+                            hypotheses=(_proposal_hypothesis("RP-012"),))
+    orc.findings = _ExplodingLedger()
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.run_log.read_all()[-1].status == Status.SUCCESS
+
+
+# ---------------------------------------------------------------------------
 # A ResearchAgent.propose() failure must never crash the whole run -- exposed
 # by a real live run where the Research agent's depth-phase validation raised
 # ResearchOutputError with nothing catching it, killing the entire process
@@ -670,3 +820,141 @@ def test_research_failure_records_do_not_consume_a_max_iterations_slot(tmp_path)
 
     stop, reason = should_stop(history, cfg.convergence)
     assert stop is False, "FAILED research-proposal records must not trip max_iterations=1"
+
+
+# ---------------------------------------------------------------------------
+# An exhausted Research agent has FINISHED, not failed.
+#
+# The distinction matters because the two are handled oppositely. A failure to
+# propose is recorded, retried, and escalated to a human once enough pile up --
+# right for an agent that cannot produce a valid proposal, wrong for a
+# deterministic backlog that has proposed every idea it holds. Without this
+# split, an exploration campaign reaching its natural end would write failed
+# records describing no real experiment and then halt as if it had broken.
+# ---------------------------------------------------------------------------
+
+class _ExhaustedResearchAgent:
+    """Proposes `n` real ideas, then reports it has nothing left."""
+
+    def __init__(self, n=0, hypothesis="a real idea"):
+        self._remaining = n
+        self._hypothesis = hypothesis
+        self.calls = 0
+
+    def propose(self, history):
+        from agent.agents import Idea, ResearchExhausted
+
+        self.calls += 1
+        if self._remaining <= 0:
+            raise ResearchExhausted("backlog exhausted: every idea has been tried")
+        self._remaining -= 1
+        return Idea(hypothesis=self._hypothesis,
+                    parent_iteration=history[-1].iteration if history else None)
+
+
+def test_an_exhausted_research_agent_stops_the_run_without_recording_a_failure(tmp_path):
+    cfg = make_test_config(tmp_path)
+    research = _ExhaustedResearchAgent(n=0)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    history = orc.run()
+
+    assert history == []                                   # no junk iteration recorded
+    assert orc.state.research_exhausted is True
+    assert "exhausted" in orc.state.research_exhausted_reason
+    assert orc.state.consecutive_research_failures == 0     # it did not fail at anything
+    assert orc.state.halted is False                        # and nobody is being paged
+
+
+def test_exhaustion_never_escalates_however_long_the_run_would_continue(tmp_path):
+    """The failure path halts after max_consecutive_research_failures. If
+    exhaustion went down that path, a finished campaign would report itself as
+    a breakdown needing human intervention."""
+    from agent.config import ConvergenceConfig
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=50))
+    research = _ExhaustedResearchAgent(n=0)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+
+    orc.run()
+
+    assert research.calls == 1          # asked once, believed the answer
+    assert orc.state.halted is False
+    assert not orc.run_log.read_all()
+
+
+def test_a_resumed_run_whose_backlog_was_exhausted_stops_immediately(tmp_path):
+    """Terminal and persisted: re-running must not call propose() again just to
+    be told the same thing."""
+    cfg = make_test_config(tmp_path)
+    research = _ExhaustedResearchAgent(n=0)
+    orc = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+    orc.run()
+    assert research.calls == 1
+
+    resumed = make_orchestrator(tmp_path, cfg, outcomes=[], research=research)
+    assert resumed.state.research_exhausted is True     # survived the state file
+    resumed.run()
+
+    assert research.calls == 1                          # not asked a second time
+
+
+def test_ideas_proposed_before_exhaustion_still_run_normally(tmp_path):
+    """Exhaustion ends the run at the point it happens -- it does not discard
+    the work the campaign already did."""
+    from agent.config import ConvergenceConfig
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=50))
+    research = _ExhaustedResearchAgent(n=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    history = orc.run()
+
+    assert [r.status for r in history] == [Status.SUCCESS]
+    assert history[0].decision is not None               # really judged
+    assert orc.state.research_exhausted is True
+
+
+def test_a_plain_exception_is_still_a_failure_not_an_orderly_finish(tmp_path):
+    """The split must not have loosened the failure path: anything that is not
+    ResearchExhausted still records, retries and can escalate."""
+    cfg = make_test_config(tmp_path)
+    research = _FlakyResearchAgent(fail_times=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    orc._step(orc.run_log.read_all())
+
+    assert orc.state.research_exhausted is False
+    assert orc.state.consecutive_research_failures == 1
+    assert [r.status for r in orc.run_log.read_all()] == [Status.FAILED]
+
+
+def test_an_orderly_finish_is_visible_in_summary_json(tmp_path):
+    """Why a run stopped has to be on disk -- no RunRecord is written for an
+    orderly finish, so summary.json is where it has to show up."""
+    import json
+
+    from agent.config import ConvergenceConfig
+
+    cfg = make_test_config(tmp_path, convergence=ConvergenceConfig(max_iterations=50))
+    research = _ExhaustedResearchAgent(n=1)
+    outcomes = [{"mode": "normal", "std": 0.0, "sleep_s": 0.0, "mean": 0.5}]
+    orc = make_orchestrator(tmp_path, cfg, outcomes, research=research)
+
+    orc.run()
+
+    summary = json.loads((cfg.paths.logs_dir / "summary.json").read_text())
+    assert "exhausted" in summary["stopped_because"]
+
+
+def test_the_offline_backlog_exhaustion_error_is_an_orderly_finish(tmp_path):
+    """The concrete case this exists for: OfflineResearchAgent running out of
+    backlog entries at the end of an exploration campaign."""
+    from agent.agents import ResearchExhausted
+    from agent.research.offline import OfflineBacklogExhausted, OfflineResearchError
+
+    assert issubclass(OfflineBacklogExhausted, ResearchExhausted)
+    # and still what existing callers/tests catch
+    assert issubclass(OfflineBacklogExhausted, OfflineResearchError)

@@ -43,6 +43,7 @@ _current_best_source() below depends on it.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import difflib
 import json
 import re
@@ -62,35 +63,292 @@ from agent.verification import Status as VerifyStatus, verify_result
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VENDORED = REPO_ROOT / "harness"
-VENDORED_FILES = ("evaluate.py", "data.py")
+VENDORED_FILES = ("evaluate.py", "data.py", "dataset.py")
 
 CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
 
 # Modules a solution may import. Everything else is rejected before it costs a
 # training run -- the environment has numpy and the stdlib, nothing more.
-ALLOWED_IMPORTS = frozenset({
-    "argparse", "collections", "copy", "csv", "dataclasses", "enum", "functools",
-    "heapq", "itertools", "json", "math", "os", "pathlib", "random", "re",
-    "statistics", "sys", "time", "typing", "warnings",
-    "numpy", "yaml",
-    "evaluate", "data",   # the vendored harness, sitting next to train.py
-})
+# IMPORT POLICY
+# -------------
+# External open-source libraries and frameworks are PERMITTED -- see
+# docs/coding-agent.md, which is the authoritative statement of this. What used
+# to sit here was a hardcoded numpy-only allowlist plus a hand-maintained
+# "unavailable" dict, and both had drifted from reality: the dict claimed
+# pandas, sklearn and scipy were "not installed" when all three are, while the
+# allowlist rejected them anyway.
+#
+# So availability is now MEASURED rather than declared. Two rules:
+#
+#   1. FORBIDDEN_IMPORTS -- refused however the environment is provisioned,
+#      because they are sandbox rules rather than packaging facts.
+#   2. everything else -- allowed if and only if it can actually be imported
+#      here. That is exactly docs/coding-agent.md's rule that a dependency must
+#      be installed before a solution may rely on it, and it needs no edit when
+#      one is later provisioned: pip install torch, and torch becomes legal.
+#
+# Measuring in THIS process is valid because executor.py launches solutions with
+# sys.executable -- the same interpreter -- so what imports here imports there.
 
-# Named separately from "not in ALLOWED_IMPORTS" so the failure message can say
-# *why* -- "torch isn't installed in this environment" is a far more actionable
-# repair prompt than "unexpected import".
-KNOWN_UNAVAILABLE = {
-    "torch": "PyTorch is not installed; the environment is numpy-only",
-    "pandas": "pandas is not installed; use csv/numpy via the vendored data.py",
-    "sklearn": "scikit-learn is not installed; implement the metric-free parts yourself",
-    "scipy": "scipy is not installed; numpy only",
-    "lightgbm": "lightgbm is not installed; numpy only",
-    "xgboost": "xgboost is not installed; numpy only",
+# Sit next to the generated train.py, so they are importable in the executor's
+# cwd=<solution_dir> subprocess but not from this process. Availability cannot
+# be measured for them; they are always legal.
+VENDORED_IMPORTS = frozenset({"evaluate", "data", "dataset"})
+
+# Sandbox rules. These stay refused no matter what is installed -- every one is
+# in the stdlib and would therefore pass an availability test.
+FORBIDDEN_IMPORTS = {
+    "subprocess": "spawning subprocesses is not permitted",
+    "socket": "there is no network access in the sandbox",
     "requests": "there is no network access in the sandbox",
     "urllib": "there is no network access in the sandbox",
-    "socket": "there is no network access in the sandbox",
-    "subprocess": "spawning subprocesses is not permitted",
 }
+
+
+# Calls that FIT a model, as opposed to scoring one. Scoring the validation
+# split is not only legal but required -- the baseline early-stops on it -- so
+# this check has to separate "used valid to select" from "used valid to learn",
+# and only the second is a violation.
+_TRAINING_CALLS = frozenset({
+    "fit", "partial_fit", "step", "train", "train_epoch", "run_training",
+    "update", "learn", "train_on_batch", "fit_transform",
+})
+
+# Operations that CARRY data through, so a result built from validation rows is
+# still validation rows. Taint follows these and nothing else: propagating
+# through every call instead marks `va = evaluate(uva, yva, ...)` as data, and
+# from there everything downstream, which is how the first version of this
+# check flagged `loss`, `int` and even the training matrix itself.
+_DATA_CARRYING_CALLS = frozenset({
+    "concatenate", "vstack", "hstack", "stack", "cat", "concat", "asarray",
+    "array", "copy", "reshape", "astype", "ravel", "flatten", "tensor", "from_numpy",
+})
+
+_HELD_OUT_KEYS = frozenset({"valid", "validation", "test"})
+
+
+def _held_out_taint(tree: ast.AST) -> set[str]:
+    """Names holding validation or test ROWS.
+
+    Seeded from split subscripts (`enc["valid"]`, `splits["test"]`) and
+    propagated only through aliasing, indexing, and the data-carrying calls
+    above -- so `Xva, yva, _ = enc["valid"]`, `a = Xva[mask]` and
+    `Xall = np.concatenate([Xtr, Xva])` are all tainted, while `va =
+    evaluate(uva, yva, ...)` is not: that is a score, not the rows.
+
+    Two passes covers the shapes real solutions use and keeps this a static
+    check rather than a dataflow engine.
+    """
+    tainted: set[str] = set()
+
+    def _reads_held_out(node) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Subscript):
+                key = getattr(sub.slice, "value", None)
+                if isinstance(key, str) and key in _HELD_OUT_KEYS:
+                    return True
+        return False
+
+    def _carries_taint(value) -> bool:
+        """Whether this expression yields held-out DATA (not a number about it)."""
+        if isinstance(value, ast.Name):
+            return value.id in tainted
+        if isinstance(value, (ast.Subscript, ast.Attribute)):
+            return _carries_taint(value.value)
+        if isinstance(value, (ast.Tuple, ast.List)):
+            return any(_carries_taint(e) for e in value.elts)
+        if isinstance(value, ast.Call):
+            fn = value.func.attr if isinstance(value.func, ast.Attribute) else \
+                 getattr(value.func, "id", "")
+            if fn not in _DATA_CARRYING_CALLS:
+                return False
+            return any(_carries_taint(a) for a in value.args) or \
+                   any(_carries_taint(k.value) for k in value.keywords)
+        return False
+
+    def _taint_target(target, value):
+        for t, v in _pairs(target, value):
+            if not (_reads_held_out(v) or _carries_taint(v)):
+                continue
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name):
+                    tainted.add(n.id)
+
+    for _ in range(2):
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                _taint_target(target, value)
+    return tainted
+
+
+def _pairs(target, value):
+    """Match `a, b = x, y` element-wise instead of tainting every name.
+
+    Without this, `Xtr, Xva, Xte = by_split["train"], by_split["valid"],
+    by_split["test"]` marks the TRAINING matrix as held-out data, and the very
+    next `m.step(Xtr, ytr)` is reported as training on validation -- a real
+    solution hit exactly that and it was the last false positive left.
+    """
+    if (isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)):
+        for t, v in zip(target.elts, value.elts):
+            yield from _pairs(t, v)
+    else:
+        yield target, value
+
+
+def check_split_hygiene(tree: ast.AST) -> list[str]:
+    """Reject a solution that appears to LEARN from validation or test rows.
+
+    THE FAILURE THIS CATCHES
+    ------------------------
+    A train.py that fits on validation rows scores brilliantly on validation,
+    wins ACCEPT, becomes the incumbent, and collapses on the held-out split.
+    Nothing else notices: agent/verification.py proves the reported metrics are
+    arithmetically consistent with the predictions the run persisted, and says
+    so in its own docstring -- it never establishes which rows produced them.
+
+    The exposure grew rather than shrank: solutions now reach for torch and for
+    extra columns via dataset.load_full, so there is far more data handling to
+    get wrong than in the numpy FM this pipeline was built around.
+
+    DELIBERATELY NARROW
+    -------------------
+    Only held-out rows reaching a FITTING call are flagged. Combining splits is
+    not flagged by itself, because doing so is often legitimate -- a solution
+    that concatenates train/valid/test video_ids to build one id vocabulary
+    uses no labels and leaks nothing. It becomes a problem only when that
+    combined array is then trained on, which the taint rules above follow.
+
+    This catches the plausible ACCIDENT. It does not pretend to stop a solution
+    determined to cheat, which would need the executor to observe what the
+    process actually read.
+    """
+    problems: list[str] = []
+    tainted = _held_out_taint(tree)
+    if not tainted:
+        return problems
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else \
+               getattr(node.func, "id", "")
+        if name not in _TRAINING_CALLS:
+            continue
+        used = {n.id for a in node.args for n in ast.walk(a) if isinstance(n, ast.Name)}
+        used |= {n.id for k in node.keywords for n in ast.walk(k.value) if isinstance(n, ast.Name)}
+        hit = sorted(used & tainted)
+        if hit:
+            problems.append(
+                f"line {node.lineno}: passes validation/test data {hit} into {name}(), "
+                f"which trains the model. Scoring the validation split is required "
+                f"(early stopping); FITTING on it inflates validation, wins ACCEPT, and "
+                f"collapses on the held-out split. Train on the 'train' split only."
+            )
+    return problems
+
+
+def hyperparameters_from_handoff(hypothesis: str) -> dict[str, Any]:
+    """The proposal's declared settings, as a config the executor can run.
+
+    WHY THIS EXISTS
+    ---------------
+    ResearchProposal.implementation.hyperparameters is the *variable being
+    tested* -- it is what "we measured this direction" means. It reached the
+    model as prose inside the handoff text and stopped there: nothing wrote it
+    into config.json, so every generated train.py fell back to whatever default
+    it invented for itself.
+
+    Those defaults were sometimes OFF. In the first full exploration campaign
+    the TIME-DRIFT solution implemented recency weighting and the time cross
+    correctly, then defaulted both to None; the executor ran it with neither
+    set, measured the control cell, and the ledger recorded the direction as a
+    dead end. Seven of sixteen iterations scored bit-identically to the
+    baseline that way.
+
+    LISTS ARE SWEEPS, CONFIGS ARE SCALARS
+    -------------------------------------
+    A proposal declares `lambda_watch: [0.05, 0.1]` meaning "test these"; a
+    config needs one value. The first non-null element is taken -- first
+    because a backlog entry lists its primary setting first and its ablation
+    values after, and non-null because a None in the list is the control cell
+    (`recency_half_life_days: [3, 14, None]`), which is the one value that must
+    not be what gets run. A nested list stays a list: `hidden_layers: [[64,32]]`
+    yields [64,32], and `auxiliary_tasks: [["is_click","is_like"]]` yields the
+    task list itself.
+
+    Returns {} for a free-text or legacy hypothesis with no HYPERPARAMETERS
+    block, which correctly changes nothing.
+    """
+    match = re.search(
+        r"(?ms)^HYPERPARAMETERS:\s*\n(.*?)(?=\n[A-Z][A-Z ]+:\s*\n|\Z)", hypothesis or "",
+    )
+    if not match:
+        return {}
+
+    out: dict[str, Any] = {}
+    for line in match.group(1).splitlines():
+        line = line.strip().lstrip("-").strip()
+        if not line or ":" not in line:
+            continue
+        key, _, raw = line.partition(":")
+        key, raw = key.strip(), raw.strip()
+        if not key:
+            continue
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue                      # unparseable: leave it to the model's default
+        if isinstance(value, list):
+            value = next((v for v in value if v is not None), None)
+            if value is None:
+                continue                  # every option was the control cell
+        out[key] = value
+    return out
+
+
+def module_available(root: str) -> bool:
+    """Whether `root` can actually be imported in the interpreter that will run
+    the solution.
+
+    find_spec, not import: it resolves the module without executing it, so
+    probing a heavy framework costs nothing and cannot run its side effects.
+    Any failure is treated as unavailable -- a module whose parent package
+    explodes on lookup is not one a generated solution should depend on.
+    """
+    if root in VENDORED_IMPORTS:
+        return True
+    try:
+        return importlib.util.find_spec(root) is not None
+    except (ImportError, AttributeError, ValueError, ModuleNotFoundError):
+        return False
+
+
+def available_third_party() -> list[str]:
+    """Installed, non-stdlib libraries a solution may use, for the prompt.
+
+    Naming what IS available matters as much as rejecting what is not: without
+    it the model has to guess, and guesses cost a whole generate/check cycle.
+    """
+    candidates = (
+        "numpy", "scipy", "pandas", "sklearn", "torch", "jax", "tensorflow",
+        "lightgbm", "xgboost", "numba",
+    )
+    return [name for name in candidates if module_available(name)]
+
+
+# Below this, within-user ranking is anti-correlated with the label. 0.5 is the
+# score of random ordering, so this is a correctness threshold, not a quality
+# one -- see the sub-random check in _smoke().
+SUB_RANDOM_GAUC = 0.5
 
 FORBIDDEN_RESULT_KEYS = ("test_primary", "test_gauc", "test_ndcg5", "test_metrics", "hidden_test")
 
@@ -172,13 +430,21 @@ def static_check(source: str) -> list[str]:
         return [f"train.py does not parse: line {e.lineno}: {e.msg}"]
 
     for root in sorted(_imported_roots(tree)):
-        if root in KNOWN_UNAVAILABLE:
-            problems.append(f"imports {root!r}: {KNOWN_UNAVAILABLE[root]}")
-        elif root not in ALLOWED_IMPORTS:
+        if root in FORBIDDEN_IMPORTS:
+            problems.append(f"imports {root!r}: {FORBIDDEN_IMPORTS[root]}")
+        elif not module_available(root):
+            # Caught here rather than at runtime on purpose: an ImportError
+            # inside the executor costs a full multi-seed training run and
+            # surfaces as a CRASH traceback, where this costs nothing and says
+            # what to do instead.
             problems.append(
-                f"imports {root!r}, which is not available. Allowed: numpy, the stdlib, "
-                f"and the vendored `evaluate`/`data` modules."
+                f"imports {root!r}, which is not installed in this environment. "
+                f"External libraries are permitted, but only once provisioned. "
+                f"Installed and available: {', '.join(available_third_party())}, "
+                f"plus the stdlib and the vendored `evaluate`/`data` modules."
             )
+
+    problems.extend(check_split_hygiene(tree))
 
     for flag in ("--config", "--seed", "--out"):
         if flag not in source:
@@ -239,6 +505,8 @@ class LLMCodingAgent:
     smoke_timeout_s: float = 600.0
 
     base_config: dict[str, Any] = field(default_factory=dict)
+    # Populated per implement() call from the proposal's HYPERPARAMETERS block.
+    _proposal_hyperparameters: dict[str, Any] = field(default_factory=dict, init=False)
 
     # ACCUMULATION: where to look up "the current best solution" so a new idea
     # builds on what has been accepted rather than always on the static
@@ -274,12 +542,17 @@ class LLMCodingAgent:
         is known-bad still gets handed over, the executor fails it honestly,
         and tier-1 retry/abandonment does its job.
         """
+        # The proposal declares what is being tested; without this it reached the
+        # model as prose and never reached the config the executor runs.
+        self._proposal_hyperparameters = hyperparameters_from_handoff(idea.hypothesis)
         t0 = time.time()
         sol_dir = self._next_solution_dir()
         self._scaffold(sol_dir)
 
         baseline, provenance = self._current_best_source()
-        system = prompts.SYSTEM_PROMPT
+        # Rendered per call against what is actually importable, so the model is
+        # told the real environment rather than a constant that can drift from it.
+        system = prompts.system_prompt(available_third_party())
         calls: list[LLMResponse] = []
         history: list[AttemptOutcome] = []
         source: Optional[str] = None
@@ -584,17 +857,57 @@ class LLMCodingAgent:
                 source=source,
             )
 
+        # SUB-RANDOM RANKING CHECK
+        # ------------------------
+        # Everything above proves the numbers are arithmetically consistent with
+        # the predictions. None of it proves the model learned the right
+        # DIRECTION. A GAUC below 0.5 means within-user ranking is
+        # anti-correlated with the label -- worse than shuffling the scores --
+        # which no correctly-implemented ranker produces by being weak. It is
+        # near-proof of an inverted comparison: a flipped gradient sign, a
+        # swapped positive/negative pair, or scrambled ids.
+        #
+        # This is deliberately NOT a quality gate. It does not compare against
+        # the incumbent and will not reject a legitimately worse idea -- a
+        # genuinely bad model scores near 0.5, not below it. It only catches
+        # backwards ones, and it catches them here rather than after a full
+        # multi-seed run has been spent recording the result as evidence that
+        # the research direction failed.
+        gauc = claimed.get("gauc")
+        if isinstance(gauc, (int, float)) and not isinstance(gauc, bool) and gauc < SUB_RANDOM_GAUC:
+            return AttemptOutcome(
+                False, "smoke",
+                f"validation GAUC is {gauc:.4f}, below {SUB_RANDOM_GAUC} -- within-user ranking is "
+                f"ANTI-correlated with the label, i.e. the model orders positives BELOW negatives. "
+                f"A weak model scores near 0.5; scoring under it means something is inverted, not "
+                f"undertrained. Check the direction of your update before anything else: for a "
+                f"pairwise loss L = -log(sigmoid(s)) with s = score_pos - score_neg, dL/ds is "
+                f"-sigmoid(-s) (NEGATIVE), so a gradient-descent step must RAISE the positive "
+                f"item's score and LOWER the negative's. Also verify the pair really is "
+                f"(positive, negative) in that order and that predictions line up with their "
+                f"user ids.",
+                source=source,
+            )
+
         return AttemptOutcome(
             True, "done",
-            f"smoke run passed: primary={claimed['primary']:.4f} on a "
+            f"smoke run passed: primary={claimed['primary']:.4f} gauc={gauc:.4f} on a "
             f"{self.smoke_max_train_rows}-row subsample, metrics verified",
             source=source,
         )
 
     def _config_dict(self) -> dict[str, Any]:
+        """data_dir, then the proposal's declared settings, then base_config.
+
+        Order matters. The proposal's hyperparameters are the experiment; an
+        explicit base_config override from the caller outranks them, because
+        that is the operator deliberately pinning something (loss, epochs) for
+        the whole run.
+        """
         cfg: dict[str, Any] = {}
         if self.data_dir:
             cfg["data_dir"] = str(self.data_dir)
+        cfg.update(self._proposal_hyperparameters)
         cfg.update(self.base_config)
         return cfg
 

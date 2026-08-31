@@ -18,11 +18,11 @@ Two of the rules are non-obvious enough to be worth their prose:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_TEMPLATE = """\
 You are the Coding agent in an automated ML research loop working on the \
 KuaiRand-Pure within-user ranking task. You are given one hypothesis and you \
 return one complete `train.py` that tests it.
@@ -34,19 +34,62 @@ TASK
   term that is constant within a user cannot change the score.
 
 ENVIRONMENT (hard constraints -- violating these fails the run)
-  - Python 3.9+ with numpy. NOTHING ELSE. No torch, pandas, sklearn, scipy.
-  - No network access. No downloads. No subprocesses.
+  - Python 3.9+. External open-source libraries and frameworks are PERMITTED
+    when a hypothesis justifies one -- you are not restricted to numpy.
+  - You may import ONLY what is already installed: {available_libraries}.
+    Anything else is rejected before your code ever runs. You cannot install a
+    package, so do not import one that is missing however well it would fit --
+    write the numerics yourself instead, as the baseline does.
+  - No network access. No downloads. No subprocesses. These are sandbox rules
+    and hold regardless of what is installed.
   - Single CPU core. Your run is killed at the executor's timeout, so keep a
-    full training run to a few minutes.
+    full training run to a few minutes. A framework that thread-pools by
+    default must be pinned to one thread -- e.g. `torch.set_num_threads(1)` --
+    or it silently spends more CPU than the budget allows and its timings are
+    not comparable with the baseline's.
   - `evaluate.py` and `data.py` are already sitting next to your train.py.
     Import them as top-level modules: `from evaluate import evaluate` and
     `from data import load, encode, FIELDS`.
+
+    `load()` gives 7 fields per row: date, user_id, video_id, author_id, tab,
+    duration_ms, long_view. If your hypothesis needs more, `dataset.py` is
+    there too:
+
+        from dataset import load_full
+        splits = load_full(data_dir, columns=('play_time_ms', 'is_click'))
+        splits['train'][0].play_time_ms
+
+    Available columns: hourmin, time_ms, is_click, is_like, is_follow,
+    is_comment, is_forward, is_hate, play_time_ms, profile_stay_time,
+    comment_stay_time, is_profile_enter, is_rand. Rows stay tuples, so x[5] is
+    still duration_ms, x[6] is still the label, and `encode()` accepts them
+    unchanged. Request ONLY the columns you use -- each one costs memory and
+    parse time across 1.14M training rows.
+
+    Always go through `load`/`load_full`. Do not read the CSVs yourself: SPLITS
+    in data.py is the one definition of which dates are train/valid/test, and a
+    solution that re-derives it can quietly train on validation rows, win on
+    validation, and collapse on the held-out split. `load_full` reuses that
+    same SPLITS, so the two can never disagree.
 
 INVOCATION CONTRACT (exact -- the executor drives this)
   python train.py --config <path> --seed <int> --out <path/to/result.json>
 
   `--config` is a YAML or JSON file of flat key/value pairs. Read every
   hyperparameter from it with a sensible default; never hardcode a path.
+
+  THE HYPOTHESIS MUST BE ON BY DEFAULT. The keys named in the hypothesis's
+  HYPERPARAMETERS block are supplied in the config, but your defaults must
+  ALSO enable the mechanism, so that running your train.py with no config at
+  all still tests the idea. Defaulting the mechanism off (lambda=0,
+  use_x=False, window=None) and relying on the config to switch it on means a
+  missing key silently measures the unchanged baseline and reports it as the
+  idea having failed. If the hypothesis names a control setting, that is a
+  comparison for the ablation -- never the default.
+
+  If the data you need is not available, FAIL LOUDLY: raise with a clear
+  message. Do not silently skip the mechanism and score the baseline. A run
+  that cannot test the idea must not look like a run where the idea lost.
   Resolve the data directory as: config `data_dir`, else the KUAIRAND_PATH
   environment variable, else "./KuaiRand-Pure/data".
 
@@ -98,6 +141,22 @@ def _read(path: Path, limit: int = 24_000) -> str:
     if len(text) > limit:
         text = text[:limit] + "\n# ... (truncated)\n"
     return text
+
+
+
+def system_prompt(available_libraries: Sequence[str]) -> str:
+    """SYSTEM_PROMPT rendered against the libraries actually installed.
+
+    Built by substitution rather than str.format: the template contains literal
+    JSON braces (`{"primary": float, ...}`) that format() would try to read as
+    fields and reject.
+
+    The available list is passed in rather than probed here so this module stays
+    free of import-policy logic -- agent.py owns that, and agent.py imports this
+    module, so reaching back the other way would be a cycle.
+    """
+    listed = ", ".join(available_libraries) if available_libraries else "the stdlib only"
+    return SYSTEM_PROMPT_TEMPLATE.replace("{available_libraries}", listed)
 
 
 def build_generate_prompt(
@@ -153,9 +212,10 @@ def build_repair_prompt(
         "Diagnose the failure above and return the COMPLETE corrected `train.py` "
         "in one ```python block -- not a patch, not a diff, not just the changed "
         "function. Keep everything that was already working. Re-read the output "
-        "and environment rules in the system prompt before answering: a mismatch "
-        "between result.json and val_predictions.npz, an import outside numpy, or "
-        "a test-split number in result.json will each fail the run again."
+            "and environment rules in the system prompt before answering: a mismatch "
+        "between result.json and val_predictions.npz, an import of a library that "
+        "is not installed, or a test-split number in result.json will each fail "
+        "the run again."
     )
 
 

@@ -24,9 +24,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent
+from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent, ResearchExhausted
 from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
 # _parse_ts is imported rather than re-implemented on purpose: summary.json's
 # wall_s and convergence.should_stop's wall-clock budget must be the SAME
@@ -88,6 +88,10 @@ class Orchestrator:
     registry: CheckpointRegistry
     state_store: StateStore
     cfg: Config = DEFAULT_CONFIG
+    # Cross-run Do/Don't ledger (agent/research/findings.py). Optional: None
+    # means "don't record findings", which is what every existing caller and
+    # test gets. run_loop.py supplies the real one.
+    findings: Optional[Any] = None
 
     def __post_init__(self) -> None:
         self.state: OrchestratorState = self.state_store.load()
@@ -119,11 +123,18 @@ class Orchestrator:
         while True:
             if self.state.halted:
                 raise OrchestratorHalted(self.state.halt_reason)
+            # Checked before should_stop as well as after _step, so a resumed
+            # run whose backlog was already exhausted stops immediately rather
+            # than calling propose() again just to be told the same thing.
+            if self.state.research_exhausted:
+                break
             history = self.run_log.read_all()
             stop, reason = should_stop(history, self.cfg.convergence)
             if stop:
                 break
             self._step(history)
+            if self.state.research_exhausted:
+                break
         return self.run_log.read_all()
 
     def bootstrap_baseline(self, idea: Idea, diff: Diff) -> RunRecord:
@@ -315,6 +326,12 @@ class Orchestrator:
             # contract, and _step() had nothing guarding the call.
             try:
                 idea = self.research.propose(history)
+            except ResearchExhausted as e:
+                # Ordered BEFORE the broad except: an agent that has finished
+                # has not failed, and must not be retried or escalated. See
+                # _handle_research_exhausted.
+                self._handle_research_exhausted(e)
+                return
             except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring below
                 self._handle_research_failure(e, history)
                 return
@@ -345,6 +362,25 @@ class Orchestrator:
             self._handle_successful_run(iteration, idea, diff, seeds, agg, history)
 
         self.state.iteration = iteration
+        self._save_state()
+        self._write_summary()
+
+    def _handle_research_exhausted(self, error: Exception) -> None:
+        """Research reported it has nothing left to propose. End the run cleanly.
+
+        Deliberately NOT _handle_research_failure: that path records a failed
+        iteration, counts toward consecutive_research_failures and escalates to
+        a human once enough pile up. Applied to an orderly finish it would log
+        records describing no real experiment, then report a run that completed
+        its whole backlog as a breakdown needing intervention.
+
+        No RunRecord is written for the same reason: runs.jsonl records
+        iterations, and this is the absence of one. The reason is kept in
+        orchestrator state and lands in summary.json, so why the run stopped is
+        still on disk and still auditable.
+        """
+        self.state.research_exhausted = True
+        self.state.research_exhausted_reason = f"{type(error).__name__}: {error}"[:2000]
         self._save_state()
         self._write_summary()
 
@@ -517,6 +553,7 @@ class Orchestrator:
         # attempt-cap exhaustion. FakeEvaluatorAgent never exercised this path
         # (it never returns ABANDON), which is why it went unnoticed until a
         # real Evaluator that can made it observable.
+        self._record_finding(record)
         self._close_idea(abandoned=(verdict.decision == Decision.ABANDON))
 
     def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
@@ -590,6 +627,36 @@ class Orchestrator:
             detail=f"tokens_in={u.tokens_in} tokens_out={u.tokens_out} cost_usd={u.cost_usd:.6f}",
             agent_action="coding",
         )]
+
+    def _record_finding(self, record: RunRecord) -> None:
+        """Log this Evaluator-judged outcome to the cross-run Do/Don't ledger.
+
+        Only judged outcomes reach here -- _handle_failed_run's technical
+        abandons deliberately do not. A crash means the Coding Agent could not
+        build the idea, which is no evidence about the idea itself.
+
+        Deterministic and LLM-free: every field is copied out of the RunRecord
+        and the Evaluator's own commentary Event. Never fatal -- the record is
+        already durably appended, so a ledger problem must not take down a run.
+        """
+        if self.findings is None:
+            return
+        try:
+            from agent.research.agent import _historical_hypothesis, _historical_hypothesis_id
+            from agent.research.findings import build_finding
+
+            direction = _historical_hypothesis_id(record)
+            if direction is None:
+                # No proposal id -- the seeded baseline, or a hand-supplied
+                # hypothesis. Nothing stable to deduplicate a direction on.
+                return
+            self.findings.record(
+                build_finding(record, direction=direction,
+                              title=_historical_hypothesis(record))
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[orchestrator] could not record research finding: "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     def _register_checkpoint(self, iteration: int, diff: Diff, seeds: list[SeedMetrics], agg) -> None:
         """Register the accepted iteration's checkpoint.
@@ -705,6 +772,10 @@ class Orchestrator:
             "best_iteration": best.iteration if best else None,
             "best_val_primary": best.val_primary if best else None,
             "usage": usage,
+            # None while the run is live. Set when Research reported it had
+            # nothing left to propose, so an orderly finish is distinguishable
+            # on disk from a run that was killed or that hit convergence.
+            "stopped_because": self.state.research_exhausted_reason,
         }
 
         path = self.cfg.paths.logs_dir / "summary.json"

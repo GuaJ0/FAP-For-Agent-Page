@@ -31,7 +31,30 @@ SCIENTIFIC RULES
     hard-code iteration 0 as the comparison unless iteration 0 is actually the
     supplied parent.
   - Do not repeat a measured dead end unless the proposal states the material
-    mechanism change that makes the new experiment different.
+    mechanism change that makes the new experiment different. `prior_findings`
+    in the context lists directions this pipeline has already measured across
+    earlier runs: entries with verdict "dont" are those measured dead ends,
+    each with the observed delta and the Evaluator's reason. Treat them as
+    binding even when this run's own iteration history is empty.
+  - Weigh a "dont" by its `confidence` field, which says how much of the
+    direction was actually measured. "well_tested" means three or more real
+    attempts across the stated `coverage` range all failed: treat it as
+    closed. "tested" means two. "inconclusive" means a SINGLE attempt lost,
+    which rules out that one implementation, not the mechanism -- such a
+    direction may be reproposed, but the proposal must say what it is doing
+    differently from the variant named in `variants`. `attempts` and `deltas`
+    show how many measurements stand behind the entry and how they spread.
+  - Weigh a "do" by its `effect` field, which says how much the metric actually
+    moved -- a different question from how often it was measured.
+    "substantive" cleared the meaningful-improvement bar. "marginal" is a real
+    but small effect. "within_noise" means the best attempt could not be told
+    apart from no change at all: that direction has NOT been shown to work,
+    only shown not to fail, so building on it needs a reason beyond the entry
+    itself. An entry can be `do` + `well_tested` + `within_noise` at once --
+    measured repeatedly, and repeatedly measured as nothing.
+  - `prior_findings` entries with verdict "do" are directions that previously
+    beat their incumbent. Prefer building on one of those over an untested
+    direction, unless the context shows it has since been superseded.
   - Change one attributable mechanism at a time and state what remains fixed.
   - Cite only citation_id/claim_id pairs in the supplied evidence packet.
 
