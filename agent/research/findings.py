@@ -264,6 +264,21 @@ def _hyperparameters_section(hypothesis: str) -> str:
     return _truncate("; ".join(items), _HYPERPARAM_LIMIT)
 
 
+# A GAUC below this is anti-correlated with the label -- worse than random
+# ordering. Kept in sync with agent/coding/agent.py's SUB_RANDOM_GAUC, and
+# duplicated rather than imported: findings.py is imported by the Research
+# agent, which has no business importing the Coding agent.
+SUB_RANDOM_GAUC = 0.5
+
+
+def _is_sub_random(record: RunRecord) -> bool:
+    """Whether this result ranks worse than chance within users."""
+    agg = record.aggregate
+    if agg is None or agg.gauc_mean is None:
+        return False
+    return agg.gauc_mean < SUB_RANDOM_GAUC
+
+
 def build_finding(
     record: RunRecord,
     *,
@@ -280,6 +295,24 @@ def build_finding(
     Research away from directions nobody has actually tested.
     """
     if record.decision is None:
+        return None
+
+    # A sub-random result is not evidence about the research direction.
+    # Within-user GAUC below 0.5 means the model ordered positives BELOW
+    # negatives, which a weak-but-correct implementation does not do -- it is
+    # an inverted comparison (flipped gradient sign, swapped pair, scrambled
+    # ids). Recording it as a "don't" would attribute a one-character bug to
+    # the mechanism and steer every future run away from a direction nobody
+    # actually tested.
+    #
+    # This really happened: an inverted BPR gradient scored 0.3937 primary /
+    # 0.3704 GAUC against a 0.6016 incumbent, and adding the missing minus sign
+    # to dL/ds took the same code to 0.5864 / 0.6457. Without this guard the
+    # ledger would have closed the ranking-loss direction -- the one the task
+    # notes rank as most likely to pay off -- on that result.
+    #
+    # Returning None rather than a "do": nothing was measured either way.
+    if _is_sub_random(record):
         return None
 
     verdict = VERDICT_DO if record.decision == Decision.ACCEPT else VERDICT_DONT

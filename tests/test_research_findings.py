@@ -411,3 +411,60 @@ def test_every_declared_family_member_resolves_back_to_its_family():
     for family, members in DIRECTION_FAMILIES.items():
         for member in members:
             assert resolve_family(f"OFFLINE-{member}") == family
+
+
+# ---------------------------------------------------------------------------
+# A sub-random result is a broken implementation, not a measured direction.
+#
+# From the real smoke run: an inverted BPR gradient (`g = sigmoid(-s)` where
+# dL/ds is -sigmoid(-s)) scored 0.3937 primary / 0.3704 GAUC against a 0.6016
+# incumbent. Adding the missing minus sign took the same code to 0.5864 /
+# 0.6457. Without this guard the ledger closes the ranking-loss direction -- the
+# highest-expected-value one in solution/ideas.md -- on a one-character bug.
+# ---------------------------------------------------------------------------
+
+from agent.research.findings import SUB_RANDOM_GAUC  # noqa: E402
+
+
+def _record_with_gauc(gauc, primary=0.3937, decision=Decision.REVERT, hid="RP-BPR"):
+    record = _record(hid=hid, decision=decision, primary=primary, delta=primary - 0.6016)
+    record.aggregate = AggregateMetrics(primary, 0.0019, gauc, 0.4170, 2)
+    return record
+
+
+def test_a_sub_random_result_is_not_recorded_as_a_dont():
+    """GAUC 0.3704 means positives were ordered BELOW negatives. That is an
+    inverted comparison, not evidence that pairwise ranking objectives fail."""
+    assert build_finding(_record_with_gauc(0.3704), direction="RP-BPR", title="BPR") is None
+
+
+def test_a_sub_random_result_is_not_recorded_as_a_do_either():
+    """Nothing was measured in either direction -- an accepted sub-random result
+    would be even more misleading than a rejected one."""
+    record = _record_with_gauc(0.42, decision=Decision.ACCEPT)
+    assert build_finding(record, direction="RP-BPR", title="BPR") is None
+
+
+def test_a_merely_weak_result_is_still_recorded():
+    """The guard must not become a quality gate. A genuinely bad model scores
+    near 0.5, not below it, and that IS a real measurement worth keeping."""
+    finding = build_finding(_record_with_gauc(0.55, primary=0.52),
+                            direction="RP-WEAK", title="a weak idea")
+
+    assert finding is not None
+    assert finding.verdict == VERDICT_DONT
+
+
+def test_the_threshold_is_exactly_random_ordering():
+    """0.5 is the score of shuffling. At or above it, the result is weak; below
+    it, the ranking is anti-correlated and something is inverted."""
+    assert SUB_RANDOM_GAUC == 0.5
+    assert build_finding(_record_with_gauc(0.5), direction="D", title="t") is not None
+    assert build_finding(_record_with_gauc(0.4999), direction="D", title="t") is None
+
+
+def test_a_record_with_no_aggregate_is_unaffected_by_the_guard():
+    """A crashed run has no GAUC to judge, and was already excluded for having
+    no Evaluator decision."""
+    record = _record(decision=None, primary=None)
+    assert build_finding(record, direction="D", title="t") is None

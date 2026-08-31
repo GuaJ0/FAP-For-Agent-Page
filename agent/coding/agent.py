@@ -135,6 +135,11 @@ def available_third_party() -> list[str]:
     return [name for name in candidates if module_available(name)]
 
 
+# Below this, within-user ranking is anti-correlated with the label. 0.5 is the
+# score of random ordering, so this is a correctness threshold, not a quality
+# one -- see the sub-random check in _smoke().
+SUB_RANDOM_GAUC = 0.5
+
 FORBIDDEN_RESULT_KEYS = ("test_primary", "test_gauc", "test_ndcg5", "test_metrics", "hidden_test")
 
 
@@ -635,9 +640,41 @@ class LLMCodingAgent:
                 source=source,
             )
 
+        # SUB-RANDOM RANKING CHECK
+        # ------------------------
+        # Everything above proves the numbers are arithmetically consistent with
+        # the predictions. None of it proves the model learned the right
+        # DIRECTION. A GAUC below 0.5 means within-user ranking is
+        # anti-correlated with the label -- worse than shuffling the scores --
+        # which no correctly-implemented ranker produces by being weak. It is
+        # near-proof of an inverted comparison: a flipped gradient sign, a
+        # swapped positive/negative pair, or scrambled ids.
+        #
+        # This is deliberately NOT a quality gate. It does not compare against
+        # the incumbent and will not reject a legitimately worse idea -- a
+        # genuinely bad model scores near 0.5, not below it. It only catches
+        # backwards ones, and it catches them here rather than after a full
+        # multi-seed run has been spent recording the result as evidence that
+        # the research direction failed.
+        gauc = claimed.get("gauc")
+        if isinstance(gauc, (int, float)) and not isinstance(gauc, bool) and gauc < SUB_RANDOM_GAUC:
+            return AttemptOutcome(
+                False, "smoke",
+                f"validation GAUC is {gauc:.4f}, below {SUB_RANDOM_GAUC} -- within-user ranking is "
+                f"ANTI-correlated with the label, i.e. the model orders positives BELOW negatives. "
+                f"A weak model scores near 0.5; scoring under it means something is inverted, not "
+                f"undertrained. Check the direction of your update before anything else: for a "
+                f"pairwise loss L = -log(sigmoid(s)) with s = score_pos - score_neg, dL/ds is "
+                f"-sigmoid(-s) (NEGATIVE), so a gradient-descent step must RAISE the positive "
+                f"item's score and LOWER the negative's. Also verify the pair really is "
+                f"(positive, negative) in that order and that predictions line up with their "
+                f"user ids.",
+                source=source,
+            )
+
         return AttemptOutcome(
             True, "done",
-            f"smoke run passed: primary={claimed['primary']:.4f} on a "
+            f"smoke run passed: primary={claimed['primary']:.4f} gauc={gauc:.4f} on a "
             f"{self.smoke_max_train_rows}-row subsample, metrics verified",
             source=source,
         )

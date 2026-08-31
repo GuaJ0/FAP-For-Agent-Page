@@ -817,3 +817,36 @@ def test_last_shipped_source_is_the_highest_numbered_not_the_lexical_last(tmp_pa
 
     # Lexically "attempt_1000" < "attempt_999", so a sorted() would pick 999.
     assert agent._last_shipped_source().startswith("# NEWEST")
+
+
+def test_smoke_run_rejects_a_backwards_ranker_that_reports_itself_honestly(tmp_path):
+    """The gap this closes, seen for real: an inverted BPR gradient scored
+    0.3704 GAUC against a 0.6016 incumbent, and metric verification passed it --
+    verification only proves the numbers match the predictions, never that the
+    predictions point the right way.
+
+    The fixture reports its own (bad) metrics truthfully, so nothing else in the
+    smoke path can catch this. Missed here it costs a full multi-seed run and,
+    worse, lands in the cross-run ledger as evidence the research direction
+    failed."""
+    agent = _smoke_agent(tmp_path, [_fenced(LIAR)], base_config={"mode": "invert"})
+
+    diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
+
+    manifest = json.loads((Path(diff.solution_dir) / "attempt.json").read_text())
+    assert manifest["succeeded"] is False
+    detail = manifest["cycles"][-1]["detail"]
+    assert "ANTI-correlated" in detail, detail
+    # and it must say what to actually check, or the repair is a guessing game
+    assert "dL/ds" in detail and "sigmoid" in detail, detail
+
+
+def test_smoke_run_still_ships_a_merely_weak_model(tmp_path):
+    """The guard is a correctness check, not a quality gate: an honest model
+    that simply is not very good must still be measured, not repaired away."""
+    agent = _smoke_agent(tmp_path, [_fenced(LIAR)], base_config={"mode": "honest"})
+
+    diff = agent.implement(Idea("use a pairwise BPR loss", None), None)
+
+    manifest = json.loads((Path(diff.solution_dir) / "attempt.json").read_text())
+    assert manifest["succeeded"] is True, manifest["cycles"]
