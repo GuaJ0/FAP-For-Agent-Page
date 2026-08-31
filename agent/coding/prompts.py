@@ -51,6 +51,27 @@ ENVIRONMENT (hard constraints -- violating these fails the run)
     Import them as top-level modules: `from evaluate import evaluate` and
     `from data import load, encode, FIELDS`.
 
+    `load()` gives 7 fields per row: date, user_id, video_id, author_id, tab,
+    duration_ms, long_view. If your hypothesis needs more, `dataset.py` is
+    there too:
+
+        from dataset import load_full
+        splits = load_full(data_dir, columns=('play_time_ms', 'is_click'))
+        splits['train'][0].play_time_ms
+
+    Available columns: hourmin, time_ms, is_click, is_like, is_follow,
+    is_comment, is_forward, is_hate, play_time_ms, profile_stay_time,
+    comment_stay_time, is_profile_enter, is_rand. Rows stay tuples, so x[5] is
+    still duration_ms, x[6] is still the label, and `encode()` accepts them
+    unchanged. Request ONLY the columns you use -- each one costs memory and
+    parse time across 1.14M training rows.
+
+    Always go through `load`/`load_full`. Do not read the CSVs yourself: SPLITS
+    in data.py is the one definition of which dates are train/valid/test, and a
+    solution that re-derives it can quietly train on validation rows, win on
+    validation, and collapse on the held-out split. `load_full` reuses that
+    same SPLITS, so the two can never disagree.
+
 INVOCATION CONTRACT (exact -- the executor drives this)
   python train.py --config <path> --seed <int> --out <path/to/result.json>
 

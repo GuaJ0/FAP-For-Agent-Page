@@ -63,7 +63,7 @@ from agent.verification import Status as VerifyStatus, verify_result
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VENDORED = REPO_ROOT / "harness"
-VENDORED_FILES = ("evaluate.py", "data.py")
+VENDORED_FILES = ("evaluate.py", "data.py", "dataset.py")
 
 CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
 
@@ -93,7 +93,7 @@ CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
 # Sit next to the generated train.py, so they are importable in the executor's
 # cwd=<solution_dir> subprocess but not from this process. Availability cannot
 # be measured for them; they are always legal.
-VENDORED_IMPORTS = frozenset({"evaluate", "data"})
+VENDORED_IMPORTS = frozenset({"evaluate", "data", "dataset"})
 
 # Sandbox rules. These stay refused no matter what is installed -- every one is
 # in the stdlib and would therefore pass an availability test.
