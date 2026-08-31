@@ -1,0 +1,1 @@
+{"k": 16, "lr": 0.001, "l2": 0.000001, "epochs": 40, "batch_size": 8192, "patience": 4, "dense_weight": 0.2, "sparse_weight": 0.05, "watchtime_weight": 0.1, "max_train_rows": null}
