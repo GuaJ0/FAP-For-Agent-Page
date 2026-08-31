@@ -7,9 +7,9 @@ from typing import Optional, Sequence
 from agent.research.breadth import (
     BreadthCandidate,
     BreadthRejection,
+    PRIMARY_FAMILIES_BY_STAGE,
     StackCoverageSummary,
     StackStage,
-    infer_mechanism_signature,
 )
 from agent.research.citations import CitationRecord
 from agent.research.context import ResearchContext
@@ -129,7 +129,13 @@ def proposal_shape(context: ResearchContext) -> dict:
         "implementation": {
             "target_components": ["component to change"],
             "steps": ["Specific implementation step"],
-            "hyperparameters": {"parameter": ["values to test"]},
+            "hyperparameters": {
+                "parameters": [{
+                    "name": "parameter name",
+                    "values": ["values to test"],
+                    "rationale": "Why this bounded range is appropriate.",
+                }]
+            },
             "must_hold_constant": ["unchanged component"],
             "feasibility": {
                 "dependencies": ["new dependency, or an empty array"],
@@ -162,6 +168,7 @@ def breadth_shape() -> dict:
             "candidate_id": "B-<unique-id>",
             "title": "Concise direction",
             "stack_stage": "one of: " + " | ".join(stage.value for stage in StackStage),
+            "primary_family": "one allowlisted family for the declared stack_stage",
             "primary_change": "The single intervention that defines this candidate.",
             "mechanism": "One or two sentences describing the single mechanism changed.",
             "metric_rationale": "Expected effect on GAUC and/or nDCG@5.",
@@ -210,6 +217,10 @@ def build_breadth_prompt(
         "stack_coverage": coverage.to_prompt_dict(),
     }
     shape = breadth_shape()
+    family_allowlist = {
+        stage.value: list(PRIMARY_FAMILIES_BY_STAGE[stage])
+        for stage in StackStage
+    }
     return (
         "## Compact validation-only research context\n"
         + json.dumps(compact_context, indent=2, sort_keys=True)
@@ -217,10 +228,13 @@ def build_breadth_prompt(
         + json.dumps(_citation_packet(citations), indent=2, sort_keys=True)
         + "\n\n## Required breadth JSON shape\n"
         + json.dumps(shape, indent=2, sort_keys=True)
+        + "\n\n## primary_family allowlist by stack_stage\n"
+        + json.dumps(family_allowlist, indent=2, sort_keys=True)
         + f"\n\nGenerate exactly {max_candidates} candidates in one response. "
-        "For each candidate, primary_change must name exactly one authoritative primary "
-        "intervention. The mechanism may include ancillary optimizer, regularizer, sampler, "
-        "or training details, but they must not replace or conflict with primary_change. "
+        "For each candidate, choose primary_family from the allowlist for its stack_stage; "
+        "that pair is the authoritative structural declaration. primary_change and mechanism "
+        "must describe that declaration without confidently contradicting it. The mechanism "
+        "may include ancillary optimizer, regularizer, sampler, or training details. "
         "Do not stuff unrelated feature, architecture, objective, optimization, or inference "
         "changes into its mechanism. Cover "
         "multiple stack stages where worthwhile, but do not include a weak idea solely "
@@ -239,9 +253,11 @@ def build_proposal_prompt(
         selected = (
             "\n\n## Selected breadth direction (binding)\n"
             + json.dumps(selected_candidate.to_prompt_dict(), indent=2, sort_keys=True)
-            + "\nDevelop this exact mechanism and stack stage into the full proposal. "
-            "State the primary intervention clearly in hypothesis and implementation steps; "
-            "keep ancillary optimizer and regularization details secondary. "
+            + "\nDevelop this exact canonical stack_stage and primary_family into the full proposal. "
+            "The validated breadth declaration is authoritative and will be injected into "
+            "the Coding handoff deterministically, so the generated fields do not need to "
+            "repeat or reclassify it. Keep ancillary optimizer and regularization details "
+            "secondary. "
             "Retain at least one listed citation/claim pair. Do not silently switch "
             "to another direction.\n"
         )
@@ -327,20 +343,21 @@ def build_repair_prompt(
         response = response[:response_limit] + "\n... (response truncated)"
     selected_guidance = ""
     if selected_candidate is not None:
-        signature = infer_mechanism_signature(selected_candidate.primary_change)
         selected_guidance = (
             "\n\n## Binding selected mechanism for repair\n"
             + json.dumps(selected_candidate.to_prompt_dict(), indent=2, sort_keys=True)
             + "\nPreserve stack_stage="
             + selected_candidate.stack_stage.value
             + ", primary mechanism family="
-            + str(signature.primary_family)
+            + selected_candidate.primary_family
             + ", and primary_change="
             + json.dumps(selected_candidate.primary_change)
-            + ". Reuse the selected primary_change wording verbatim or nearly verbatim in "
-            + "proposal.hypothesis and in at least the first intervention-bearing "
-            + "proposal.implementation.steps entry. Do not introduce a competing primary "
-            + "family in title, hypothesis, target_components, or any implementation step. "
+            + ". This canonical primary intervention is already fixed by validated breadth "
+            + "and will be injected into the Coding handoff deterministically. Do not choose "
+            + "another method. Remove or rewrite only text that makes another stack stage or "
+            + "family look like the proposed primary intervention. Retained incumbent methods "
+            + "may be described explicitly as fixed context. Do not introduce a competing "
+            + "primary family in title, hypothesis, target_components, or any implementation step. "
             + "Ancillary optimizer or regularizer details may remain secondary.\n"
         )
     return (

@@ -98,6 +98,11 @@ _PRIMARY_FAMILY_PHRASES: dict[StackStage, dict[str, tuple[tuple[str, ...], ...]]
     },
 }
 
+PRIMARY_FAMILIES_BY_STAGE: dict[StackStage, tuple[str, ...]] = {
+    stage: tuple(families)
+    for stage, families in _PRIMARY_FAMILY_PHRASES.items()
+}
+
 _SECONDARY_TAG_PHRASES: dict[str, tuple[tuple[str, ...], ...]] = {
     "hard_negative_sampling": (("hard", "negative", "sampling"), ("hard", "negatives")),
     "within_user_sampling": (("within", "user", "sampling"), ("same", "user", "pairs")),
@@ -243,6 +248,7 @@ class BreadthCandidate:
     candidate_id: str
     title: str
     stack_stage: StackStage
+    primary_family: str
     primary_change: str
     mechanism: str
     metric_rationale: str
@@ -255,8 +261,9 @@ class BreadthCandidate:
     def from_dict(cls, value: Any, path: str) -> "BreadthCandidate":
         data = _mapping(value, path)
         _exact_keys(data, {
-            "candidate_id", "title", "stack_stage", "primary_change", "mechanism", "metric_rationale",
-            "expected_upside", "implementation_risk", "experiment_cost", "evidence",
+            "candidate_id", "title", "stack_stage", "primary_family", "primary_change",
+            "mechanism", "metric_rationale", "expected_upside", "implementation_risk",
+            "experiment_cost", "evidence",
         }, path)
         candidate_id = _text(
             data["candidate_id"],
@@ -273,6 +280,17 @@ class BreadthCandidate:
             raise BreadthValidationError(
                 f"{path}.stack_stage must be one of {[stage.value for stage in STACK_STAGES]}"
             ) from exc
+        primary_family = _text(
+            data["primary_family"],
+            f"{path}.primary_family",
+            max_chars=64,
+        )
+        allowed_families = PRIMARY_FAMILIES_BY_STAGE[stack_stage]
+        if primary_family not in allowed_families:
+            raise BreadthValidationError(
+                f"{path}.primary_family must be one of {list(allowed_families)} "
+                f"for stack_stage={stack_stage.value}"
+            )
         evidence_raw = data["evidence"]
         if not isinstance(evidence_raw, Sequence) or isinstance(evidence_raw, (str, bytes)):
             raise BreadthValidationError(f"{path}.evidence must be an array")
@@ -295,6 +313,7 @@ class BreadthCandidate:
             candidate_id=candidate_id,
             title=_text(data["title"], f"{path}.title", max_chars=MAX_TITLE_CHARS),
             stack_stage=stack_stage,
+            primary_family=primary_family,
             primary_change=_text(
                 data["primary_change"],
                 f"{path}.primary_change",
@@ -575,7 +594,11 @@ def _method_relevant_text(text: str) -> str:
     if "[RESEARCH_PROPOSAL" not in text:
         return text
     title = re.search(r"(?m)^TITLE:\s*([^\r\n]+?)\s*$", text)
-    sections = [title.group(1) if title else ""]
+    primary_change = re.search(r"(?m)^PRIMARY CHANGE:\s*([^\r\n]+?)\s*$", text)
+    sections = [
+        title.group(1) if title else "",
+        primary_change.group(1) if primary_change else "",
+    ]
     sections.extend(
         section
         for heading in (
@@ -622,6 +645,27 @@ def historical_mechanism_signature(record: RunRecord) -> MechanismSignature:
     """Infer history from intervention-bearing fields, not handoff boilerplate."""
     text = record.hypothesis
     if text.lstrip().startswith("[RESEARCH_PROPOSAL"):
+        stage_match = re.search(r"(?m)^STACK STAGE:\s*([^\r\n]+?)\s*$", text)
+        family_match = re.search(r"(?m)^PRIMARY FAMILY:\s*([^\r\n]+?)\s*$", text)
+        if stage_match and family_match:
+            try:
+                declared_stage = StackStage(stage_match.group(1).strip())
+            except ValueError:
+                declared_stage = None
+            declared_family = family_match.group(1).strip()
+            if (
+                declared_stage is not None
+                and declared_family in PRIMARY_FAMILIES_BY_STAGE[declared_stage]
+            ):
+                inferred = infer_mechanism_signature(_method_relevant_text(text))
+                return MechanismSignature(
+                    declared_stage,
+                    declared_family,
+                    inferred.primary_tags,
+                    inferred.secondary_tags,
+                    "confident",
+                    False,
+                )
         hypothesis = _section(text, "HYPOTHESIS")
         title = re.search(r"(?m)^TITLE:\s*([^\r\n]+?)\s*$", text)
         implementation = "\n".join(filter(None, (
@@ -1154,12 +1198,47 @@ def _candidate_safety_error(candidate: BreadthCandidate) -> Optional[str]:
 
 
 def _candidate_signature(candidate: BreadthCandidate) -> MechanismSignature:
-    # ``primary_change`` is the authoritative intervention.  The verbose body
-    # can enrich secondary tags but cannot vote for a different primary family.
-    return infer_mechanism_signature(
+    """Return the candidate's canonical declaration plus text-derived tags."""
+    inferred = infer_mechanism_signature(
         candidate.primary_change,
         secondary_text=f"{candidate.title}\n{candidate.mechanism}",
     )
+    return MechanismSignature(
+        stack_stage=candidate.stack_stage,
+        primary_family=candidate.primary_family,
+        primary_tags=inferred.primary_tags,
+        secondary_tags=inferred.secondary_tags,
+        confidence="confident",
+        ambiguous=False,
+    )
+
+
+def _declared_family_conflict(candidate: BreadthCandidate, text: str) -> bool:
+    """Reject only deterministic text contradictions to a canonical family.
+
+    Unknown prose is allowed. Optimization details remain ancillary to a clear
+    feature/model/objective/inference declaration, while any competing core
+    stage or same-stage family fails closed.
+    """
+    matches = _matched_primary_families(text)
+    for stage, families in matches.items():
+        if (
+            stage == StackStage.OPTIMIZATION_REGULARIZATION
+            and candidate.stack_stage != StackStage.OPTIMIZATION_REGULARIZATION
+        ):
+            continue
+        if stage != candidate.stack_stage:
+            return True
+        if any(
+            not _compatible_primary_families(
+                candidate.stack_stage,
+                family,
+                candidate.primary_family,
+            )
+            for family in families
+        ):
+            return True
+    return False
 
 
 def _candidate_relevant_source_ids(
@@ -1322,44 +1401,20 @@ def filter_breadth_candidates(
             rejected.append(BreadthRejection(candidate.candidate_id, "invalid citation evidence"))
             continue
         primary_signature = _candidate_signature(candidate)
-        described_signature = infer_mechanism_signature(candidate.mechanism)
-        if primary_signature.confidence != "confident":
+        if _declared_family_conflict(candidate, candidate.primary_change):
             rejected.append(BreadthRejection(
                 candidate.candidate_id,
-                "primary_change does not identify one unambiguous mechanism",
+                "primary_change confidently conflicts with declared "
+                f"stack_stage={candidate.stack_stage.value}, "
+                f"primary_family={candidate.primary_family}",
             ))
             continue
-        if primary_signature.stack_stage != candidate.stack_stage:
+        if _declared_family_conflict(candidate, candidate.mechanism):
             rejected.append(BreadthRejection(
                 candidate.candidate_id,
-                "declared stack_stage conflicts with primary_change: declared "
-                f"{candidate.stack_stage.value}, inferred "
-                f"{primary_signature.stack_stage.value}",
-            ))
-            continue
-        described_families = _matched_primary_families(candidate.mechanism)
-        described_core_stages = {
-            stage for stage in described_families
-            if stage != StackStage.OPTIMIZATION_REGULARIZATION
-        }
-        foreign_core_stage = any(
-            stage != primary_signature.stack_stage for stage in described_core_stages
-        )
-        confident_conflict = (
-            described_signature.confidence == "confident"
-            and (
-                described_signature.stack_stage != primary_signature.stack_stage
-                or not _compatible_primary_families(
-                    primary_signature.stack_stage,
-                    described_signature.primary_family,
-                    primary_signature.primary_family,
-                )
-            )
-        )
-        if described_signature.ambiguous or foreign_core_stage or confident_conflict:
-            rejected.append(BreadthRejection(
-                candidate.candidate_id,
-                "mechanism conflicts with the declared primary_change",
+                "mechanism confidently conflicts with declared "
+                f"stack_stage={candidate.stack_stage.value}, "
+                f"primary_family={candidate.primary_family}",
             ))
             continue
         if any(
@@ -1536,102 +1591,91 @@ def _alignment_tokens(text: str) -> set[str]:
     }
 
 
-def _depth_mechanism_signature(proposal: ResearchProposal) -> tuple[MechanismSignature, str]:
-    """Fail closed while combining independently inferred change fields.
-
-    Title, hypothesis, target components, and individual implementation steps
-    can each state the intervention.  Controls, evidence, risks,
-    hyperparameters, feasibility, and evaluation prose are excluded.  An
-    ambiguous field or a confident core-family conflict invalidates the whole
-    depth signature; repetition and ancillary tags cannot outvote it.
-    """
-    fields = (
+def _depth_intervention_fields(proposal: ResearchProposal) -> tuple[str, ...]:
+    """Return only fields that can declare the implemented intervention."""
+    return (
         proposal.title,
         proposal.hypothesis,
         *proposal.implementation.target_components,
         *proposal.implementation.steps,
     )
-    signatures = tuple(infer_mechanism_signature(field) for field in fields)
-    secondary_tags = tuple(sorted({
-        tag for signature in signatures for tag in signature.secondary_tags
-    }))
-    if any(signature.ambiguous for signature in signatures):
-        return MechanismSignature(
-            None, None, (), secondary_tags, "ambiguous", True
-        ), "\n".join(fields)
 
-    confident = [
-        signature for signature in signatures
-        if signature.confidence == "confident"
-    ]
-    core = [
-        signature for signature in confident
-        if signature.stack_stage != StackStage.OPTIMIZATION_REGULARIZATION
-    ]
-    candidates = core or confident
-    if not candidates:
-        return MechanismSignature(
-            None, None, (), secondary_tags, "unknown", False
-        ), "\n".join(fields)
 
-    chosen = candidates[0]
-    for signature in candidates[1:]:
-        if (
-            signature.stack_stage != chosen.stack_stage
-            or not _compatible_primary_families(
-                chosen.stack_stage,
-                signature.primary_family,
-                chosen.primary_family,
-            )
-        ):
-            return MechanismSignature(
-                None, None, (), secondary_tags, "ambiguous", True
-            ), "\n".join(fields)
+_DEPTH_CHANGE_ACTIONS = frozenset({
+    "add", "adopt", "apply", "build", "change", "convert", "implement",
+    "introduce", "make", "move", "replace", "set", "switch", "train", "use",
+})
 
-    return MechanismSignature(
-        chosen.stack_stage,
-        chosen.primary_family,
-        tuple(sorted({tag for signature in candidates for tag in signature.primary_tags})),
-        secondary_tags,
-        "confident",
-        False,
-    ), "\n".join(fields)
+
+def _depth_introduced_families(
+    text: str,
+) -> tuple[tuple[StackStage, str], ...]:
+    """Return only families that a clause presents as newly introduced.
+
+    Bare component/model mentions and preserved incumbent methods are context,
+    not method switches. A competing family becomes a contradiction only when
+    its own clause applies a change action (or explicitly calls it the primary
+    change). Transition handling in ``_is_preserved`` keeps the old side of
+    "replace X with Y" or "switch from X to Y" contextual.
+    """
+    introduced: set[tuple[StackStage, str]] = set()
+    for clause in _clause_texts(text):
+        tokens = _policy_tokens(clause)
+        for stage, families in _PRIMARY_FAMILY_PHRASES.items():
+            for family, phrases in families.items():
+                for phrase in phrases:
+                    for position in _phrase_positions(tokens, phrase):
+                        prefix = tokens[max(0, position - 7):position]
+                        suffix = tokens[
+                            position + len(phrase):position + len(phrase) + 6
+                        ]
+                        preserved_context = (
+                            _is_preserved(tokens, position)
+                            or any(
+                                item in _PRESERVATION_TOKENS
+                                or item in _CONTEXTUAL_OLD_TOKENS
+                                for item in prefix
+                            )
+                            or any(item in _PRESERVATION_TOKENS for item in suffix)
+                            or (bool(prefix) and prefix[-1] in {"in", "on"})
+                        )
+                        if preserved_context:
+                            continue
+                        local = tokens[max(0, position - 7):position + len(phrase) + 7]
+                        change_action = any(item in _DEPTH_CHANGE_ACTIONS for item in local)
+                        primary_change = "primary" in local and "change" in local
+                        if change_action or primary_change or "instead" in local:
+                            introduced.add((stage, family))
+    return tuple(sorted(introduced, key=lambda item: (item[0].value, item[1])))
 
 
 def validate_depth_alignment(
     proposal: ResearchProposal,
     selected: BreadthCandidate,
 ) -> None:
-    """Require the depth proposal to preserve the selected stage/mechanism."""
+    """Trust the selected canonical intent and reject generated method switches."""
     selected_signature = _candidate_signature(selected)
-    actual_signature, method_text = _depth_mechanism_signature(proposal)
-    if actual_signature.confidence != "confident":
-        raise BreadthValidationError(
-            "depth proposal has an unknown or ambiguous primary mechanism"
-        )
-    if actual_signature.stack_stage != selected_signature.stack_stage:
-        raise BreadthValidationError(
-            "depth proposal changed the selected stack stage: expected "
-            f"{selected.stack_stage.value}, classified "
-            f"{actual_signature.stack_stage.value if actual_signature.stack_stage else 'unknown'}"
-        )
-    if actual_signature.primary_family != selected_signature.primary_family:
-        raise BreadthValidationError(
-            "depth proposal changed the selected primary mechanism family: expected "
-            f"{selected_signature.primary_family}, classified "
-            f"{actual_signature.primary_family}"
-        )
-    selected_text = (
-        f"{selected.title} {selected.primary_change} {selected.mechanism}"
-    )
-    selected_tokens = _alignment_tokens(selected_text)
-    proposal_tokens = _alignment_tokens(method_text)
-    token_overlap = selected_tokens & proposal_tokens
-    required_overlap = 1 if len(selected_tokens) <= 3 else 2
-    if len(token_overlap) < required_overlap:
-        raise BreadthValidationError(
-            "depth proposal is not meaningfully aligned with the selected breadth mechanism"
-        )
+    for field in _depth_intervention_fields(proposal):
+        for stage, family in _depth_introduced_families(field):
+            if (
+                stage == StackStage.OPTIMIZATION_REGULARIZATION
+                and selected.stack_stage != StackStage.OPTIMIZATION_REGULARIZATION
+            ):
+                continue
+            if stage != selected.stack_stage:
+                raise BreadthValidationError(
+                    "depth proposal changed the selected stack stage: expected "
+                    f"{selected.stack_stage.value}, classified {stage.value}"
+                )
+            if not _compatible_primary_families(
+                selected.stack_stage,
+                family,
+                selected.primary_family,
+            ):
+                raise BreadthValidationError(
+                    "depth proposal changed the selected primary mechanism family: expected "
+                    f"{selected_signature.primary_family}, classified {family}"
+                )
     selected_evidence = {
         (item.citation_id.casefold(), item.claim_id.casefold())
         for item in selected.evidence

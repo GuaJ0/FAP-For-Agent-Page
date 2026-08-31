@@ -65,6 +65,7 @@ def _candidate(
     candidate_id: str,
     stage: StackStage,
     *,
+    family: str | None = None,
     title: str | None = None,
     primary_change: str | None = None,
     mechanism: str | None = None,
@@ -88,11 +89,26 @@ def _candidate(
         StackStage.OPTIMIZATION_REGULARIZATION: "Apply embedding dropout regularization.",
         StackStage.INFERENCE_ENSEMBLE: "Use prediction averaging.",
     }
+    change = primary_change or primary_defaults[stage]
+    inferred = infer_mechanism_signature(change)
+    family_defaults = {
+        StackStage.FEATURES: "metadata_features",
+        StackStage.ARCHITECTURE: "mlp",
+        StackStage.OBJECTIVE_SAMPLING: "pairwise",
+        StackStage.OPTIMIZATION_REGULARIZATION: "regularization",
+        StackStage.INFERENCE_ENSEMBLE: "prediction_averaging",
+    }
+    declared_family = family or (
+        inferred.primary_family
+        if inferred.confidence == "confident" and inferred.stack_stage == stage
+        else family_defaults[stage]
+    )
     return {
         "candidate_id": candidate_id,
         "title": title or f"{stage.value} direction",
         "stack_stage": stage.value,
-        "primary_change": primary_change or primary_defaults[stage],
+        "primary_family": declared_family,
+        "primary_change": change,
         "mechanism": mechanism or defaults[stage],
         "metric_rationale": metric_rationale,
         "expected_upside": upside,
@@ -571,7 +587,7 @@ def test_production_partial_failure_retains_survivors_and_repairs_incrementally(
     assert "B-SCORER-UNSAFE" in repair_prompt
     assert "modifies or tunes the official scorer/metric implementation" in repair_prompt
     assert "B-MECHANISM-CONFLICT" in repair_prompt
-    assert "mechanism conflicts with the declared primary_change" in repair_prompt
+    assert "mechanism confidently conflicts with declared" in repair_prompt
     assert "B-DUPLICATE-ARCH" in repair_prompt
     assert "duplicates breadth batch candidate" in repair_prompt
     assert "exactly 3 replacement candidate(s)" in repair_prompt
@@ -807,6 +823,7 @@ def test_breadth_schema_rejects_boolean_version_and_duplicate_ids(payload, match
         ("mechanism", "M" * 1201, "mechanism exceeds"),
         ("metric_rationale", "R" * 801, "metric_rationale exceeds"),
         ("stack_stage", "not-a-stage", "stack_stage must be one of"),
+        ("primary_family", "deepfm", "primary_family must be one of"),
         ("expected_upside", 3, "non-empty string"),
     ],
 )
@@ -1021,7 +1038,7 @@ def test_token_phrase_stage_classifier_adversarial_cases(text, expected):
     assert classify_stack_stage(text) == expected
 
 
-def test_declared_stage_must_match_confident_mechanism_inference():
+def test_canonical_declaration_allows_unknown_text_but_rejects_confident_conflicts():
     candidates = [
         _candidate(
             "B-MISLABEL-DEEPFM", StackStage.FEATURES,
@@ -1047,11 +1064,124 @@ def test_declared_stage_must_match_confident_mechanism_inference():
     survivors, rejections = filter_breadth_candidates(
         plan, history=[_baseline()], citation_source=JsonCitationCatalog()
     )
-    assert {item.candidate_id for item in survivors} == {"B-REG"}
+    assert {item.candidate_id for item in survivors} == {"B-AMBIGUOUS", "B-REG"}
     reasons = {item.candidate_id: item.reason for item in rejections}
     assert "conflicts" in reasons["B-MISLABEL-DEEPFM"]
     assert "conflicts" in reasons["B-MISLABEL-BPR"]
-    assert "unambiguous" in reasons["B-AMBIGUOUS"]
+
+
+def test_live_pattern_canonical_families_tolerate_unknown_and_ancillary_prose():
+    unknown_feature = _candidate(
+        "B-UNKNOWN-FEATURE",
+        StackStage.FEATURES,
+        family="temporal_features",
+        primary_change="Encode how recently each viewer interacted into bounded signals.",
+        mechanism="Transform event timestamps into viewer-state inputs before training.",
+    )
+    objective_with_optimizer = _candidate(
+        "B-PAIRWISE-ADAMW",
+        StackStage.OBJECTIVE_SAMPLING,
+        family="pairwise",
+        primary_change="Add a BPR pairwise objective.",
+        mechanism="Train the BPR pairwise term with AdamW and gradient clipping.",
+    )
+    inference_with_component_model = _candidate(
+        "B-DEEPFM-COMPONENTS",
+        StackStage.INFERENCE_ENSEMBLE,
+        family="prediction_averaging",
+        primary_change="Use prediction averaging.",
+        mechanism="Use prediction averaging across retained DeepFM component models.",
+    )
+    plan = BreadthPlan.from_json(
+        _breadth(unknown_feature, objective_with_optimizer, inference_with_component_model),
+        max_candidates=5,
+    )
+
+    survivors, rejections = filter_breadth_candidates(
+        plan, history=[_baseline()], citation_source=JsonCitationCatalog()
+    )
+
+    assert {item.candidate_id for item in survivors} == {
+        "B-UNKNOWN-FEATURE", "B-PAIRWISE-ADAMW", "B-DEEPFM-COMPONENTS",
+    }
+    assert rejections == ()
+
+
+def test_live_pattern_unknown_breadth_wording_reaches_depth_in_two_calls(tmp_path):
+    candidates = [
+        _candidate(
+            "B-UNKNOWN-FEATURE", StackStage.FEATURES, family="temporal_features",
+            primary_change="Encode recent viewer state into bounded inputs.",
+            mechanism="Transform timestamps into viewer-state signals.",
+        ),
+        _candidate(
+            "B-UNKNOWN-ARCH", StackStage.ARCHITECTURE, family="mlp",
+            primary_change="Strengthen the trainable interaction function.",
+            mechanism="Use a compact nonlinear representation module.",
+        ),
+        _candidate(
+            "B-UNKNOWN-OBJECTIVE", StackStage.OBJECTIVE_SAMPLING, family="pairwise",
+            primary_change="Add direct within-viewer ordering pressure.",
+            mechanism="Compare preferred and non-preferred items within each viewer.",
+            evidence=[
+                {"citation_id": "rendle2009bpr", "claim_id": "pairwise-ranking-objective"},
+                {"citation_id": "covington2016youtube", "claim_id": "ranking-objective-and-watch-time"},
+            ],
+        ),
+        _candidate(
+            "B-UNKNOWN-REG", StackStage.OPTIMIZATION_REGULARIZATION,
+            family="regularization",
+            primary_change="Constrain representation co-adaptation during fitting.",
+            mechanism="Apply a bounded stochastic constraint during fitting.",
+        ),
+        _candidate(
+            "B-UNKNOWN-INFERENCE", StackStage.INFERENCE_ENSEMBLE,
+            family="prediction_averaging",
+            primary_change="Combine several retained prediction vectors.",
+            mechanism="Aggregate retained prediction vectors before ranking.",
+        ),
+    ]
+    agent, client = _agent(tmp_path, [
+        _breadth(*candidates),
+        json.dumps(_objective_proposal()),
+    ])
+
+    idea = agent.propose([_baseline()])
+
+    assert idea.parent_iteration == 0
+    assert [call[2] for call in client.calls] == [
+        "research_breadth", "research_depth",
+    ]
+    assert "STACK STAGE: objective_sampling" in idea.hypothesis
+    assert "PRIMARY FAMILY: pairwise" in idea.hypothesis
+    assert (
+        "PRIMARY CHANGE: Add direct within-viewer ordering pressure."
+        in idea.hypothesis
+    )
+
+
+def test_declared_feature_family_rejects_confident_deepfm_contradiction():
+    conflicting = _candidate(
+        "B-FEATURE-AS-DEEPFM",
+        StackStage.FEATURES,
+        family="temporal_features",
+        primary_change="Replace the incumbent with a DeepFM architecture.",
+        mechanism="Use a DeepFM interaction tower architecture.",
+    )
+    plan = BreadthPlan.from_json(_breadth(
+        conflicting,
+        _candidate("B-REG", StackStage.OPTIMIZATION_REGULARIZATION),
+        _candidate("B-ENSEMBLE", StackStage.INFERENCE_ENSEMBLE),
+    ), max_candidates=5)
+
+    survivors, rejections = filter_breadth_candidates(
+        plan, history=[_baseline()], citation_source=JsonCitationCatalog()
+    )
+
+    assert "B-FEATURE-AS-DEEPFM" not in {item.candidate_id for item in survivors}
+    assert "confidently conflicts" in {
+        item.candidate_id: item.reason for item in rejections
+    }["B-FEATURE-AS-DEEPFM"]
 
 
 def _proposal_for_method(
@@ -1115,6 +1245,113 @@ def test_citation_overlap_alone_does_not_prove_depth_alignment():
     proposal_data = proposal.to_dict()
     proposal_data["implementation"]["hyperparameters"] = {"listwise_temperature": [1.0]}
     proposal = ResearchProposal.from_dict(proposal_data)
+    with pytest.raises(BreadthValidationError, match="primary mechanism family"):
+        validate_depth_alignment(proposal, selected)
+
+
+def test_depth_accepts_one_canonical_anchor_plus_unknown_neutral_prose():
+    selected = BreadthCandidate.from_dict(_candidate(
+        "B-BPR", StackStage.OBJECTIVE_SAMPLING, family="pairwise",
+    ), "candidate")
+    proposal = _proposal_for_method(
+        title="Bounded ranking refinement",
+        hypothesis="Refine the incumbent ordering signal without changing evaluation.",
+        mechanism="The added supervision should sharpen useful ordering behavior.",
+        components=["training path"],
+        steps=[
+            "Add a BPR pairwise objective term.",
+            "Keep the remainder of the training path fixed.",
+        ],
+    )
+
+    validate_depth_alignment(proposal, selected)
+
+
+def test_live_depth_allows_preserved_pointwise_context_for_selected_pairwise():
+    selected = BreadthCandidate.from_dict(_candidate(
+        "B-BPR", StackStage.OBJECTIVE_SAMPLING, family="pairwise",
+        primary_change="Add a BPR pairwise ranking objective.",
+    ), "candidate")
+    proposal = _proposal_for_method(
+        title="Selected ordering intervention",
+        hypothesis=(
+            "Retain the incumbent pointwise loss and add the selected BPR "
+            "pairwise objective."
+        ),
+        mechanism="The selected intervention adds direct ordering pressure.",
+        components=["training objective"],
+        steps=[
+            "Keep existing pointwise supervision fixed.",
+            "Train the selected intervention with the incumbent features.",
+        ],
+    )
+
+    validate_depth_alignment(proposal, selected)
+
+
+def test_live_depth_allows_fully_neutral_prose_because_selected_anchor_is_authoritative():
+    selected = BreadthCandidate.from_dict(_candidate(
+        "B-BPR", StackStage.OBJECTIVE_SAMPLING, family="pairwise",
+        primary_change="Add a BPR pairwise ranking objective.",
+    ), "candidate")
+    proposal = _proposal_for_method(
+        title="Bounded ranking refinement",
+        hypothesis="Apply the already selected intervention without changing evaluation.",
+        mechanism="The bounded change should sharpen useful ordering behavior.",
+        components=["training path"],
+        steps=["Implement the selected change and keep all other components fixed."],
+    )
+
+    validate_depth_alignment(proposal, selected)
+
+
+@pytest.mark.parametrize(
+    ("conflicting_text", "error_match"),
+    [
+        ("Replace BPR with pointwise logloss.", "primary mechanism family"),
+        ("Switch from BPR to LambdaRank.", "primary mechanism family"),
+        ("Replace the objective change with a DeepFM architecture.", "stack stage"),
+        ("Use a transformer architecture as the primary change.", "stack stage"),
+        (
+            "Keep pointwise supervision unchanged, then replace BPR with pointwise logloss.",
+            "primary mechanism family",
+        ),
+    ],
+)
+def test_live_depth_rejects_real_method_switches_clause_locally(
+    conflicting_text, error_match
+):
+    selected = BreadthCandidate.from_dict(_candidate(
+        "B-BPR", StackStage.OBJECTIVE_SAMPLING, family="pairwise",
+        primary_change="Add a BPR pairwise ranking objective.",
+    ), "candidate")
+    proposal = _proposal_for_method(
+        title="Selected ranking intervention",
+        hypothesis="Apply the selected ranking intervention.",
+        mechanism="The selected intervention changes ranking supervision.",
+        components=["training objective"],
+        steps=[conflicting_text],
+    )
+
+    with pytest.raises(BreadthValidationError, match=error_match):
+        validate_depth_alignment(proposal, selected)
+
+
+def test_depth_rejects_confident_competing_family_despite_selected_anchor():
+    selected = BreadthCandidate.from_dict(_candidate(
+        "B-BPR", StackStage.OBJECTIVE_SAMPLING, family="pairwise",
+    ), "candidate")
+    proposal = _proposal_for_method(
+        title="Pairwise ranking refinement",
+        hypothesis="Add a BPR pairwise objective term.",
+        mechanism="Pairwise supervision should improve ordering.",
+        components=["training objective"],
+        steps=[
+            "Add a BPR pairwise objective term.",
+            "Also train a listwise objective over each ranked list.",
+        ],
+    )
+
     with pytest.raises(BreadthValidationError, match="primary mechanism family"):
         validate_depth_alignment(proposal, selected)
 
@@ -1298,15 +1535,15 @@ def test_misaligned_depth_uses_one_bounded_repair(tmp_path):
     ]
 
 
-def test_ambiguous_depth_repair_receives_binding_selected_mechanism_guidance(tmp_path):
-    vague = _objective_proposal()
-    vague.update({
-        "title": "Ranking refinement",
-        "hypothesis": "Refine the incumbent representation for stronger ordering.",
+def test_conflicting_depth_repair_receives_binding_selected_mechanism_guidance(tmp_path):
+    conflicting = _objective_proposal()
+    conflicting.update({
+        "title": "Pointwise objective replacement",
+        "hypothesis": "Replace BPR with pointwise logloss for stronger ordering.",
     })
-    vague["implementation"]["target_components"] = ["ranking training path"]
-    vague["implementation"]["steps"] = [
-        "Improve the incumbent ranking behavior without changing evaluation."
+    conflicting["implementation"]["target_components"] = ["training objective"]
+    conflicting["implementation"]["steps"] = [
+        "Switch from BPR to pointwise logloss."
     ]
     repaired = _objective_proposal()
     repaired["hypothesis"] = (
@@ -1317,7 +1554,7 @@ def test_ambiguous_depth_repair_receives_binding_selected_mechanism_guidance(tmp
     )
     agent, client = _agent(tmp_path, [
         _strong_objective_breadth(),
-        json.dumps(vague),
+        json.dumps(conflicting),
         json.dumps(repaired),
     ])
 
@@ -1328,12 +1565,14 @@ def test_ambiguous_depth_repair_receives_binding_selected_mechanism_guidance(tmp
         "research_breadth", "research_depth", "research_depth_repair",
     ]
     repair_prompt = client.calls[2][1]
-    assert "unknown or ambiguous primary mechanism" in repair_prompt
+    assert "changed the selected primary mechanism family" in repair_prompt
+    assert "classified pointwise" in repair_prompt
     assert "stack_stage=objective_sampling" in repair_prompt
     assert "primary mechanism family=pairwise" in repair_prompt
     assert "Add a weighted BPR pairwise objective." in repair_prompt
-    assert "hypothesis" in repair_prompt
-    assert "first intervention-bearing" in repair_prompt
+    assert "canonical primary intervention is already fixed" in repair_prompt
+    assert "Do not choose another method" in repair_prompt
+    assert "Remove or rewrite only text" in repair_prompt
     assert "Do not introduce a competing primary family" in repair_prompt
 
 
@@ -2132,6 +2371,28 @@ def test_structured_history_falls_back_after_unknown_hypothesis():
         _record(1, proposal, Decision.REVERT),
     ])
     assert coverage.for_stage(StackStage.ARCHITECTURE).attempts == 1
+    assert coverage.unclassified_attempts == 0
+
+
+def test_structured_history_prefers_recorded_canonical_family_when_available():
+    proposal = _proposal_for_method(
+        title="Bounded representation refinement",
+        hypothesis="Encode recent viewer state into bounded inputs.",
+        mechanism="The extra state may improve ranking.",
+        components=["viewer-state inputs"],
+        steps=["Derive bounded signals from event timestamps."],
+    ).to_handoff_text(
+        stack_stage="features",
+        primary_family="temporal_features",
+        primary_change="Encode recent viewer state into bounded inputs.",
+    )
+
+    coverage = build_stack_coverage([
+        _baseline(),
+        _record(1, proposal, Decision.REVERT),
+    ])
+
+    assert coverage.for_stage(StackStage.FEATURES).attempts == 1
     assert coverage.unclassified_attempts == 0
 
 
