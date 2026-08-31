@@ -14,28 +14,41 @@ from agent.records import Decision, RunRecord
 
 
 @dataclass(frozen=True)
-class Idea:
-    hypothesis: str
-    parent_iteration: Optional[int]
-
-
-@dataclass(frozen=True)
 class AgentUsage:
-    """What one implement() call cost. Optional -- a CodingAgent that doesn't
-    track usage simply leaves Diff.usage as None.
+    """What one agent call cost: one implement(), one judge(), one propose().
+
+    Optional everywhere it appears -- an agent that doesn't track usage simply
+    leaves the field None, which is "not measured", not "measured as zero".
 
     `cost_usd` is carried here but deliberately does NOT get a field on
     ResourceUsage. Token counts are ground truth from the API; a dollar figure
     is derived from a mutable list-price table, so persisting one into an
     append-only log freezes a number that silently goes stale as prices change.
     Tokens are what's stored; cost stays derivable (agent/coding/llm.py's
-    pricing table) and is logged alongside the model name in
-    logs/coding_agent_usage.jsonl. The orchestrator also writes it into a
+    pricing table) and is logged alongside the model name in each agent's own
+    per-call usage JSONL (coding_agent_usage.jsonl, research_agent_usage.jsonl,
+    evaluator_usage.jsonl). The orchestrator also writes it into a
     per-iteration Event so it's visible in runs.jsonl without a schema change.
     """
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class Idea:
+    hypothesis: str
+    parent_iteration: Optional[int]
+    # Optional: what proposing this idea cost. A ResearchAgent that makes real
+    # LLM calls reports them here and orchestrator.py folds them into the
+    # RunRecord.resources of the FIRST iteration run for this idea -- see
+    # Orchestrator._step. None means "not tracked" (OfflineResearchAgent
+    # proposes from a deterministic backlog and spends nothing).
+    #
+    # Carried on the Idea rather than returned on a side channel for the same
+    # reason Diff.usage and Verdict.usage are: one object crosses the agent
+    # boundary, so there is nothing for a caller to forget to collect.
+    usage: Optional["AgentUsage"] = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +113,17 @@ class ResearchAgent(Protocol):
         Raise ResearchExhausted to end the run cleanly when there is nothing
         left to propose. Any other exception is treated as a failure to
         propose: recorded, retried, and escalated if it keeps happening.
+
+        Report what the call cost on the returned Idea's `usage`. An agent
+        that spends no tokens (a deterministic backlog) leaves it None.
+
+        USAGE ON THE FAILING PATH -- an implementation that also exposes a
+        `last_usage` dict (tokens_in / tokens_out / cost_usd) MUST clear it on
+        entry to propose(), not only write it on the way out. A propose() that
+        raises returns no Idea, so that dict is the only place its tokens can
+        be recovered from, and Orchestrator._failed_proposal_usage reads it to
+        bill the failed iteration. Leaving a previous call's numbers there
+        would charge one proposal's spend to two different RunRecords.
         """
         ...
 

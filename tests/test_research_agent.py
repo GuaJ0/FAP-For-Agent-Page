@@ -552,6 +552,49 @@ def test_research_usage_accounting_is_scoped_and_persisted(tmp_path):
     assert agent.usage.totals()["tokens_in"] == agent.last_usage["tokens_in"]
 
 
+def test_proposed_idea_carries_the_tokens_it_cost(tmp_path):
+    """The Idea is the channel that gets Research spend into RunRecord.
+    resources. Before this it existed only in research_agent_usage.jsonl, so
+    reconciling a campaign's runs.jsonl against its usage logs came up short by
+    exactly the Research total."""
+    agent, _ = _agent(tmp_path, [json.dumps(_proposal(parent=3))])
+
+    idea = agent.propose([_record(3, 0.62, Decision.ACCEPT)])
+
+    assert idea.usage is not None
+    assert idea.usage.tokens_in == agent.last_usage["tokens_in"] > 0
+    assert idea.usage.tokens_out == agent.last_usage["tokens_out"] > 0
+    assert idea.usage.cost_usd == agent.last_usage["cost_usd"]
+    # The Idea and the on-disk log are two views of the same calls.
+    assert idea.usage.tokens_in == agent.usage.totals()["tokens_in"]
+
+
+def test_last_usage_is_cleared_on_entry_so_a_failed_propose_cannot_bill_twice(tmp_path):
+    """Orchestrator._failed_proposal_usage reads last_usage to charge a
+    propose() that RAISED, which is sound only if a raising call cannot leave
+    the previous call's numbers behind. Here the second propose() dies before
+    any model call: it must report nothing, not the first call's tokens."""
+    agent, _ = _agent(tmp_path, [json.dumps(_proposal(parent=3))])
+    history = [_record(3, 0.62, Decision.ACCEPT)]
+
+    agent.propose(history)
+    spent = agent.last_usage["tokens_in"]
+    assert spent > 0
+
+    # No citations -> propose() raises above its own try/except, the earliest
+    # exit there is.
+    agent.citation_source = _EmptyCitationSource()
+    with pytest.raises(Exception):
+        agent.propose(history)
+
+    assert agent.last_usage == {}
+
+
+class _EmptyCitationSource:
+    def search(self, query, limit):
+        return []
+
+
 def test_rejected_depth_output_is_recorded_in_bounded_local_failure_trace(tmp_path):
     agent, client = _agent(tmp_path, ["ordinary malformed depth response"], max_repair_attempts=0)
 

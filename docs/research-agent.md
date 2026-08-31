@@ -116,8 +116,18 @@ validation-only responses are written to a bounded local
 `logs/research_agent_failures.jsonl` trace with their purpose, attempt, and
 validation error; unsafe output is redacted before persistence. Usage rows
 distinguish `research_breadth`, `research_breadth_repair`, `research_depth`, and
-`research_depth_repair`. Research token counts and estimated cost remain in
-`logs/research_agent_usage.jsonl`; Coding Agent accounting is not modified.
+`research_depth_repair`. Research token counts and estimated cost are written to
+`logs/research_agent_usage.jsonl`, and are also folded into
+`RunRecord.resources` — the proposed `Idea` carries an `AgentUsage`, and the
+Orchestrator adds it to the same per-iteration total the Coding and Evaluator
+agents already contribute to, alongside a `research_usage` event carrying the
+dollar figure. It is charged to the **first** iteration run for an idea and
+only that one: one `propose()` call can produce several `RunRecord`s once a
+failure triggers a retry, and billing each of them would silently multiply one
+call's spend. A `propose()` that raises is billed too, on the `research_failed`
+record it produces — which is why `last_usage` is cleared on entry to
+`propose()` rather than only written on the way out. Coding Agent accounting is
+not modified.
 
 Generated breadth and depth fields share one safety boundary. It combines the
 existing encoded-text/injection scanner with a normalized, bounded

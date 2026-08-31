@@ -26,7 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.agents import CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent, ResearchExhausted
+from agent.agents import (
+    AgentUsage, CodingAgent, Diff, EvaluatorAgent, Idea, ResearchAgent, ResearchExhausted,
+)
 from agent.config import BOOTSTRAP_ITERATION, Config, DEFAULT_CONFIG
 # _parse_ts is imported rather than re-implemented on purpose: summary.json's
 # wall_s and convergence.should_stop's wall-clock budget must be the SAME
@@ -318,6 +320,13 @@ class Orchestrator:
             self.state.run_start_time = now
 
         idea = self.state.get_current_idea()
+        # Attributed to the first iteration run for this idea, and only that
+        # one. An idea that fails and is retried comes back from
+        # get_current_idea() on the next _step() -- proposing it happened once,
+        # so charging its tokens to each retry's RunRecord would bill one
+        # propose() call two or three times over. Left None on that path; the
+        # tokens are already on the record where they were actually spent.
+        research_usage: Optional[AgentUsage] = None
         if idea is None:
             # No try/except here used to mean one bad proposal could take
             # down the entire run -- see _handle_research_failure's docstring.
@@ -335,6 +344,7 @@ class Orchestrator:
             except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring below
                 self._handle_research_failure(e, history)
                 return
+            research_usage = idea.usage
             self.state.set_current_idea(idea)
             self.state.fix_attempts = 0
             self.state.idea_start_time = now
@@ -357,9 +367,9 @@ class Orchestrator:
         idea_elapsed = time.time() - (self.state.idea_start_time or time.time())
 
         if agg is None:
-            self._handle_failed_run(iteration, idea, diff, seeds, idea_elapsed)
+            self._handle_failed_run(iteration, idea, diff, seeds, idea_elapsed, research_usage)
         else:
-            self._handle_successful_run(iteration, idea, diff, seeds, agg, history)
+            self._handle_successful_run(iteration, idea, diff, seeds, agg, history, research_usage)
 
         self.state.iteration = iteration
         self._save_state()
@@ -405,7 +415,16 @@ class Orchestrator:
         that cannot propose at all is a categorically different problem from
         one hard idea, and burning the whole wall-clock/cost budget retrying
         it forever would be worse than stopping and asking.
+
+        The record carries the tokens the failed call spent. A propose() that
+        raised after two model calls cost exactly as much as one that returned,
+        and this record is the only one that will ever be written for it -- no
+        Idea comes back to carry the usage out, so it is read off the agent
+        instead. That reversal is safe only because the Protocol requires
+        last_usage to be cleared at the start of every propose(); see
+        _failed_proposal_usage.
         """
+        failed_usage = self._failed_proposal_usage()
         self.state.consecutive_research_failures += 1
         iteration = self.state.iteration + 1
         halt = self.state.consecutive_research_failures >= self.cfg.retry.max_consecutive_research_failures
@@ -428,8 +447,12 @@ class Orchestrator:
                     f"reason={type(error).__name__}: {error}"
                 )[:2000],
                 agent_action="research",
-            )],
-            resources=ResourceUsage(wall_s=0.0),
+            )] + self._research_usage_event(failed_usage),
+            resources=ResourceUsage(
+                wall_s=0.0,
+                tokens_in=failed_usage.tokens_in if failed_usage else 0,
+                tokens_out=failed_usage.tokens_out if failed_usage else 0,
+            ),
         )
         self.run_log.append(record)
         self.state.iteration = iteration
@@ -444,6 +467,33 @@ class Orchestrator:
         self._save_state()
         self._write_summary()
 
+    def _failed_proposal_usage(self) -> Optional[AgentUsage]:
+        """Tokens spent by the propose() call that just raised, or None.
+
+        Read off the agent because a raising propose() returns no Idea to carry
+        them. ResearchAgent (agent/agents.py) makes this sound: an agent that
+        reports last_usage must clear it on entry to propose(), so whatever is
+        found here was spent by the call that just failed and cannot be an
+        earlier proposal's numbers billed a second time.
+
+        Defensive on every axis -- absent attribute, wrong type, missing or
+        non-numeric keys all mean "not measured" rather than a crash. This runs
+        on the path that already exists to stop one bad proposal from ending an
+        unattended run; it must not become a new way to end one.
+        """
+        raw = getattr(self.research, "last_usage", None)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            tokens_in = int(raw.get("tokens_in", 0))
+            tokens_out = int(raw.get("tokens_out", 0))
+            cost_usd = float(raw.get("cost_usd", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if tokens_in == 0 and tokens_out == 0:
+            return None
+        return AgentUsage(tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost_usd)
+
     def _handle_failed_run(
         self,
         iteration: int,
@@ -451,6 +501,7 @@ class Orchestrator:
         diff: Diff,
         seeds: list[SeedMetrics],
         idea_elapsed: float,
+        research_usage: Optional[AgentUsage] = None,
     ) -> None:
         self.state.fix_attempts += 1
         should_abandon = (
@@ -476,8 +527,8 @@ class Orchestrator:
                     f"reason={'attempt_cap' if self.state.fix_attempts >= self.cfg.retry.max_fix_attempts else 'time_backstop' if should_abandon else 'will_retry'}"
                 ),
                 agent_action="orchestrator",
-            )] + self._usage_event(diff),
-            resources=self._resources(diff, seeds),
+            )] + self._usage_event(diff) + self._research_usage_event(research_usage),
+            resources=self._resources(diff, seeds, research_usage),
             manual_intervention=self._consume_manual_intervention_flag(),
         )
         self.run_log.append(record)
@@ -495,6 +546,7 @@ class Orchestrator:
         seeds: list[SeedMetrics],
         agg,
         history: list[RunRecord],
+        research_usage: Optional[AgentUsage] = None,
     ) -> None:
         best = self.registry.best()
         delta = agg.primary_mean - best.val_primary if best else agg.primary_mean
@@ -513,8 +565,8 @@ class Orchestrator:
             delta_vs_current_best=delta,
             decision=None,
             events=[Event(type="eval_finished", detail=f"primary={agg.primary_mean:.4f}", agent_action="evaluator")]
-                   + self._usage_event(diff),
-            resources=self._resources(diff, seeds),
+                   + self._usage_event(diff) + self._research_usage_event(research_usage),
+            resources=self._resources(diff, seeds, research_usage),
             manual_intervention=self._consume_manual_intervention_flag(),
         )
 
@@ -556,7 +608,12 @@ class Orchestrator:
         self._record_finding(record)
         self._close_idea(abandoned=(verdict.decision == Decision.ABANDON))
 
-    def _resources(self, diff: Diff, seeds: list[SeedMetrics]) -> ResourceUsage:
+    def _resources(
+        self,
+        diff: Diff,
+        seeds: list[SeedMetrics],
+        research_usage: Optional[AgentUsage] = None,
+    ) -> ResourceUsage:
         """Build the iteration's ResourceUsage, including LLM tokens and CPU time.
 
         ResourceUsage has carried tokens_in/tokens_out since the schema was
@@ -572,19 +629,29 @@ class Orchestrator:
         only, by design, and cpu_hours is what actually reports the compute
         a Feasibility scorer would otherwise find only a bare zero for.
 
+        `research_usage` is the third contributor, added once the same leak was
+        found on the Research side: an LLM-backed ResearchAgent spends real
+        tokens producing the hypothesis, and those appeared only in
+        research_agent_usage.jsonl, never in any RunRecord. It is passed in
+        rather than read off `idea` so the caller can enforce charging it to
+        exactly one iteration -- see _step. Both stay optional and independent:
+        the offline Research agent with a live Coding agent yields precisely
+        the Coding-only ResourceUsage it did before.
+
         Called from the failed path as well as the successful one: a failed
         attempt still costs tokens and CPU time, and is often the most
         expensive kind of either, since it is the one that burned repairs.
         """
         wall_s = sum(s.wall_s for s in seeds)
         cpu_hours = sum(s.cpu_s for s in seeds) / 3600.0
-        if diff.usage is None:
+        contributors = [u for u in (diff.usage, research_usage) if u is not None]
+        if not contributors:
             return ResourceUsage(wall_s=wall_s, cpu_hours=cpu_hours)
         return ResourceUsage(
             wall_s=wall_s,
             cpu_hours=cpu_hours,
-            tokens_in=diff.usage.tokens_in,
-            tokens_out=diff.usage.tokens_out,
+            tokens_in=sum(u.tokens_in for u in contributors),
+            tokens_out=sum(u.tokens_out for u in contributors),
         )
 
     @staticmethod
@@ -626,6 +693,24 @@ class Orchestrator:
             type="coding_usage",
             detail=f"tokens_in={u.tokens_in} tokens_out={u.tokens_out} cost_usd={u.cost_usd:.6f}",
             agent_action="coding",
+        )]
+
+    @staticmethod
+    def _research_usage_event(usage: Optional[AgentUsage]) -> list[Event]:
+        """Research's counterpart to _usage_event, and for the same reason:
+        cost_usd has no ResourceUsage field, so the dollar figure reaches
+        runs.jsonl as an event. Kept a separate event type from coding_usage so
+        a reader can still attribute spend per agent after the two are summed
+        into one ResourceUsage."""
+        if usage is None or (usage.tokens_in == 0 and usage.tokens_out == 0):
+            return []
+        return [Event(
+            type="research_usage",
+            detail=(
+                f"tokens_in={usage.tokens_in} tokens_out={usage.tokens_out} "
+                f"cost_usd={usage.cost_usd:.6f}"
+            ),
+            agent_action="research",
         )]
 
     def _record_finding(self, record: RunRecord) -> None:
