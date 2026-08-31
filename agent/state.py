@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from agent.agents import Idea
+from agent.agents import AgentUsage, Idea
 
 
 @dataclass
@@ -44,7 +44,24 @@ class OrchestratorState:
     manual_intervention_pending: bool = False
 
     def get_current_idea(self) -> Optional[Idea]:
-        return Idea(**self.current_idea) if self.current_idea else None
+        """Rehydrate the in-flight Idea, nested AgentUsage included.
+
+        set_current_idea() persists via asdict(), which flattens a nested
+        AgentUsage into a plain dict; Idea(**d) would hand that dict straight
+        back as Idea.usage, so a resumed idea would carry something that looks
+        like usage and has no attributes. Rebuilt explicitly instead.
+
+        A state file written before Idea grew a `usage` field simply has no
+        such key, and the field's default (None) applies -- old checkpoints
+        resume unchanged.
+        """
+        if not self.current_idea:
+            return None
+        fields = dict(self.current_idea)
+        usage = fields.get("usage")
+        if isinstance(usage, dict):
+            fields["usage"] = AgentUsage(**usage)
+        return Idea(**fields)
 
     def set_current_idea(self, idea: Optional[Idea]) -> None:
         self.current_idea = asdict(idea) if idea else None

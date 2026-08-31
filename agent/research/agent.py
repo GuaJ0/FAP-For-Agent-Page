@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from agent.agents import Idea
+from agent.agents import AgentUsage, Idea
 from agent.coding.llm import LLMClient, LLMResponse
 from agent.config import (
     DEFAULT_CONFIG,
@@ -372,6 +372,13 @@ class LLMResearchAgent:
 
     def propose(self, history: list[RunRecord]) -> Idea:
         """Return one validated, evidence-backed proposal as the existing Idea."""
+        # Cleared per call, not just written on the way out. Orchestrator reads
+        # last_usage to attribute the tokens of a propose() that RAISED (see
+        # _handle_research_failure); leaving the previous call's numbers here
+        # would make that path bill an earlier proposal's spend a second time.
+        # Every exit below -- return, ResearchAgentError, or a raise from
+        # anything above the try -- therefore reports only this call's calls.
+        self.last_usage = {}
         # Prior findings make SYSTEM_PROMPT's existing "do not repeat a measured
         # dead end" rule enforceable on a fresh run, when this run's own history
         # is empty and would otherwise give that rule nothing to point at.
@@ -417,6 +424,11 @@ class LLMResearchAgent:
             # Use the selected incumbent from trusted context, rather than
             # trusting the model to choose its own parent.
             parent_iteration=context.parent_iteration,
+            # Proposing this idea cost real tokens. Handing them back on the
+            # Idea is what lets orchestrator.py put them in RunRecord.resources
+            # instead of leaving Research the one agent whose spend appeared
+            # only in its own usage log.
+            usage=self._usage_of(calls),
         )
 
     def _complete(
@@ -721,6 +733,17 @@ class LLMResearchAgent:
         return (
             f"{context.task} ranking recommendation behavior sequence multi-task "
             f"watch time feature interactions {recent}"
+        )
+
+    @staticmethod
+    def _usage_of(calls: Sequence[LLMResponse]) -> AgentUsage:
+        """The same totals as _set_last_usage, in the shape the Orchestrator
+        folds into ResourceUsage. Both are derived from one list of responses
+        so the dict and the AgentUsage can never disagree."""
+        return AgentUsage(
+            tokens_in=sum(response.tokens_in for response in calls),
+            tokens_out=sum(response.tokens_out for response in calls),
+            cost_usd=round(sum(response.cost_usd for response in calls), 6),
         )
 
     def _set_last_usage(self, calls: Sequence[LLMResponse]) -> None:

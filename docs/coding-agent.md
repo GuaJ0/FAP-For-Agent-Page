@@ -185,6 +185,23 @@ that burned repairs.
 the old `wall_s`-only record, which is what keeps `tests/test_orchestrator.py`
 passing unmodified.
 
+**The same leak existed on the Research side and is now closed too.** An
+LLM-backed `ResearchAgent` spends real tokens producing the hypothesis, and
+those reached only `logs/research_agent_usage.jsonl` — reconciling
+`runs/run2/runs.jsonl` against its usage logs came up short by exactly that
+file's totals (15799 in / 10282 out). `Idea` now carries the same optional
+`AgentUsage`, and `_resources()` sums every contributor. The one asymmetry
+versus `Diff.usage`: an `Idea` outlives a single iteration, so Research usage is
+charged to the first `RunRecord` for that idea and none of its retries — see
+`Orchestrator._step`.
+
+**What still doesn't reconcile, and why it isn't a schema problem.** If a run is
+killed between the LLM calls and the `RunRecord` append, the tokens are in the
+per-call usage log (written and `fsync`ed immediately) but in no record —
+`runs/exploration` is short one such orphaned attempt. The per-agent usage
+JSONLs are therefore the authoritative source for a cost/token submission, and
+`runs.jsonl` is the per-iteration attribution of it.
+
 **`cost_usd` deliberately has no `ResourceUsage` field.** Token counts are
 ground truth from the API response; a dollar figure is derived from a mutable
 list-price table, so persisting one into an append-only log freezes a number
