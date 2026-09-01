@@ -13,6 +13,7 @@ from agent.records import AggregateMetrics, Decision, Event, ResourceUsage, RunR
 from agent.research.agent import ResearchInputError
 from agent.research.citations import JsonCitationCatalog, validate_proposal_citations
 from agent.research.context import build_research_context
+from agent.research.findings import VERDICT_DO, Finding, FindingsLedger
 from agent.research.offline import (
     DEFAULT_BACKLOG,
     OfflineBacklogExhausted,
@@ -152,6 +153,33 @@ def test_offline_agent_does_not_repeat_an_accepted_proposal():
     assert "OFFLINE-HYBRID-BPR" in first.hypothesis
     assert "OFFLINE-HYBRID-BPR" not in second.hypothesis
     assert "OFFLINE-GAUC-WEIGHTED-BPR" in second.hypothesis
+
+
+def test_offline_agent_skips_a_backlog_entry_already_in_the_findings_ledger(tmp_path):
+    """Reproduces the run1->run2 bug: a fresh run's OWN history is empty, so
+    without cross-run context OFFLINE-HYBRID-BPR gets proposed again even
+    though a prior run's ledger already recorded it. A FindingsLedger seeded
+    with that id must make this run skip straight past it, same as an
+    in-run duplicate does.
+    """
+    ledger = FindingsLedger(tmp_path / "findings.jsonl")
+    ledger.record(Finding(
+        direction="RANKING-LOSS",
+        title="Hybrid pointwise/pairwise ranking objective",
+        verdict=VERDICT_DO,
+        decision="accept",
+        delta_vs_incumbent=0.0016,
+        validation_primary=0.6032,
+        why="measured by a prior run",
+        iteration=2,
+        variants=("OFFLINE-HYBRID-BPR",),
+    ))
+
+    agent = OfflineResearchAgent(findings=ledger)
+    proposal = agent.propose([_baseline()])
+
+    assert "OFFLINE-HYBRID-BPR" not in proposal.hypothesis
+    assert "OFFLINE-GAUC-WEIGHTED-BPR" in proposal.hypothesis
 
 
 def test_offline_agent_advances_as_history_grows():

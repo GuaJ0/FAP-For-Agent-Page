@@ -210,6 +210,25 @@ class Executor:
                 "iteration": iteration, "seed": seed, "test_metrics": test_metrics,
             })
 
+    def _check_compiles(self, train_py: Path) -> Optional[str]:
+        """None if train_py compiles cleanly; the compiler's stderr tail otherwise.
+
+        `python -m py_compile` only parses and compiles to bytecode -- it never
+        executes module-level code, so it catches SyntaxError/IndentationError
+        and nothing else (a runtime bug still has to reach the real subprocess
+        run below, same as today).
+        """
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(train_py)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return "py_compile timed out after 30s"
+        if proc.returncode == 0:
+            return None
+        return _tail(_strip_test_metrics_lines(proc.stderr), self.cfg.executor.traceback_tail_lines)
+
     @staticmethod
     def _parse_result(out_path: Path) -> Optional[dict]:
         if not out_path.exists():
@@ -238,7 +257,30 @@ class Executor:
     ) -> tuple[list[SeedMetrics], Optional[AggregateMetrics]]:
         """Run every seed, then aggregate over the ones that succeeded. An
         empty `ok` set (every seed failed) yields aggregate=None -- the
-        orchestrator treats that as a FAILED iteration."""
+        orchestrator treats that as a FAILED iteration.
+
+        A SyntaxError in generated code fails identically on every seed's
+        subprocess, so check it once, before dispatching any of them. This
+        reuses the existing failed-run path unchanged (FailureKind.CRASH,
+        same traceback_tail -> last_failure_feedback -> CodingAgent repair
+        wiring in orchestrator._handle_failed_run) -- a compile error is just
+        a crash caught earlier and cheaper, not a new kind of outcome. That
+        path already never counts a FAILED record against max_iterations or
+        the stall window (see convergence.should_stop's docstring); this only
+        saves the wasted subprocess spawns/wall-clock and gives the CodingAgent
+        the compiler's own message instead of a subprocess traceback tail.
+        """
+        compile_error = self._check_compiles(solution_dir / "train.py")
+        if compile_error is not None:
+            results = [
+                SeedMetrics(
+                    seed=s, primary=None, gauc=None, ndcg5=None, epochs_run=None,
+                    wall_s=0.0, cpu_s=0.0, failure_kind=FailureKind.CRASH,
+                    traceback_tail=compile_error,
+                )
+                for s in seeds
+            ]
+            return results, None
         results = [self.run_seed(solution_dir, config_path, s, iteration, timeout_s) for s in seeds]
         ok = [r for r in results if r.failure_kind is None]
         if not ok:

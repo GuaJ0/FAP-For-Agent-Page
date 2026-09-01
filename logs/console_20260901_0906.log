@@ -1,0 +1,48 @@
+[env] loaded from .env: OPENAI_API_KEY, KUAIRAND_PATH, CODING_AGENT_MODEL
+[llm] OpenAI, model=gpt-5 -- this run costs money
+[findings] ledger: /Users/jovangua/FAP-For-Agent-Page/agent/research/findings.jsonl
+[baseline] iteration 0: valid primary=0.6016 (std 0.0001) over 2 seed(s) -- this is the bar
+
+=== finished in 1290s, 5 record(s) ===
+
+iteration 0  status=success  decision=accept
+  VALID primary=0.6016 (std 0.0001) gauc=0.6673 ndcg5=0.5360 over 2 seed(s)
+    seed 0: primary=0.6014695167541504 kind=None wall=48s
+    seed 1: primary=0.6017608642578125 kind=None wall=34s
+
+iteration 1  status=success  decision=revert
+  VALID primary=0.4161 (std 0.0006) gauc=0.4023 ndcg5=0.4298 over 2 seed(s)
+    seed 0: primary=0.4166533350944519 kind=None wall=64s
+    seed 1: primary=0.4154537320137024 kind=None wall=68s
+  evaluator: The huge drop suggests an implementation/weighting bug rather than a mild objective mismatch. Verify per-user pair sampling and BPR loss sign/scale (normalize by number of pairs) and try lambda_bpr orders of magnitude smaller or anneal from 0. Also ensure negatives are truly unclicked for the same user and early stopping monitors the primary metric.
+
+iteration 2  status=failed  decision=None
+    seed 0: primary=None kind=crash wall=0s
+        File "/Users/jovangua/FAP-For-Agent-Page/solutions/attempt_001/train.py", line 393
+    "n_val_users": int(val_metrics["users']),
+                                   ^
+SyntaxError: unterminated string literal (detected at line 393)
+    seed 1: primary=None kind=crash wall=0s
+        File "/Users/jovangua/FAP-For-Agent-Page/solutions/attempt_001/train.py", line 393
+    "n_val_users": int(val_metrics["users']),
+                                   ^
+SyntaxError: unterminated string literal (detected at line 393)
+
+iteration 3  status=success_after_retry  decision=accept
+  VALID primary=0.6026 (std 0.0001) gauc=0.6686 ndcg5=0.5366 over 2 seed(s)
+    seed 0: primary=0.6027274131774902 kind=None wall=60s
+    seed 1: primary=0.6025280952453613 kind=None wall=61s
+  evaluator: Positive-count-weighted user sampling yields a small but consistent primary gain, suggesting metric-aligned sampling helps. Next, sweep smoothed weights w ∝ (pos_count)^alpha with alpha in [0.3, 1.0] and/or cap extremes, and try mixtures with uniform sampling to push GAUC further without depressing nDCG@5.
+
+iteration 4  status=success  decision=revert
+  VALID primary=0.6012 (std 0.0002) gauc=0.6671 ndcg5=0.5353 over 2 seed(s)
+    seed 0: primary=0.6010394096374512 kind=None wall=131s
+    seed 1: primary=0.6014139652252197 kind=None wall=133s
+  evaluator: Primary dropped by 0.0014, suggesting the candidate-conditioned history signal is weak/over-noisy with a 20–50 window and undertrained similarity embeddings. Run the planned ablation vs unconditioned pooling, verify no temporal leakage, and try a much shorter window (3–10) with normalized/capped attention and stronger item similarity (pretrained item2vec/co-vis or end-to-end tuned embeddings).
+
+run log:          /Users/jovangua/FAP-For-Agent-Page/logs/runs.jsonl
+coding LLM usage: /Users/jovangua/FAP-For-Agent-Page/logs/coding_agent_usage.jsonl
+quarantine:       /Users/jovangua/FAP-For-Agent-Page/logs/quarantine/test_metrics.jsonl  (agents never read this)
+coding totals:    {'calls': 8, 'real_model_calls': 8, 'tokens_in': 51896, 'tokens_out': 65010, 'cost_usd': 0.71497}
+evaluator usage:  /Users/jovangua/FAP-For-Agent-Page/logs/evaluator_usage.jsonl
+evaluator totals: {'calls': 3, 'real_model_calls': 3, 'tokens_in': 6026, 'tokens_out': 2597, 'cost_usd': 0.033502}

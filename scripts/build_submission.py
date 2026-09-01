@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -99,6 +100,32 @@ def main() -> int:
                 if name == "checkpoint.npz":
                     continue  # optional: a model may have no separate weights file
                 missing.append(f"missing {name} in {artifact_dir}")
+
+        # logs/artifacts/iter_N/seed_M/ is NOT namespaced per run -- a later
+        # run reusing the same low iteration numbers overwrites these files in
+        # place. If that happened, the file on disk now belongs to a
+        # different (later) run's iteration than the one RunRecord.seeds
+        # claims, and copying it would silently staple the wrong
+        # checkpoint/predictions onto this run's code and hypothesis. Compare
+        # against the primary this RunRecord itself recorded at run time
+        # (trusted -- written once, immediately after training, before any
+        # later run could collide with the path) and refuse rather than ship
+        # a mismatched submission.
+        result_check = artifact_dir / "result.json"
+        if result_check.exists():
+            on_disk_primary = json.loads(result_check.read_text()).get("primary")
+            if (
+                on_disk_primary is not None
+                and seed.primary is not None
+                and not math.isclose(on_disk_primary, seed.primary, rel_tol=1e-9, abs_tol=1e-9)
+            ):
+                raise SystemExit(
+                    f"CORRUPTED ARTIFACT: {result_check} now holds primary={on_disk_primary}, "
+                    f"but iteration {record.iteration} seed {seed.seed} in {runs_path} recorded "
+                    f"primary={seed.primary} at run time. A later run reused this same "
+                    "logs/artifacts/ path and overwrote it -- refusing to build a submission "
+                    "with mismatched code and checkpoint."
+                )
 
     config_src = Path(record.diff_path) if record.diff_path else None
     if sol_dir is None:

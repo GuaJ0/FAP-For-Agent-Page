@@ -222,6 +222,15 @@ def _main() -> int:
         client = OpenAIClient(model=args.model)
         print(f"[llm] OpenAI, model={args.model} -- this run costs money")
 
+    # Cross-run Do/Don't ledger. Deliberately NOT under --root by default: a
+    # reset here archives logs/ wholesale, and this has to outlive that. An
+    # exploration pass overrides it so its findings can be reviewed before they
+    # reach the ledger the graded run actually reads. Built before Research so
+    # the offline agent can be handed the same instance below, to skip backlog
+    # entries a PRIOR run already recorded here.
+    findings = FindingsLedger(Path(args.findings_path) if args.findings_path else DEFAULT_FINDINGS_PATH)
+    print(f"[findings] ledger: {findings.path}")
+
     # All live agents share this exact client instance. Offline Research stays
     # the default and uses no LLM even when Coding/Evaluator are live.
     if args.live_research:
@@ -231,7 +240,7 @@ def _main() -> int:
             convergence=cfg.convergence,
         )
     else:
-        research = OfflineResearchAgent(convergence=cfg.convergence)
+        research = OfflineResearchAgent(convergence=cfg.convergence, findings=findings)
 
     coding = LLMCodingAgent(
         work_dir=root / "solutions",
@@ -251,12 +260,6 @@ def _main() -> int:
     evaluator = FakeEvaluatorAgent() if args.offline else LLMEvaluatorAgent(
         llm=client, usage_log_path=cfg.paths.logs_dir / "evaluator_usage.jsonl",
     )
-    # Cross-run Do/Don't ledger. Deliberately NOT under --root by default: a
-    # reset here archives logs/ wholesale, and this has to outlive that. An
-    # exploration pass overrides it so its findings can be reviewed before they
-    # reach the ledger the graded run actually reads.
-    findings = FindingsLedger(Path(args.findings_path) if args.findings_path else DEFAULT_FINDINGS_PATH)
-    print(f"[findings] ledger: {findings.path}")
 
     orc = Orchestrator(
         research=research,

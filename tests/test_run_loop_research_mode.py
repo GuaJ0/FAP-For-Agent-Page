@@ -46,8 +46,9 @@ def _install_pipeline_fakes(monkeypatch):
         return offline_client
 
     class OfflineResearch:
-        def __init__(self, *, convergence):
+        def __init__(self, *, convergence, findings=None):
             self.convergence = convergence
+            self.findings = findings
             captured["research"] = self
 
     class LiveResearch:
@@ -249,6 +250,16 @@ def test_the_ledger_defaults_to_the_committed_one(monkeypatch, tmp_path):
     _run_main(monkeypatch, tmp_path)
 
     assert captured["orchestrator"].kwargs["findings"].path == DEFAULT_FINDINGS_PATH
+
+
+def test_offline_research_receives_the_same_findings_ledger_as_the_orchestrator(monkeypatch, tmp_path):
+    """Without this, a fresh run's OfflineResearchAgent has no way to know a
+    prior run already measured a backlog entry -- see
+    agent/research/offline.py's OfflineResearchAgent.findings docstring."""
+    captured = _install_pipeline_fakes(monkeypatch)
+    _run_main(monkeypatch, tmp_path)
+
+    assert captured["research"].findings is captured["orchestrator"].kwargs["findings"]
 
 
 def test_an_exploration_pass_can_redirect_the_ledger_to_a_scratch_file(monkeypatch, tmp_path):

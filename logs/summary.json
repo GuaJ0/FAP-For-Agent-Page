@@ -1,0 +1,24 @@
+{
+  "iterations_concluded": 4,
+  "wall_s": 3035.910058,
+  "best_iteration": 2,
+  "best_val_primary": 0.6022542417049408,
+  "usage": {
+    "coding": {
+      "calls": 7,
+      "real_model_calls": 7,
+      "tokens_in": 46126,
+      "tokens_out": 59651,
+      "cost_usd": 0.654167
+    },
+    "research": null,
+    "evaluator": {
+      "calls": 3,
+      "real_model_calls": 3,
+      "tokens_in": 5045,
+      "tokens_out": 2121,
+      "cost_usd": 0.027517
+    }
+  },
+  "stopped_because": null
+}

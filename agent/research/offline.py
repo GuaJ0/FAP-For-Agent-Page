@@ -27,6 +27,7 @@ from agent.research.citations import (
     validate_proposal_citations,
 )
 from agent.research.context import ResearchContext, build_research_context
+from agent.research.findings import FindingsLedger
 from agent.research.schemas import ProposalValidationError, ResearchProposal
 
 
@@ -949,6 +950,17 @@ class OfflineResearchAgent:
     citation_source: CitationSource = field(default_factory=JsonCitationCatalog)
     backlog: Sequence[BacklogEntry] = DEFAULT_BACKLOG
     convergence: ConvergenceConfig = DEFAULT_CONFIG.convergence
+    # Cross-run Do/Don't ledger (agent/research/findings.py). Optional: None
+    # preserves every existing caller/test, same convention as
+    # Orchestrator.findings. Without it, select_proposal only dedupes against
+    # THIS run's own history (via _validate_proposal_against_context below),
+    # which is why two separate runs of the same backlog produced the
+    # identical OFFLINE-HYBRID-BPR / OFFLINE-GAUC-WEIGHTED-BPR /
+    # OFFLINE-DIN-SHORT-HISTORY sequence: each run's history started empty,
+    # so nothing told it those exact backlog entries were already measured by
+    # a PRIOR run. With it, a backlog entry whose id already appears as a
+    # variant in the ledger is skipped the same way an in-run duplicate is.
+    findings: Optional[FindingsLedger] = None
 
     def propose(self, history: list[RunRecord]) -> Idea:
         proposal = self.select_proposal(history)
@@ -979,12 +991,19 @@ class OfflineResearchAgent:
             )
         )
 
+        known_ids = self._known_finding_ids()
+
         rejected_duplicates = 0
         for entry in viable:
             try:
                 proposal = entry.build(context)
                 validate_proposal_citations(proposal, self.citation_source)
                 _validate_proposal_against_context(proposal, context, history)
+                if proposal.hypothesis_id.casefold() in known_ids:
+                    raise DuplicateHypothesisError(
+                        f"proposal.hypothesis_id {proposal.hypothesis_id!r} already recorded "
+                        "in the cross-run findings ledger by an earlier run"
+                    )
             except DuplicateHypothesisError:
                 rejected_duplicates += 1
                 continue
@@ -998,3 +1017,19 @@ class OfflineResearchAgent:
             "offline Research backlog exhausted: no untried proposal fits the remaining "
             f"budget ({len(viable)} feasible, {rejected_duplicates} already attempted)"
         )
+
+    def _known_finding_ids(self) -> set[str]:
+        """Every proposal id any PRIOR run's ledger entry already covers.
+
+        A finding's `variants` are exactly the proposal ids merged into that
+        family (see findings.py's _merge) plus its own `direction` key, so
+        this is the full set of backlog entries this run must not re-propose
+        as if they were untried.
+        """
+        if self.findings is None:
+            return set()
+        ids: set[str] = set()
+        for finding in self.findings.load():
+            ids.add(finding.direction.casefold())
+            ids.update(v.casefold() for v in finding.variants)
+        return ids

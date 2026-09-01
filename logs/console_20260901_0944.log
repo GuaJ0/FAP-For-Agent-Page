@@ -1,0 +1,36 @@
+[env] loaded from .env: OPENAI_API_KEY, KUAIRAND_PATH, CODING_AGENT_MODEL
+[llm] OpenAI, model=gpt-5 -- this run costs money
+[findings] ledger: /Users/jovangua/FAP-For-Agent-Page/agent/research/findings.jsonl
+[baseline] iteration 0: valid primary=0.6016 (std 0.0001) over 2 seed(s) -- this is the bar
+
+=== finished in 2670s, 4 record(s) ===
+
+iteration 0  status=success  decision=accept
+  VALID primary=0.6016 (std 0.0001) gauc=0.6673 ndcg5=0.5360 over 2 seed(s)
+    seed 0: primary=0.6014695167541504 kind=None wall=47s
+    seed 1: primary=0.6017608642578125 kind=None wall=51s
+
+iteration 1  status=success  decision=revert
+  VALID primary=0.6014 (std 0.0003) gauc=0.6670 ndcg5=0.5357 over 2 seed(s)
+    seed 0: primary=0.6010530591011047 kind=None wall=71s
+    seed 1: primary=0.6016653776168823 kind=None wall=59s
+  evaluator: Primary fell slightly below the incumbent, suggesting the BPR term is mis-scaled or the pair sampler altered user weighting. Try a much smaller lambda (0.005–0.02) or anneal it, normalize BPR by number of pairs, and use balanced within-user negatives (consider mild hard-negative mining with per-user caps).
+
+iteration 2  status=success  decision=accept
+  VALID primary=0.6023 (std 0.0004) gauc=0.6683 ndcg5=0.5362 over 2 seed(s)
+    seed 0: primary=0.6018361449241638 kind=None wall=50s
+    seed 1: primary=0.6026723384857178 kind=None wall=51s
+  evaluator: Small primary gain suggests aligning user sampling with GAUC weighting helps. Next, try tempered weighting (sqrt/log or clipped positive-count weights) to limit heavy-user dominance and potentially stabilize/improve nDCG@5. Also confirm robustness with a few more seeds.
+
+iteration 3  status=success  decision=revert
+  VALID primary=0.6013 (std 0.0000) gauc=0.6672 ndcg5=0.5354 over 2 seed(s)
+    seed 0: primary=0.6012449860572815 kind=None wall=90s
+    seed 1: primary=0.6013363599777222 kind=None wall=129s
+  evaluator: Primary fell slightly below the incumbent, suggesting the candidate-conditioned history is either too noisy or mis-joined. Verify strict no-leak temporal joins/masking and run the planned ablation vs an unconditioned pooled history; try much shorter windows (5–20) with recency decay and normalized attention plus fallbacks for sparse histories. Consider learning compact item embeddings (video/author) for similarity instead of raw IDs to stabilize the attention signal.
+
+run log:          /Users/jovangua/FAP-For-Agent-Page/logs/runs.jsonl
+coding LLM usage: /Users/jovangua/FAP-For-Agent-Page/logs/coding_agent_usage.jsonl
+quarantine:       /Users/jovangua/FAP-For-Agent-Page/logs/quarantine/test_metrics.jsonl  (agents never read this)
+coding totals:    {'calls': 7, 'real_model_calls': 7, 'tokens_in': 46126, 'tokens_out': 59651, 'cost_usd': 0.654167}
+evaluator usage:  /Users/jovangua/FAP-For-Agent-Page/logs/evaluator_usage.jsonl
+evaluator totals: {'calls': 3, 'real_model_calls': 3, 'tokens_in': 5045, 'tokens_out': 2121, 'cost_usd': 0.027517}

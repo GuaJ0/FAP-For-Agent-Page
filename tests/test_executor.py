@@ -72,6 +72,20 @@ def test_crash_is_classified_and_traceback_preserved(tmp_path):
     assert "forced crash" in result.traceback_tail
 
 
+def test_syntax_error_is_caught_before_any_seed_is_dispatched(tmp_path):
+    sol_dir, config_path = _solution(tmp_path, mode="normal")
+    (sol_dir / "train.py").write_text('print("unterminated string)\n')
+    ex, _ = _executor(tmp_path)
+
+    seeds, agg = ex.run_seeds(sol_dir, config_path, iteration=1, seeds=[0, 1])
+
+    assert agg is None
+    assert len(seeds) == 2
+    assert all(s.failure_kind == FailureKind.CRASH for s in seeds)
+    assert all(s.artifact_dir is None for s in seeds)
+    assert "SyntaxError" in seeds[0].traceback_tail
+
+
 def test_bad_output_is_classified(tmp_path):
     sol_dir, config_path = _solution(tmp_path, mode="bad_output")
     ex, _ = _executor(tmp_path)
