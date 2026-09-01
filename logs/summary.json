@@ -1,24 +1,24 @@
 {
-  "iterations_concluded": 4,
-  "wall_s": 3035.910058,
-  "best_iteration": 2,
-  "best_val_primary": 0.6022542417049408,
+  "iterations_concluded": 2,
+  "wall_s": 338.948823,
+  "best_iteration": 0,
+  "best_val_primary": 0.6016151905059814,
   "usage": {
     "coding": {
-      "calls": 7,
-      "real_model_calls": 7,
-      "tokens_in": 46126,
-      "tokens_out": 59651,
-      "cost_usd": 0.654167
+      "calls": 3,
+      "real_model_calls": 3,
+      "tokens_in": 21863,
+      "tokens_out": 28008,
+      "cost_usd": 0.307408
     },
     "research": null,
     "evaluator": {
-      "calls": 3,
-      "real_model_calls": 3,
-      "tokens_in": 5045,
-      "tokens_out": 2121,
-      "cost_usd": 0.027517
+      "calls": 1,
+      "real_model_calls": 1,
+      "tokens_in": 1478,
+      "tokens_out": 596,
+      "cost_usd": 0.007808
     }
   },
-  "stopped_because": null
+  "stopped_because": "OfflineBacklogExhausted: offline Research backlog exhausted: no untried proposal fits the remaining budget (14 feasible, 14 already attempted)"
 }

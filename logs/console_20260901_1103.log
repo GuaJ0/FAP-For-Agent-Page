@@ -1,0 +1,26 @@
+[env] loaded from .env: OPENAI_API_KEY, KUAIRAND_PATH, CODING_AGENT_MODEL
+[llm] OpenAI, model=gpt-5 -- this run costs money
+[findings] ledger: /Users/jovangua/FAP-For-Agent-Page/agent/research/findings.jsonl
+[baseline] iteration 0: valid primary=0.6016 (std 0.0001) over 2 seed(s) -- this is the bar
+
+[research] nothing left to propose -- stopped cleanly: OfflineBacklogExhausted: offline Research backlog exhausted: no untried proposal fits the remaining budget (14 feasible, 14 already attempted)
+
+=== finished in 419s, 2 record(s) ===
+
+iteration 0  status=success  decision=accept
+  VALID primary=0.6016 (std 0.0001) gauc=0.6673 ndcg5=0.5360 over 2 seed(s)
+    seed 0: primary=0.6014695167541504 kind=None wall=41s
+    seed 1: primary=0.6017608642578125 kind=None wall=33s
+
+iteration 1  status=success  decision=revert
+  VALID primary=0.6016 (std 0.0001) gauc=0.6673 ndcg5=0.5360 over 2 seed(s)
+    seed 0: primary=0.6014695167541504 kind=None wall=45s
+    seed 1: primary=0.6017608642578125 kind=None wall=40s
+  evaluator: No modeling change was made, so the primary metric is unchanged and cannot beat the incumbent. Keep the diagnostic tooling, but surface the randomized-exposure GAUC/nDCG and, if a gap appears, try IPS-weighted validation/early stopping or a debiased loss to optimize for unbiased ranking quality.
+
+run log:          /Users/jovangua/FAP-For-Agent-Page/logs/runs.jsonl
+coding LLM usage: /Users/jovangua/FAP-For-Agent-Page/logs/coding_agent_usage.jsonl
+quarantine:       /Users/jovangua/FAP-For-Agent-Page/logs/quarantine/test_metrics.jsonl  (agents never read this)
+coding totals:    {'calls': 3, 'real_model_calls': 3, 'tokens_in': 21863, 'tokens_out': 28008, 'cost_usd': 0.307408}
+evaluator usage:  /Users/jovangua/FAP-For-Agent-Page/logs/evaluator_usage.jsonl
+evaluator totals: {'calls': 1, 'real_model_calls': 1, 'tokens_in': 1478, 'tokens_out': 596, 'cost_usd': 0.007808}
