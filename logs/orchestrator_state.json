@@ -1,0 +1,21 @@
+{
+  "iteration": 1,
+  "current_idea": null,
+  "fix_attempts": 0,
+  "idea_start_time": null,
+  "last_failure_feedback": null,
+  "consecutive_abandonments": 0,
+  "consecutive_research_failures": 0,
+  "halted": false,
+  "halt_reason": null,
+  "research_exhausted": true,
+  "research_exhausted_reason": "OfflineBacklogExhausted: offline Research backlog exhausted: no untried proposal fits the remaining budget (14 feasible, 14 already attempted)",
+  "run_start_time": 1788231813.687713,
+  "seed_costs": [
+    40.72325778007507,
+    32.78688907623291,
+    45.131871938705444,
+    40.11288928985596
+  ],
+  "manual_intervention_pending": false
+}
