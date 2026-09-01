@@ -1,0 +1,15 @@
+{
+  "entries": [
+    {
+      "iteration": 0,
+      "checkpoint_path": "/Users/jovangua/FAP-For-Agent-Page/logs/artifacts/iter_0/seed_1",
+      "val_primary": 0.6016151905059814
+    },
+    {
+      "iteration": 2,
+      "checkpoint_path": "/Users/jovangua/FAP-For-Agent-Page/logs/artifacts/iter_2/seed_1",
+      "val_primary": 0.6022542417049408
+    }
+  ],
+  "best_iteration": 2
+}
