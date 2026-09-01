@@ -19,3 +19,4 @@ Format: one line per entry, oldest first.
 ## Entries
 
 <!-- Add entries below this line. Leave it empty if none happened. -->
+2026-09-01T01:34:39Z | relaunched loop after run 1 converged at 5 records (delta 0.0010 < eps 0.002); archived prior state, added py_compile pre-check
